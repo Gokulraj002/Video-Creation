@@ -10,7 +10,7 @@
 
 **Status labels.** **M1** means the behaviour exists in the code today. **Planned (Mx)** means it does not exist yet and is
 scheduled for milestone Mx. This document was written from `packages/ai-director/src`, its tests (`packages/ai-director/test`,
-184 tests, all passing with no network access) and `apps/studio-api/src/director`. It was revised after the M1 review
+185 tests, all passing with no network access) and `apps/studio-api/src/director`. It was revised after the M1 review
 (2026-10-09). If this document and the code disagree, the code is right and this document has a bug.
 
 ---
@@ -412,8 +412,8 @@ interface AIProvider {
 ```
 
 A provider without `configFingerprint` shares cache keys per name and model. The built-in fingerprints are
-`heuristic-mock@2` (bumped when the mock's output logic changes) and `anthropic:{model, effort, maxOutputTokens, fallbacks,
-structuredOutput}`.
+`heuristic-mock@3` (`HEURISTIC_MOCK_VERSION`, bumped when the mock's output logic changes) and
+`anthropic:{model, effort, maxOutputTokens, fallbacks, structuredOutput}`.
 
 `createAIProvider({kind: 'mock'} | {kind: 'anthropic', ...AnthropicProviderOptions})` builds a provider from config.
 studio-api has its own `createProvider(config)` in `apps/studio-api/src/director/factory.ts` ([section 17](#17-how-studio-api-runs-the-director)).
@@ -428,11 +428,12 @@ offline with no API key ([ADR-012](DECISIONS.md#adr-012-mock-first-ai-providers)
   chapter target, storyboard pieces are split or merged until the count fits the scene range, every scene gets one shot list
   entry, templates belong to available engines, and props start from the template's `buildProps` and are re-parsed against the
   `propsSchema` (falling back to plain `buildProps` output).
-- **Genre-aware and content-aware.** It parses the prompt for numbered or bulleted steps, safety cautions, prices, locations,
-  real-estate features and amenities, contact lines, numeric facts and cartoon characters and settings. SOP videos get
-  numbered `step-instruction` scenes in prompt order; real-estate videos get `property-showcase` cards with the price and
-  location; comedy and cartoon videos get `cartoon-scene`; `product-3d` videos get 3D templates; videos with a call to action
-  close on `cta-end-card`. Reference profiles steer palette, mood, shot types and transitions.
+- **Genre-aware and content-aware.** It parses the prompt for numbered or bulleted steps, safety cautions, prices (including
+  `Rs`, lakh and crore amounts), locations, real-estate features (bedrooms, `BHK`, areas) and amenities, contact lines,
+  numeric facts and cartoon characters and settings. SOP videos get numbered `step-instruction` scenes in prompt order;
+  real-estate videos get `property-showcase` cards with the price and location, and the scenes' on-screen text shows the
+  extracted features one per scene until they run out (never the same feature on every scene); comedy and cartoon videos get `cartoon-scene`;
+  `product-3d` videos get 3D templates; videos with a call to action close on `cta-end-card`. Reference profiles steer palette, mood, shot types and transitions.
 - **Deterministic.** Variation comes from 32-bit FNV-1a hashes of specific fields (title, chapter id and target, scene id and
   title, regeneration instructions) and a seeded mulberry32 PRNG. Identical input gives identical artifacts and timelines
   (tested).

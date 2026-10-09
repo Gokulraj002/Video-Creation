@@ -7,7 +7,7 @@ import {
   type DirectorResult,
   type PricingTable,
 } from '@vc/ai-director';
-import { VideoRequestSchema, type DirectorRunProgress, type TokenUsage, type UsageReport } from '@vc/schema';
+import { toWellFormedText, VideoRequestSchema, type DirectorRunProgress, type TokenUsage, type UsageReport } from '@vc/schema';
 import { effectiveRunTimeoutMs, type AppConfig } from '../config';
 import { Prisma, ProjectStatus, RunStatus, type PrismaClient } from '../db';
 import { toJsonInput } from '../lib/json';
@@ -80,7 +80,8 @@ function usageColumns(usage: UsageReport) {
 }
 
 function warningsJson(warnings: readonly string[] | undefined): string[] {
-  return (warnings ?? []).slice(0, 500).map((w) => w.slice(0, 2000));
+  // Slice by code points (never split a surrogate pair) and repair lone surrogates: Postgres jsonb rejects them.
+  return (warnings ?? []).slice(0, 500).map((w) => toWellFormedText(Array.from(w).slice(0, 2000).join('')));
 }
 
 /** Running totals of the provider requests of one run (what it has spent so far, before the final report). */

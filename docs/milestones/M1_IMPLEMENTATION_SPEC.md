@@ -481,3 +481,134 @@ camera presets) · M6 Generative video & footage (provider adapters e.g. Runway/
 async jobs, cost controls; footage/screen/image engines) · M7 Long-form at scale (distributed chapter/segment rendering,
 resumable renders, > 20 min validation, editor v2 tracks/transitions/audio, campaigns MVP merged as a module) · M8 Production
 hardening (OIDC auth, teams, billing/quotas, observability, sandboxed workers, backups, CDN).
+
+---
+
+## Amendments after review (2026-10-09)
+
+The contract above is kept exactly as it was written. This section records every deliberate deviation of the shipped
+Milestone 1 code from it: differences introduced during implementation and the fixes made after the adversarial review of
+2026-10-09. Where this section and the contract disagree, this section wins, and the code is the final reference.
+
+Field-level detail for sections 1 and 2 is kept next to the reference docs, in
+[TIMELINE_SCHEMA.md section 17](../TIMELINE_SCHEMA.md#17-differences-from-the-m1-spec) and
+[AI_DIRECTOR.md section 21](../AI_DIRECTOR.md#21-deviations-from-the-m1-spec); A.1 and A.2 summarize them. A.3 to A.5
+list the studio-api, studio-web and docs amendments in full. The decisions behind the larger changes are
+[ADR-018](../DECISIONS.md#adr-018-spend-caps-enforced-with-a-per-run-cost-ceiling-reservation-and-a-live-budget-check)
+(spend caps), [ADR-019](../DECISIONS.md#adr-019-run-heartbeat-and-stale-run-reaper-failed-runs-are-never-re-queued) (run
+recovery) and [ADR-020](../DECISIONS.md#adr-020-stage-cache-scoped-per-user-and-keyed-by-stage-input-and-provider-configuration)
+(cache scope and key). Gaps that remain open are tracked in
+[ROADMAP.md, Known gaps carried out of M1](../ROADMAP.md#known-gaps-carried-out-of-m1).
+
+### A.1 `@vc/schema` (section 1)
+
+| Contract | Amendment |
+|---|---|
+| 1.1 `SafeUriSchema`: `asset:` or `https:`; reject `http:`, `file:`, `data:`, `javascript:`, credentials and control characters | An allow-list that requires the literal prefix `https://` or `asset://` (scheme case-insensitive). `asset://`: the host must be an `Id`, path segments are `[A-Za-z0-9._-]` without a leading dot, no query or fragment. `https://`: the host must be a fully-qualified DNS name; IP literals and local names (`localhost`, `*.localhost`, `*.local`, `*.internal`, `*.localdomain`, `*.home.arpa`) are rejected. Rejected anywhere: whitespace, Unicode format characters, backslashes, `@`, percent-encoded controls and dot segments (also percent-encoded). The parsed value is the normalized `URL.href` (at most 2048 characters). It is a shape check only and never resolves DNS; the fetch-time address check belongs to M3 (A.5). |
+| 1.1 `JsonValueSchema`: string, array, object and depth bounds | Also at most 10 000 nodes per value, the keys `__proto__`, `constructor` and `prototype` rejected, and well-formed strings. Template `props` use `JsonObjectSchema`, where the props object itself is depth level 1. |
+| Not specified: text encoding | Every string in a `VideoRequest`, in the director artifacts and in a timeline must be well-formed UTF-16 (no lone surrogates, which PostgreSQL `jsonb` rejects). This is timeline invariant 10. New helpers `isWellFormedText`, `toWellFormedText` and `findIllFormedStrings`; the template helper `clip()` cuts on code-point boundaries and always returns well-formed text. |
+| 1.15 `VideoRequestSchema`: `title` 1..200, `prompt` 1..20000 | Both are trimmed and must contain at least one visible character (input made only of whitespace or zero-width characters is rejected). |
+| 1.15 custom aspect ratio or resolution needs custom dims | With a preset aspect ratio and `resolution: 'custom'`, the custom size must match the ratio within ±1 px per side (`dimensionsMatchAspectRatio`). With `aspectRatio: 'custom'` the resolution preset is ignored. |
+| 1.2 `resolveDimensions` | Custom dims are rounded to even integers too, and a resolved side outside 16..8192 throws `RangeError`. |
+| 1.3 `secondsToFrames = Math.round(seconds * fps)` | `Math.round(seconds * fps + 1e-9)`, so exact halves that floating point puts just below `.5` still round up. |
+| 1.3 `allocateFrames` | Requires safe integers, normalizes the weights by their maximum (any finite positive weights work), bounds every loop and asserts its postcondition (safe integers ≥ `minFrames` summing exactly to `totalFrames`). |
+| 1.11 invariants 1 to 9 | Ten invariants. 4 also covers overlay image content, layers inside overlay content, and the asset-reference props that catalog templates declare (`split-feature.imageAssetId` must name an `image` asset). 5 adds: `trimStartFrame` of footage, screen, audio and video items must be smaller than the asset's `durationInFrames` when the asset declares it. 8 adds: layers inside overlay items fit the item, and `screen` zoom regions lie within the scene. 10 (new): every string is well-formed UTF-16. |
+| 1.12 `ResourceLimitsSchema` with nine limits | Adds the optional `maxTrackItems`, `maxLayers` and `maxTimelineBytes` (defaults 20 000, 5 000 and 20 MiB of timeline JSON) with the codes `MAX_TRACK_ITEMS`, `MAX_LAYERS` and `MAX_TIMELINE_BYTES`, plus the code `INVALID_DIMENSIONS`. The `ResourceLimits` type is the nine core limits; `FullResourceLimits` adds the optional ones. `maxAssets` also bounds `referenceAssetIds`, and `maxPromptChars` also bounds `generated` scene prompts. |
+| 1.16 `TemplateDefinition` | Adds `assetRefProps` (props whose value is an asset id, with the required kind) and `getTemplateAssetRefProps(id)`. `step-instruction` caps `stepNumber` and `totalSteps` at 999 and requires `stepNumber ≤ totalSteps`; every text prop has explicit length bounds. |
+| 1.17 `paginated(item) → {items, nextCursor}` | Adds an optional `total` (the number of items over all pages). `GET /v1/projects` always sets it. |
+| Other | Further structural bounds, extra exports and the migration and `safeParseTimeline` details are listed in [TIMELINE_SCHEMA.md section 17](../TIMELINE_SCHEMA.md#17-differences-from-the-m1-spec). |
+
+### A.2 `@vc/ai-director` (section 2)
+
+| Contract | Amendment |
+|---|---|
+| 2.1 `AIProvider`, `StructuredGenerationResult`, `DirectorError` | `AIProvider.configFingerprint` (optional): every provider setting that can change outputs; it is part of the cache key. `StructuredGenerationResult.usageByModel` (optional): a per-model breakdown, for example Anthropic server-side fallback hops. `DirectorError` also carries `stage`, `chunk`, `usage` and `warnings`; `ProviderRefusalError` and `ProviderTruncatedError` carry the billed tokens and the model that produced the response. |
+| 2.2 `HeuristicMockProvider` | `configFingerprint` is `heuristic-mock@3` (`HEURISTIC_MOCK_VERSION`); the version is bumped whenever the mock's output logic changes, so cached mock outputs never go stale. |
+| 2.2 `AnthropicProvider` | `configFingerprint` is `anthropic:` plus the canonical JSON of `{model, effort, maxOutputTokens, fallbacks, structuredOutput}`. A schema-related 400 in `json_schema` mode is retried once in prompt mode, as specified, and the rejection is remembered per `(model, schemaName)` for the process (at most 1000 entries), so later calls go straight to prompt mode. Usage is the sum of `usage.iterations` when the response has them, each priced by its own model. Refused and truncated responses are billed and counted. `maxOutputTokens` is also a hard cap (at most 16 000), and each request sends `min(cap, stage max_tokens)`. Extra error mappings: an aborted request becomes `CANCELLED`, status ≥ 500 or 529 becomes `PROVIDER_UNAVAILABLE`. |
+| 2.2 `stop_reason: 'max_tokens'` → `ProviderTruncatedError` | The director treats truncation as repairable and asks for a complete but more concise object; `PROVIDER_TRUNCATED` surfaces only when the last allowed attempt is truncated. |
+| 2.3 pricing and usage | `UsageTracker` prices each `usageByModel` entry by its own model. New module `cost-ceiling.ts` (`estimateRunCostCeilingUsd`, `stageCallCounts`, `STAGE_INPUT_TOKEN_ESTIMATE`): the worst-case cost of a plan, used by the studio-api spend cap (A.3). |
+| 2.4 cache key `{stage, chunk, promptVersion, provider, model, schemaName, system, prompt}` | Also covers `inputHash` (hash of the structured stage input) and `providerFingerprint`. `get(key, {stage, chunk})`; entries carry `stage` and `chunk`; hits are re-validated and invalid entries ignored. studio-api scopes its stored keys per user (A.3). |
+| 2.5 scene count | The expected scene count is also capped at `maxChapters × 24`, so a small chapter limit lengthens scenes instead of packing hundreds into one call. |
+| 2.6 `PROMPT_VERSION = 'm1.0'` | `'m1.1'`. |
+| 2.6 prompt hardening | Every data tag, including earlier stage outputs, is untrusted data. `<user_instructions>` is the one directive tag: it appears only when a scene is regenerated and carries the user's creative direction, which cannot override the schema, ids, durations or safety rules. Model-written text is never interpolated into the `<task>` line. |
+| 2.6 validation before any provider call | Also: asset ids that collide with director-generated ids (`c<n>`, `c<n>-s<m>`, `c<n>-s<m>-cap<k>`, `c<n>-g<k>`, `sh<n>`, `captions`) or with each other fail with `VALIDATION_FAILED`; more than `min(20, maxAssets)` reference profiles fail with `LIMIT_EXCEEDED`; when neither `motion2d` nor `three` is available the run fails with `PROVIDER_CONFIG`. Blank nullable model text (`""`, whitespace) becomes `null`. |
+| 2.6 engine coercion to `motion2d` | Coerces to `three` when `motion2d` is disabled. |
+| 2.6 scene-specs LLM schema: union over the whole catalog | The structured-output schema is restricted to the templates selected for the chunk (`chapterSceneSpecsSchemaFor`). |
+| 2.6 scene specs per chapter | `step-instruction` scenes are numbered across the whole video (`stepNumber` 1..N, `totalSteps` N). |
+| 2.6 `regenerateScene`: "Other scenes untouched" | Other scenes keep their content and timing, except that other `step-instruction` scenes may get a new `stepNumber` or `totalSteps` (with a warning). Before any call it validates the stored storyboard durations (finite, > 0, total within 10× of the request duration) and rescales them to the request duration. It never reads or writes the stage cache, so every regeneration is a fresh take. |
+| 2.6 compiler: caption cues of ≤ 7 words | At most 7 word-like units and 80 characters per cue; tokens longer than 24 characters are split with `Intl.Segmenter` (languages written without spaces); when a scene has fewer frames than cues, cues are regrouped instead of dropped. Brand colors with alpha 0 are ignored and the background is always opaque. Non-finite or non-positive storyboard durations fail with `VALIDATION_FAILED`. |
+| 2.6 cancellation | Also checked before each stage, each repair attempt and compile; a cancelled run is logged at `info`, not `error`. |
+| Other | The complete list (33 rows) is [AI_DIRECTOR.md section 21](../AI_DIRECTOR.md#21-deviations-from-the-m1-spec). |
+
+### A.3 `@vc/studio-api` (section 3)
+
+**Data model and migrations**
+
+| Contract | Amendment |
+|---|---|
+| One migration, `init` | Three migrations, applied in order: `20261009082453_init`; `20261009085125_run_accounting` (`DirectorRun.projectId` nullable, `DirectorRun.warnings` jsonb default `[]`, `DirectorCacheEntry.chunk`); `20261009140000_run_reservations_heartbeat_version_summary` (`DirectorRun.reservedCostUsd` Decimal(12,6) and `heartbeatAt`, indexes `[requestedById, status]` and `[status, heartbeatAt]`, and `ProjectVersion.sceneCount`, `durationInFrames` and `fps`, backfilled from the stored timelines; runs that are `RUNNING` when it is applied get a fresh heartbeat). |
+| `DirectorRun.projectId → Project (cascade)` | Nullable with `ON DELETE SET NULL`: deleting a project keeps its runs, so usage and the daily quotas stay accurate. |
+| `ApiToken`, `DirectorCacheEntry` | `ApiToken` has an index on `userId`. The stored cache key is `sha256(userId + "\n" + directorKey)`, so entries are never shared across users ([ADR-020](../DECISIONS.md#adr-020-stage-cache-scoped-per-user-and-keyed-by-stage-input-and-provider-configuration)). Entries written before the review (`m1.0`, older key) are orphans that no run can hit. |
+| `prisma.config.ts`: datasource URL from `DATABASE_URL` | Also loads `apps/studio-api/.env` (`process.loadEnvFile`, without overriding variables that are already set), because Prisma 7 no longer does, and falls back to the local `video_studio` URL so `prisma generate` needs no database. |
+
+**Environment** (every variable is in `apps/studio-api/.env.example` and
+[DEVELOPMENT.md section 3.2](../DEVELOPMENT.md#32-studio-api-and-worker-appsstudio-apienv))
+
+| Contract | Amendment |
+|---|---|
+| Not in the contract | New: `DATABASE_POOL_MAX=10`, `DATABASE_CONNECTION_TIMEOUT_MS=5000`, `QUEUE_ENQUEUE_TIMEOUT_MS=3000`, `DIRECTOR_JOB_LOCK_MS=300000`, `DIRECTOR_STEP_TIMEOUT_MS=120000`, `DIRECTOR_HEARTBEAT_STALE_MS=60000`, `DIRECTOR_QUEUED_STALE_MS=600000`, `DIRECTOR_REAPER_INTERVAL_MS=30000` (`0` disables the reaper), `LIMIT_MAX_TRACKS=50`, `LIMIT_MAX_ASSETS=500`, `LIMIT_ACTIVE_RUNS_PER_USER=2`, `RATE_LIMIT_UNAUTH_PER_MINUTE=60`, `VERSION_CACHE_MAX_BYTES=67108864` (`0` disables the cache), and `TEST_DATABASE_URL` for tests. |
+| `DIRECTOR_RUN_TIMEOUT_MS=1800000`: the overall timeout | It is the minimum: the effective timeout is `min(2^31 − 1, max(DIRECTOR_RUN_TIMEOUT_MS, totalSteps × DIRECTOR_STEP_TIMEOUT_MS))` ms, and expiry is recorded as `TIMEOUT`. Every `*_MS` variable is capped at 2 147 483 647 ms, the largest delay Node.js timers honour. |
+| `RATE_LIMIT_PER_MINUTE=300` per token | Per user, shared by all of the user's tokens (see Endpoints). |
+| `LIMIT_DIRECTOR_RUNS_PER_DAY=50`, `LIMIT_DIRECTOR_USD_PER_DAY=25` | Per user per UTC day. The USD limit counts cost-ceiling reservations (see Run processing); `0` blocks every run. |
+| `ANTHROPIC_EFFORT=medium`, `ANTHROPIC_MAX_OUTPUT_TOKENS=16000` | Effort accepts `low`, `medium`, `high`, `xhigh` and `max`; max output tokens accepts 256 to 16 000. |
+
+**Endpoints**
+
+| Contract | Amendment |
+|---|---|
+| `GET /health` only | Adds public `GET /ready` → `{ok, checks: {database, queue}}` (each `ok`, `error` or `skipped`): 503 when the database, or Redis with the BullMQ driver, does not answer within 2 s; results are reused for 1 s. Neither probe is rate limited. |
+| `GET /v1/projects?limit=20&cursor=`, cursor = id | Ordered by `updatedAt` desc then `id` desc. The cursor is opaque (base64url of the last row's `updatedAt` and `id`); an undecodable cursor is 400 `INVALID_CURSOR`. The page carries `total`, the number of the owner's projects. |
+| `DELETE /v1/projects/:id` cascades | Versions are deleted; runs are kept with `projectId` null (see Data model). |
+| `POST /v1/projects/:id/director-runs`: 429 when runs today ≥ limit or cost today ≥ USD limit | Checked under a per-user transaction advisory lock, with every quota read on that transaction. 429 `QUOTA_EXCEEDED` when the user already has `LIMIT_ACTIVE_RUNS_PER_USER` queued or running runs, when today's runs reach the daily limit, or when today's estimated spend plus the unspent reservations of today's active runs plus this run's cost ceiling would exceed the USD limit ([ADR-018](../DECISIONS.md#adr-018-spend-caps-enforced-with-a-per-run-cost-ceiling-reservation-and-a-live-budget-check)). Runs that failed before starting with `QUEUE_UNAVAILABLE` or `QUEUE_LOST` count toward neither usage nor quotas. When the job cannot be enqueued the run is recorded `FAILED` (`QUEUE_UNAVAILABLE`), the project returns to its previous status and the API answers 503 `QUEUE_UNAVAILABLE`. |
+| `POST /v1/director-runs/:runId/cancel`: "else 409" | The code is `RUN_NOT_ACTIVE`. |
+| `GET /v1/projects/:id/versions` | The latest 100 versions, newest first, from the summary columns (the timeline JSON is not read). Not paginated. |
+| `GET /v1/projects/:id/versions/:version` | Strong `ETag` `"pv-<versionId>-t<timelineSchemaVersion>-<apiVersion>"`, `Cache-Control: private, max-age=31536000, immutable`, and 304 on a matching `If-None-Match` (after the owner-scoped lookup). The serialized DTO is kept in an in-process LRU bounded by `VERSION_CACHE_MAX_BYTES`. |
+| Errors | Any `/v1` route can also answer 429 `RATE_LIMITED` and 500 `DATA_INTEGRITY` (a stored row failed validation on read; the details are logged, not returned). |
+| `@fastify/rate-limit` per token | Three `/v1` hooks in this order: a per-IP guard that refuses an IP over its failed-authentication budget (`RATE_LIMIT_UNAUTH_PER_MINUTE`, IPv6 grouped per /64) before any token lookup; authentication, where every 401 counts against that budget; then a per-user limit (`RATE_LIMIT_PER_MINUTE`). |
+| `GET /v1/system/config` engine reasons | `motion2d` and `three` are available with a non-null reason ("Planned scenes only; rendering arrives in Milestone 2 / 5"); the `footage`, `image` and `screen` reasons also name Milestone 6. |
+
+**Run processing**
+
+| Contract | Amendment |
+|---|---|
+| Spend checked only when a run starts | At creation the run reserves its cost ceiling (`reservedCostUsd`, from `estimateRunCostCeilingUsd` for the planned chapter count and model). While it runs, the worker meters every provider response and, before each LLM stage, stops the run as `FAILED` with `QUOTA_EXCEEDED` once today's spend of the user's other runs plus this run's spend reaches the USD limit (zero-cost runs never trip it). |
+| Cancellation noticed through progress writes | A `RUNNING` run writes a heartbeat about every 2 s; the heartbeat and progress writes are conditional on `RUNNING`, so a cancel is noticed within about 2 s. Progress writes (throttled to 500 ms) also persist the token and cost columns so far. |
+| Not in the contract: crashed or stuck runs | A stale-run reaper (in the worker, and in the API with the inline driver) fails a `RUNNING` run whose heartbeat is older than `DIRECTOR_HEARTBEAT_STALE_MS` as `WORKER_LOST`, and a `QUEUED` run older than `DIRECTOR_QUEUED_STALE_MS` whose job is gone as `QUEUE_LOST`. BullMQ jobs use a lock of `DIRECTOR_JOB_LOCK_MS` and `maxStalledCount: 0`; when BullMQ gives up on a job, the run is failed as `INTERNAL` only if no process still heart-beats it. Runs are never re-queued ([ADR-019](../DECISIONS.md#adr-019-run-heartbeat-and-stale-run-reaper-failed-runs-are-never-re-queued)). |
+| Graceful shutdown | On SIGTERM or SIGINT the worker stops taking jobs and records its in-flight runs `FAILED` with `SHUTDOWN` (partial usage kept, project status restored); a job delivered during shutdown is recorded `SHUTDOWN` without starting. The API does the same for inline runs and forces an exit after 90 s. |
+| Final writes | Success, failure and cancellation writes are retried with backoff for about a minute, so a short database outage does not strand a run. |
+| Queue producer | No offline queue, and every enqueue is bounded by `QUEUE_ENQUEUE_TIMEOUT_MS` (fail fast, 503 above). |
+| Error codes | Besides the `DirectorError` codes, studio-api sets `TIMEOUT`, `QUOTA_EXCEEDED`, `SHUTDOWN`, `WORKER_LOST`, `QUEUE_LOST`, `QUEUE_UNAVAILABLE` and `INTERNAL`. |
+| Seed script: upsert dev user and token | Never modifies an existing token row: a revoked token stays revoked and a token that belongs to another user is not reassigned (both reported as warnings). |
+| Tests | The test database name must end in `_test` or the global setup refuses to run. Added suites: `quotas`, `rate-limit`, `reliability`, `versions` and `factory`. |
+| Layout | Adds `src/context.ts`, `src/version.ts`, `src/director/{engines,plan,reaper}.ts`, `src/lib/{errors,json,logger,lru,retry}.ts` and `src/services/{project-status,system}.ts`. |
+
+### A.4 `@vc/studio-web` (section 4)
+
+| Contract | Amendment |
+|---|---|
+| Pages `/`, `/projects/new`, `/projects/[id]`, `/settings` | Also `/projects`, a list of all projects, 20 per page. `/` and `/projects` live in the route groups `(home)` and `(list)`, each with its own `loading.tsx`. The dashboard's project count is the API's `total`. A missing project answers HTTP 404. |
+| `/projects/[id]` tabs | Adds a Request tab (the stored `VideoRequest`). Only the active tab is rendered on the server; the URL carries `?tab=`, `?version=` (a version switcher appears when there is more than one version) and, on paginated tabs, `?page=` (Script 150 segments, Shot list 200 shots, Usage 100 stage calls per page). With a live AI provider, Start and Re-run ask for confirmation first. |
+| One route handler, `src/app/api/runs/[runId]/route.ts` | Three same-origin route handlers proxy server-side: `GET /api/runs/:runId` (a slim run with usage totals only), `GET /api/projects/:id/versions/:v/timeline` (the Preview and Timeline JSON tabs load the timeline lazily; validated on the server and in the browser) and `GET /api/projects/:id/versions/:v/storyboard?chapter=&offset=&limit=` (storyboard chapters load lazily, 60 cards by default, at most 200). Responses above 16 KB are gzipped when the browser accepts it. |
+| Client polling | Every 1.5 s while a run is queued or running, every 5 s after 2 minutes, paused while the tab is hidden; 400, 401, 403, 404 and 503 stop polling at once; other failures back off (3 to 30 s) and polling stops after 6 consecutive failures, then the page re-syncs. |
+| Server-side API access | Parsed versions are cached in the web server (3 entries, 5-minute TTL, keyed by a fingerprint of the token, dropped when the project is deleted). |
+| Not in the contract: exposure | `dev` and `start` bind `127.0.0.1` (port 3000). `next.config.ts` sends security headers: a Content-Security-Policy without `unsafe-eval` in production and with `frame-ancestors 'none'`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Permissions-Policy` and `Cross-Origin-Opener-Policy`. Zod runs `jitless` in the browser. |
+| Preview: Remotion `<Player>` | The Player loads lazily and is rendered without `acknowledgeRemotionLicense`, deliberately: the licensing decision is the owner's ([DEVELOPMENT.md section 8](../DEVELOPMENT.md#8-typecheck-and-build)). |
+| Tests: duration formatting and form mapping | Also run polling, tabs and pagination, the TTL cache, security headers, the storyboard helpers and the dashboard. |
+
+### A.5 Docs and roadmap (section 5)
+
+- The docs set also contains `README.md` and `docs/CAMPAIGNS.md` (the existing campaigns MVP), and the decision log now has
+  ADR-018 to ADR-020.
+- Roadmap amendment: M3 also owns a guarded fetcher for `https:` asset URIs. It resolves the host and refuses private,
+  loopback, link-local and metadata addresses at fetch time, re-checking every redirect, because `SafeUriSchema` checks
+  shape only. See [ROADMAP.md](../ROADMAP.md).

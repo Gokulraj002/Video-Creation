@@ -176,15 +176,17 @@ for every package, and the test suites passed with 723 (`@vc/schema`), 184 (`@vc
       secrets. Since the review also: readiness, quota reservations and the live spend stop, rate limits, the reaper,
       shutdown, fail-fast enqueue, version caching and `DATA_INTEGRITY`.
 - [x] The Prisma migration SQL is committed under `apps/studio-api/prisma/migrations` (three migrations).
-- [ ] `pnpm --filter @vc/studio-web typecheck`, `test` (pure helpers: duration formatting and parsing, form → `VideoRequest`
-      mapping) and `build` pass. Typecheck and test pass; `build` not re-run for this revision.
+- [x] `pnpm --filter @vc/studio-web typecheck`, `test` (pure helpers: duration formatting and parsing, form → `VideoRequest`
+      mapping) and `build` pass (locally and in CI).
 - [x] The campaigns MVP still typechecks and `pnpm --filter @vc/core test` passes under the pnpm workspace.
-- [ ] CI passes on the M1 branch.
-- [ ] Manual check with `AI_PROVIDER=mock` and `QUEUE_DRIVER=bullmq`: start the API, the worker and the web app; create a
+- [x] CI passes on the M1 branch (GitHub Actions: install, typecheck, tests with Postgres 16 + Redis 7 services, build).
+- [x] Manual check with `AI_PROVIDER=mock` and `QUEUE_DRIVER=bullmq`: start the API, the worker and the web app; create a
       project; watch progress; open every tab; play the animatic; cancel a run; re-run and see cached calls in the Usage tab.
+      (Done with Playwright against a production build: form → run → every tab, animatic seek, re-run with all stages cached,
+      cancel covered by the API suite and the BullMQ smoke test; no console errors under the CSP.)
 - [ ] Optional manual check with `AI_PROVIDER=anthropic` and a real key: one short run, with usage and estimated cost shown,
       and the observed latency per call written down. Not part of CI.
-- [ ] Docs describe the shipped code and label everything else as planned.
+- [x] Docs describe the shipped code and label everything else as planned (reconciled after the review; links checked).
 
 ### Dependencies
 
