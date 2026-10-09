@@ -1006,7 +1006,7 @@ Use several tracks for simultaneous items. Track order in the array carries no m
 |---|---|---|---|---|
 | `audio` | Voice-over (`role: voiceover`), music bed (`music`), sound effects (`sfx`). Track-level `muted` and `volume` (0..2), and per-item `volume`, `trimStartFrame` and fades. | `audio` asset | Fades fit the item ([invariant 8](#invariant-8-audio-fades-and-layers-fit-their-container)) | No. Voice and music providers are **planned (M4)**. |
 | `caption` | Timed caption cues with a `language`, a style preset (`bold-center`, `lower`, `karaoke`, `minimal`) and a position. Cues may carry a `speaker`. | none | — | **Yes.** The compiler emits one caption track (id `captions`) built from storyboard voice-over: cues of at most 7 words, frames proportional to word count, contiguous within each scene. Word-timed captions are **planned (M4)**. |
-| `overlay` | Graphics drawn over scenes: `motion2d` template content (for example `lower-third`) or an image, with `opacity` and `zIndex`. | `image` asset (image content or image layers) | Layers fit the overlay item | No. The schema, preview and tests support it. |
+| `overlay` | Graphics drawn over scenes: `motion2d` template content (for example `lower-third`) or an image, with `opacity` and `zIndex`. | `image` asset (image content or image layers) | Layers fit the overlay item | No. The schema and its tests support overlays, but no M1 code produces or draws them. |
 | `video` | B-roll or picture-in-picture clips with `trimStartFrame`, `playbackRate` 0.25..4, `opacity`, `volume` and `muted`. | `video` asset | — | No. Footage is **planned (M6)**. |
 
 ## 10. Asset references and `SafeUri`
@@ -1638,7 +1638,7 @@ How the example satisfies each invariant:
 
 1. The scenes cover 0 → 90 → 150 → 270 → 360.
 2. `ch-1` = [0, 150) holds `c1-s*` and `ch-2` = [150, 360) holds `c2-s*`.
-3. All 21 ids are unique.
+3. All 20 ids (2 chapters, 4 scenes, 2 assets, 3 tracks, 7 track items, 2 layers) are unique.
 4. `logo-1` is an `image`, used by the brand and an image layer. `music-1` is an `audio`, used by an audio item.
 5. Track items are sorted and do not overlap. The cues touch at frame 45.
 6. Transitions are 15 ≤ min(60, 90), 15 ≤ min(120, 60) and 15 ≤ min(90, 120).
