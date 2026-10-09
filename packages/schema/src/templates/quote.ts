@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { HexColorSchema } from '../common';
-import { colorsOf, textOr, textOrNull } from './helpers';
+import { colorsOf, firstText, textOrNull } from './helpers';
 import { defineTemplate } from './types';
 
 export const QuotePropsSchema = z.object({
@@ -21,10 +21,10 @@ export const quoteTemplate = defineTemplate({
   genres: ['corporate-training', 'presentation', 'long-form', 'promo', 'explainer', 'cinematic-ad'],
   propsSchema: QuotePropsSchema,
   minDurationSeconds: 3,
-  buildProps(ctx) {
+  buildProps(ctx): QuoteProps {
     const c = colorsOf(ctx);
     return {
-      quote: textOr(ctx.text, ctx.title || 'Every great story starts with a single idea.', 400),
+      quote: firstText([ctx.text, ctx.title], 'Every great story starts with a single idea.', 400),
       attribution: textOrNull(ctx.brandName, 120),
       accentColor: c.accent,
       backgroundColor: c.background,

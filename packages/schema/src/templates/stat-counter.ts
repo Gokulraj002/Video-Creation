@@ -24,7 +24,7 @@ export const statCounterTemplate = defineTemplate({
   genres: ['promo', 'corporate-training', 'explainer', 'presentation', 'motion-graphics', 'social-short', 'long-form'],
   propsSchema: StatCounterPropsSchema,
   minDurationSeconds: 2.5,
-  buildProps(ctx) {
+  buildProps(ctx): StatCounterProps {
     const c = colorsOf(ctx);
     const source = [ctx.text ?? '', ...ctx.bullets, ctx.title].join(' ');
     const found = firstNumber(source);

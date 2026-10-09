@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { HexColorSchema } from '../common';
-import { clip, colorsOf, pick, textOr } from './helpers';
+import { clip, colorsOf, firstText, pick, textOr } from './helpers';
 import { defineTemplate } from './types';
 
 export const KineticTextPropsSchema = z.object({
@@ -33,9 +33,9 @@ export const kineticTextTemplate = defineTemplate({
   genres: ['cinematic-ad', 'promo', 'motion-graphics', 'social-short', 'explainer', 'long-form', 'reference-based'],
   propsSchema: KineticTextPropsSchema,
   minDurationSeconds: 2,
-  buildProps(ctx) {
+  buildProps(ctx): KineticTextProps {
     const c = colorsOf(ctx);
-    const source = textOr(ctx.text, ctx.title || 'Make it move', 480);
+    const source = firstText([ctx.text, ctx.title], 'Make it move', 480);
     const lines = toLines(source, 4, 6);
     const longest = source
       .split(/\s+/)

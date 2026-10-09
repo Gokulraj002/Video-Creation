@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { HexColorSchema } from '../common';
-import { colorsOf, textOr, textOrNull } from './helpers';
+import { colorsOf, firstText, firstTextOrNull } from './helpers';
 import { defineTemplate } from './types';
 
 export const TitleCardPropsSchema = z.object({
@@ -40,11 +40,11 @@ export const titleCardTemplate = defineTemplate({
   ],
   propsSchema: TitleCardPropsSchema,
   minDurationSeconds: 1.5,
-  buildProps(ctx) {
+  buildProps(ctx): TitleCardProps {
     const c = colorsOf(ctx);
     return {
-      headline: textOr(ctx.title, ctx.brandName ?? 'Untitled', 120),
-      subheadline: textOrNull(ctx.text ?? ctx.brandName, 200),
+      headline: firstText([ctx.title, ctx.brandName], 'Untitled', 120),
+      subheadline: firstTextOrNull([ctx.text, ctx.brandName], 200),
       align: 'center',
       background: { style: 'gradient', colors: [c.background, c.primary] },
       accentColor: c.accent,

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { HexColorSchema } from '../common';
-import { colorsOf, textOr } from './helpers';
+import { colorsOf, firstText } from './helpers';
 import { defineTemplate } from './types';
 
 export const LogoReveal3DPropsSchema = z.object({
@@ -21,10 +21,10 @@ export const logoReveal3DTemplate = defineTemplate({
   genres: ['product-3d', 'cinematic-ad', 'promo', 'motion-graphics', 'corporate-training'],
   propsSchema: LogoReveal3DPropsSchema,
   minDurationSeconds: 2.5,
-  buildProps(ctx) {
+  buildProps(ctx): LogoReveal3DProps {
     const c = colorsOf(ctx);
     return {
-      text: textOr(ctx.brandName ?? ctx.title, 'Brand', 40),
+      text: firstText([ctx.brandName, ctx.title], 'Brand', 40),
       depth: 0.4,
       color: c.primary,
       accentColor: c.accent,

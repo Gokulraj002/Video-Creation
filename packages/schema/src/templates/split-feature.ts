@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { HexColorSchema, IdSchema } from '../common';
-import { clip, colorsOf, hashString, textOr } from './helpers';
+import { clip, colorsOf, firstText, hashString, textOr } from './helpers';
 import { defineTemplate } from './types';
 
 export const SplitFeaturePropsSchema = z.object({
@@ -24,9 +24,9 @@ export const splitFeatureTemplate = defineTemplate({
   genres: ['promo', 'product-3d', 'explainer', 'presentation', 'real-estate', 'corporate-training', 'long-form'],
   propsSchema: SplitFeaturePropsSchema,
   minDurationSeconds: 4,
-  buildProps(ctx) {
+  buildProps(ctx): SplitFeatureProps {
     const c = colorsOf(ctx);
-    const body = textOr(ctx.text ?? ctx.bullets.join('. '), ctx.title || 'Feature details', 500);
+    const body = firstText([ctx.text, ctx.bullets.join('. '), ctx.title], 'Feature details', 500);
     return {
       headline: textOr(ctx.title, 'Feature', 120),
       body,

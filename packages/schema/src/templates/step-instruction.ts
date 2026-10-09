@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { HexColorSchema } from '../common';
-import { colorsOf, textOr, textOrNull } from './helpers';
+import { colorsOf, firstText, textOr, textOrNull } from './helpers';
 import { defineTemplate } from './types';
 
 export const StepInstructionPropsSchema = z
@@ -31,7 +31,7 @@ export const stepInstructionTemplate = defineTemplate({
   genres: ['sop-training', 'corporate-training', 'explainer'],
   propsSchema: StepInstructionPropsSchema,
   minDurationSeconds: 4,
-  buildProps(ctx) {
+  buildProps(ctx): StepInstructionProps {
     const c = colorsOf(ctx);
     const caution = ctx.bullets.find((b) => CAUTION_HINT.test(b)) ?? null;
     const totalSteps = Math.min(999, Math.max(1, ctx.bullets.length));
@@ -39,7 +39,7 @@ export const stepInstructionTemplate = defineTemplate({
       stepNumber: 1,
       totalSteps,
       title: textOr(ctx.title, 'Step', 120),
-      instruction: textOr(ctx.text ?? ctx.bullets[0], ctx.title || 'Follow the procedure.', 500),
+      instruction: firstText([ctx.text, ctx.bullets[0], ctx.title], 'Follow the procedure.', 500),
       caution: textOrNull(caution, 200),
       accentColor: c.accent,
       backgroundColor: c.background,

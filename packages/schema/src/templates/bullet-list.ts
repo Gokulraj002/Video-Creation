@@ -22,7 +22,7 @@ export const bulletListTemplate = defineTemplate({
   genres: ['sop-training', 'corporate-training', 'explainer', 'presentation', 'long-form', 'promo'],
   propsSchema: BulletListPropsSchema,
   minDurationSeconds: 4,
-  buildProps(ctx) {
+  buildProps(ctx): BulletListProps {
     const c = colorsOf(ctx);
     const bullets = itemsOf(ctx, 6, 160);
     return {

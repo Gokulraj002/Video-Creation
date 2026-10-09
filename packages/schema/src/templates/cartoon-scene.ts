@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { HexColorSchema } from '../common';
-import { colorsOf, pick, textOrNull } from './helpers';
+import { colorsOf, firstTextOrNull, pick } from './helpers';
 import { defineTemplate } from './types';
 
 export const CartoonScenePropsSchema = z.object({
@@ -23,13 +23,13 @@ export const cartoonSceneTemplate = defineTemplate({
   genres: ['comedy', 'cartoon', 'social-short', 'explainer'],
   propsSchema: CartoonScenePropsSchema,
   minDurationSeconds: 3,
-  buildProps(ctx) {
+  buildProps(ctx): CartoonSceneProps {
     const c = colorsOf(ctx);
     const seed = `${ctx.title}|${ctx.text ?? ''}`;
     return {
       character: pick(['blob', 'robot', 'cat', 'bird'], `${seed}|character`),
       expression: pick(['happy', 'surprised', 'confused', 'angry', 'laughing'], `${seed}|expression`),
-      dialogue: textOrNull(ctx.text ?? ctx.title, 200),
+      dialogue: firstTextOrNull([ctx.text, ctx.title], 200),
       setting: pick(['room', 'office', 'park', 'space', 'stage'], `${seed}|setting`),
       gag: pick(['bounce', 'shake', 'spin', 'squash'], `${seed}|gag`),
       backgroundColor: c.primary,

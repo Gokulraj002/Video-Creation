@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { HexColorSchema } from '../common';
-import { colorsOf, textOr, textOrNull } from './helpers';
+import { colorsOf, firstText, textOrNull } from './helpers';
 import { defineTemplate } from './types';
 
 export const CtaEndCardPropsSchema = z.object({
@@ -33,11 +33,11 @@ export const ctaEndCardTemplate = defineTemplate({
   ],
   propsSchema: CtaEndCardPropsSchema,
   minDurationSeconds: 2.5,
-  buildProps(ctx) {
+  buildProps(ctx): CtaEndCardProps {
     const c = colorsOf(ctx);
     return {
-      headline: textOr(ctx.brandName ?? ctx.title, 'Thank you', 120),
-      callToAction: textOr(ctx.text ?? ctx.bullets[0], 'Learn more', 120),
+      headline: firstText([ctx.brandName, ctx.title], 'Thank you', 120),
+      callToAction: firstText([ctx.text, ctx.bullets[0]], 'Learn more', 120),
       contactLine: textOrNull(ctx.bullets[1], 160),
       accentColor: c.accent,
       backgroundColor: c.background,

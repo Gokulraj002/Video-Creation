@@ -12,17 +12,36 @@ export function clip(value: string, max: number): string {
   return `${clean.slice(0, max - 1).trimEnd()}…`;
 }
 
-/** Non-empty clipped text with a fallback. */
+/** Last-resort text when every candidate and the fallback are blank. */
+const LAST_RESORT_TEXT = 'Untitled';
+
+/** First non-blank candidate (whitespace-collapsed, clipped to `max`), else the fallback; never empty. */
+export function firstText(candidates: readonly (string | null | undefined)[], fallback: string, max: number): string {
+  for (const candidate of candidates) {
+    const clipped = candidate ? clip(candidate, max) : '';
+    if (clipped.length > 0) return clipped;
+  }
+  const fb = clip(fallback, max);
+  return fb.length > 0 ? fb : clip(LAST_RESORT_TEXT, max);
+}
+
+/** Non-empty clipped text with a fallback (never empty). */
 export function textOr(value: string | null | undefined, fallback: string, max: number): string {
-  const clipped = value ? clip(value, max) : '';
-  return clipped.length > 0 ? clipped : clip(fallback, max);
+  return firstText([value], fallback, max);
+}
+
+/** First non-blank candidate (clipped) or null when every candidate is blank. */
+export function firstTextOrNull(candidates: readonly (string | null | undefined)[], max: number): string | null {
+  for (const candidate of candidates) {
+    const clipped = candidate ? clip(candidate, max) : '';
+    if (clipped.length > 0) return clipped;
+  }
+  return null;
 }
 
 /** Clipped text or null when empty. */
 export function textOrNull(value: string | null | undefined, max: number): string | null {
-  if (!value) return null;
-  const clipped = clip(value, max);
-  return clipped.length > 0 ? clipped : null;
+  return firstTextOrNull([value], max);
 }
 
 /** Valid palette with at least `min` colors (defaults fill the gaps). */
@@ -91,11 +110,15 @@ export function itemsOf(ctx: TemplatePropsContext, max: number, maxLength: numbe
   return [textOr(ctx.title, 'Key point', maxLength)];
 }
 
-/** Extracts the first number in a string (e.g. "Grew 42.5% in 2025" → 42.5). */
+/**
+ * Extracts the first number in a string (e.g. "Grew 42.5% in 2025" → 42.5, "1,250 users" → 1250,
+ * "3,5x" → 3.5). Comma groups of exactly three digits are thousands separators; otherwise a comma is a decimal mark.
+ */
 export function firstNumber(value: string): { value: number; decimals: number; suffix: string | null } | null {
-  const match = /(-?\d+(?:[.,]\d+)?)\s*(%|x|k|m|\+)?/i.exec(value);
+  const match = /(-?\d{1,3}(?:,\d{3})+(?!\d)(?:\.\d+)?|-?\d+(?:[.,]\d+)?)(?:\s*(%|\+|(?:x|k|m)(?![a-z])))?/i.exec(value);
   if (!match || match[1] === undefined) return null;
-  const raw = match[1].replace(',', '.');
+  const token = match[1];
+  const raw = /^-?\d{1,3}(?:,\d{3})+(?:\.\d+)?$/.test(token) ? token.replace(/,/g, '') : token.replace(',', '.');
   const n = Number(raw);
   if (!Number.isFinite(n)) return null;
   const decimals = Math.min(3, raw.includes('.') ? (raw.split('.')[1] ?? '').length : 0);

@@ -31,7 +31,7 @@ export const productTurntableTemplate = defineTemplate({
   genres: ['product-3d', 'promo', 'cinematic-ad', 'social-short'],
   propsSchema: ProductTurntablePropsSchema,
   minDurationSeconds: 3,
-  buildProps(ctx) {
+  buildProps(ctx): ProductTurntableProps {
     const c = colorsOf(ctx);
     const haystack = `${ctx.title} ${ctx.text ?? ''} ${ctx.bullets.join(' ')}`;
     const primitive = PRIMITIVE_HINTS.find(([re]) => re.test(haystack))?.[1] ?? 'box';

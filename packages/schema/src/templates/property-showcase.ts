@@ -25,7 +25,7 @@ export const propertyShowcaseTemplate = defineTemplate({
   genres: ['real-estate'],
   propsSchema: PropertyShowcasePropsSchema,
   minDurationSeconds: 4,
-  buildProps(ctx) {
+  buildProps(ctx): PropertyShowcaseProps {
     const c = colorsOf(ctx);
     const price = PRICE.exec([ctx.text ?? '', ...ctx.bullets].join(' '));
     return {

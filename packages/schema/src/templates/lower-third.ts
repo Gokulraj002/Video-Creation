@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { HexColorSchema } from '../common';
-import { colorsOf, textOr, textOrNull } from './helpers';
+import { colorsOf, firstText, firstTextOrNull } from './helpers';
 import { defineTemplate } from './types';
 
 export const LowerThirdPropsSchema = z.object({
@@ -20,11 +20,11 @@ export const lowerThirdTemplate = defineTemplate({
   genres: ['corporate-training', 'presentation', 'long-form', 'sop-training', 'explainer', 'real-estate', 'promo'],
   propsSchema: LowerThirdPropsSchema,
   minDurationSeconds: 2,
-  buildProps(ctx) {
+  buildProps(ctx): LowerThirdProps {
     const c = colorsOf(ctx);
     return {
-      name: textOr(ctx.title, ctx.brandName ?? 'Speaker', 80),
-      role: textOrNull(ctx.text ?? ctx.brandName, 120),
+      name: firstText([ctx.title, ctx.brandName], 'Speaker', 80),
+      role: firstTextOrNull([ctx.text, ctx.brandName], 120),
       accentColor: c.accent,
     };
   },

@@ -21,7 +21,7 @@ export const floatingShapesTemplate = defineTemplate({
   genres: ['motion-graphics', 'product-3d', 'promo', 'social-short', 'cinematic-ad', 'presentation'],
   propsSchema: FloatingShapesPropsSchema,
   minDurationSeconds: 2,
-  buildProps(ctx) {
+  buildProps(ctx): FloatingShapesProps {
     const palette = paletteOf(ctx).slice(0, 5);
     return {
       shapes: pick(['spheres', 'cubes', 'torus', 'mixed'], ctx.title),
