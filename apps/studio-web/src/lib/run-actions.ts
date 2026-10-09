@@ -1,7 +1,7 @@
-import type { DirectorRunDTO } from '@vc/schema';
+import type { ClientRun } from './client-run';
 
-/** Result of the project-page Server Actions (start / re-run / cancel / delete). */
-export type RunActionResult = { ok: true; run: DirectorRunDTO | null } | { ok: false; code: string; message: string };
+/** Result of the project-page Server Actions (start / re-run / cancel / delete); runs in the slim client shape. */
+export type RunActionResult = { ok: true; run: ClientRun | null } | { ok: false; code: string; message: string };
 
 /** Human copy for error codes passed through the URL after project creation (`?runError=CODE`). */
 export function runErrorNotice(code: string): string {

@@ -12,29 +12,27 @@ export function AppShell({ children }: { children: ReactNode }) {
         <div className="mx-auto flex h-14 w-full max-w-7xl items-center gap-3 px-4 sm:px-6">
           <Link href="/" className="mr-2 flex items-center gap-2 font-semibold tracking-tight">
             <span className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-sm">
-              <Clapperboard className="size-4" />
+              <Clapperboard className="size-4" aria-hidden="true" />
             </span>
-            <span className="hidden sm:inline">AI Video Studio</span>
+            {/* Visually hidden on small screens but always in the accessibility tree (never `display: none`). */}
+            <span className="sr-only sm:not-sr-only">AI Video Studio</span>
           </Link>
           <nav aria-label="Main" className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
-            <NavLink href="/" exact>
-              <LayoutDashboard />
-              <span className="hidden md:inline">Dashboard</span>
+            <NavLink href="/" exact label="Dashboard">
+              <LayoutDashboard aria-hidden="true" />
             </NavLink>
-            <NavLink href="/projects" exact>
-              <FolderKanban />
-              <span className="hidden md:inline">Projects</span>
+            <NavLink href="/projects" exact label="Projects">
+              <FolderKanban aria-hidden="true" />
             </NavLink>
-            <NavLink href="/settings">
-              <Settings />
-              <span className="hidden md:inline">Settings</span>
+            <NavLink href="/settings" label="Settings">
+              <Settings aria-hidden="true" />
             </NavLink>
           </nav>
           <div className="flex items-center gap-1">
             <Button asChild size="sm">
               <Link href="/projects/new">
-                <Plus />
-                <span className="hidden sm:inline">New project</span>
+                <Plus aria-hidden="true" />
+                <span className="sr-only sm:not-sr-only">New project</span>
               </Link>
             </Button>
             <ThemeToggle />

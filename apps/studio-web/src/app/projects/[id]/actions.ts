@@ -4,14 +4,16 @@ import type { DirectorRunDTO } from '@vc/schema';
 import { refresh } from 'next/cache';
 import { redirect } from 'next/navigation';
 import { failureMessage } from '@/lib/api-failure';
+import { toClientRun } from '@/lib/client-run';
 import type { RunActionResult } from '@/lib/run-actions';
 import { cancelDirectorRun, deleteProject, isStudioApiError, startDirectorRun } from '@/lib/studio-api';
 
 async function runAction(call: () => Promise<DirectorRunDTO>): Promise<RunActionResult> {
   try {
     const run = await call();
+    // Re-render the page in the same round trip; the client must not refresh again for this change.
     refresh();
-    return { ok: true, run };
+    return { ok: true, run: toClientRun(run) };
   } catch (error) {
     if (!isStudioApiError(error)) throw error;
     return { ok: false, code: error.code, message: failureMessage(error.toFailure()) };

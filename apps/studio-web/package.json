@@ -5,9 +5,9 @@
   "type": "module",
   "description": "Universal AI Video Studio web app (Next.js App Router)",
   "scripts": {
-    "dev": "next dev --port 3000",
+    "dev": "next dev -H 127.0.0.1 --port 3000",
     "build": "next build",
-    "start": "next start --port 3000",
+    "start": "next start -H 127.0.0.1 --port 3000",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --passWithNoTests"
   },

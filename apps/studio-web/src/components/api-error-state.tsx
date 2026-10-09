@@ -1,4 +1,5 @@
 import { KeyRound, PlugZap, ServerCrash, TriangleAlert } from 'lucide-react';
+import type { ReactNode } from 'react';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -18,15 +19,33 @@ function iconFor(failure: ApiFailure) {
   }
 }
 
-/** Full-width card explaining why the Studio API call failed (unreachable, 401, misconfigured…). */
-export function ApiErrorState({ failure, retryHref }: { failure: ApiFailure; retryHref?: string }) {
-  const copy = describeFailure(failure);
+/**
+ * Full-width card explaining why the Studio API call failed (unreachable, 401, misconfigured…). Copy comes from
+ * `describeFailure` (generic for infrastructure failures — no base URL or low-level error text). `title` /
+ * `description` override it for failures the page understands better; `action` replaces the "Try again" link
+ * (e.g. when retrying the same URL cannot succeed).
+ */
+export function ApiErrorState({
+  failure,
+  retryHref,
+  title,
+  description,
+  action,
+}: {
+  failure: ApiFailure;
+  retryHref?: string;
+  title?: string;
+  description?: string;
+  action?: ReactNode;
+}) {
+  const described = describeFailure(failure);
+  const copy = { ...described, title: title ?? described.title, description: description ?? described.description };
   const Icon = iconFor(failure);
   return (
     <Card className="border-destructive/30">
       <CardContent className="flex flex-col items-start gap-4 p-6 sm:flex-row">
         <div className="flex size-11 shrink-0 items-center justify-center rounded-full bg-destructive/10 text-destructive">
-          <Icon className="size-5" />
+          <Icon className="size-5" aria-hidden="true" />
         </div>
         <div className="min-w-0 flex-1 space-y-2">
           <h2 className="text-lg font-semibold">{copy.title}</h2>
@@ -36,7 +55,9 @@ export function ApiErrorState({ failure, retryHref }: { failure: ApiFailure; ret
               {copy.hint}
             </p>
           ) : null}
-          {retryHref ? (
+          {action ? (
+            <div className="pt-1">{action}</div>
+          ) : retryHref ? (
             <div className="pt-1">
               <Button asChild variant="outline" size="sm">
                 {/* Plain anchor: a full reload re-runs every server request for the page. */}

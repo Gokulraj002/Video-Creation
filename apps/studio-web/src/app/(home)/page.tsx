@@ -8,6 +8,7 @@ import { ProjectsTable } from '@/components/projects/projects-table';
 import { StatCard } from '@/components/stat-card';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { projectCountStat } from '@/lib/dashboard';
 import { formatCompactNumber, formatNumber, formatUsd } from '@/lib/format';
 import { attempt, getUsageSummary, listProjects } from '@/lib/studio-api';
 
@@ -44,8 +45,8 @@ export default async function DashboardPage() {
 
   const page = projectsResult.data;
   const usage = usageResult.ok ? usageResult.data : null;
-  const projectCount = `${page.items.length}${page.nextCursor ? '+' : ''}`;
   const directing = page.items.filter((p) => p.status === 'directing').length;
+  const projectCount = projectCountStat(page, directing);
   const monthTokens = usage ? usage.month.inputTokens + usage.month.outputTokens : null;
 
   return (
@@ -60,8 +61,8 @@ export default async function DashboardPage() {
         <StatCard
           icon={FolderKanban}
           label="Projects"
-          value={projectCount}
-          hint={directing > 0 ? `${directing} directing now` : page.nextCursor ? 'Showing the most recent' : 'All projects'}
+          value={projectCount.value}
+          hint={projectCount.hint}
         />
         <StatCard
           icon={Zap}

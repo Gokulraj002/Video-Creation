@@ -336,6 +336,9 @@ function messageFor(key: FormErrorKey, input: Record<string, unknown>, issueMess
   return FRIENDLY_MESSAGES[key] ?? issueMessage;
 }
 
+/** `formError` when every problem is attached to a field (the UI shows the field summary instead). */
+export const GENERIC_FORM_ERROR = 'Please fix the highlighted fields.';
+
 export type ParseProjectFormResult =
   | { success: true; request: VideoRequest }
   | { success: false; fieldErrors: FieldErrors; formError: string | null };
@@ -389,7 +392,7 @@ export function parseProjectForm(form: FormLike, limits?: ResourceLimits | null)
   return {
     success: false,
     fieldErrors,
-    formError: unplaced.length > 0 ? unplaced.join(' · ') : 'Please fix the highlighted fields.',
+    formError: unplaced.length > 0 ? unplaced.join(' · ') : GENERIC_FORM_ERROR,
   };
 }
 

@@ -1,8 +1,18 @@
 'use client';
 
+import '@/lib/zod-jitless';
 import { resolveDimensions, type AspectRatio, type ResourceLimits, type Resolution } from '@vc/schema';
 import { LoaderCircle, Plus, Sparkles, TriangleAlert, X } from 'lucide-react';
-import { useActionState, useId, useState, startTransition, type FormEvent, type ReactNode } from 'react';
+import {
+  useActionState,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  startTransition,
+  type FormEvent,
+  type ReactNode,
+} from 'react';
 import { createProjectAction } from '@/app/projects/new/actions';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
@@ -13,6 +23,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
 import {
+  DURATION_INPUT_HINT,
   DURATION_UNIT_LABELS,
   DURATION_UNITS,
   formatDuration,
@@ -29,12 +40,21 @@ import {
   RESOLUTION_OPTIONS,
   VOICE_GENDER_OPTIONS,
 } from '@/lib/options';
-import { FORM_FIELDS, MAX_BRAND_COLORS, parseProjectForm, type FieldErrors, type FormErrorKey } from '@/lib/project-form';
+import {
+  FORM_FIELDS,
+  GENERIC_FORM_ERROR,
+  MAX_BRAND_COLORS,
+  aspectRatioMismatch,
+  parseProjectForm,
+  promptMaxChars,
+  summarizeFieldErrors,
+  type FieldErrors,
+  type FormErrorKey,
+} from '@/lib/project-form';
 import { INITIAL_CREATE_PROJECT_STATE } from '@/lib/project-form-state';
 import { cn } from '@/lib/utils';
 
 const DEFAULT_BRAND_PALETTE = ['#6366f1', '#0ea5e9', '#f59e0b', '#10b981', '#ef4444'];
-const DEFAULT_PROMPT_LIMIT = 20_000;
 
 function Field({
   id,
@@ -55,12 +75,15 @@ function Field({
     <div className={cn('flex flex-col gap-2', className)}>
       <Label htmlFor={id}>{label}</Label>
       {children}
+      {/* Per-field errors are plain text linked via aria-describedby; the form announces ONE summary (role=alert). */}
       {error ? (
-        <p id={`${id}-error`} className="text-xs font-medium text-destructive" role="alert">
+        <p id={`${id}-error`} className="text-xs font-medium text-destructive">
           {error}
         </p>
       ) : hint ? (
-        <p className="text-xs text-muted-foreground">{hint}</p>
+        <p id={`${id}-hint`} className="text-xs text-muted-foreground">
+          {hint}
+        </p>
       ) : null}
     </div>
   );
@@ -90,33 +113,67 @@ export function ProjectForm({ limits }: { limits: ResourceLimits | null }) {
   const [music, setMusic] = useState(false);
   const [localErrors, setLocalErrors] = useState<FieldErrors | null>(null);
   const [localFormError, setLocalFormError] = useState<string | null>(null);
+  /** Bumped on every failed submit (local or server): re-announces the summary and moves focus. */
+  const [failedSubmits, setFailedSubmits] = useState(0);
+  const formRef = useRef<HTMLFormElement>(null);
+  const summaryRef = useRef<HTMLDivElement>(null);
 
   const serverErrors = state.status === 'error' ? state.fieldErrors : {};
   const errors: FieldErrors = localErrors ?? serverErrors;
   const formError = localErrors ? localFormError : state.status === 'error' ? state.formError : null;
   const err = (key: FormErrorKey) => errors[key];
+  const errorSummary = summarizeFieldErrors(errors);
+  const extraFormError = formError && formError !== GENERIC_FORM_ERROR ? formError : null;
 
-  const isCustom = aspectRatio === 'custom' || resolution === 'custom';
-  const promptLimit = limits?.maxPromptChars ?? DEFAULT_PROMPT_LIMIT;
+  // A custom aspect ratio always uses the custom W × H: the resolution preset is ignored (and submitted as custom).
+  const effectiveResolution: Resolution = aspectRatio === 'custom' ? 'custom' : resolution;
+  const isCustom = aspectRatio === 'custom' || effectiveResolution === 'custom';
+  const promptLimit = promptMaxChars(limits);
   const maxFps = limits?.maxFps ?? 240;
 
   const duration = parseDurationInput(durationValue, durationUnit);
   const fpsNumber = /^\d+$/.test(fps) ? Number(fps) : Number.NaN;
   const overLimit = duration.ok && limits ? duration.seconds > limits.maxDurationSeconds : false;
+  const durationError =
+    err('duration') ?? (overLimit && limits ? `Exceeds the configured limit of ${formatDurationLong(limits.maxDurationSeconds)}` : undefined);
 
+  const widthNumber = /^\d+$/.test(customWidth) ? Number(customWidth) : Number.NaN;
+  const heightNumber = /^\d+$/.test(customHeight) ? Number(customHeight) : Number.NaN;
   let dimensions: { width: number; height: number } | null = null;
   try {
     dimensions = resolveDimensions({
       aspectRatio,
-      resolution,
-      customWidth: Number(customWidth) || undefined,
-      customHeight: Number(customHeight) || undefined,
+      resolution: effectiveResolution,
+      customWidth: Number.isFinite(widthNumber) ? widthNumber : undefined,
+      customHeight: Number.isFinite(heightNumber) ? heightNumber : undefined,
     });
   } catch {
     dimensions = null;
   }
   const dimensionsOverLimit =
     dimensions !== null && limits !== null && (dimensions.width > limits.maxWidth || dimensions.height > limits.maxHeight);
+  const ratioMismatch =
+    effectiveResolution === 'custom' && aspectRatio !== 'custom'
+      ? aspectRatioMismatch(aspectRatio, widthNumber, heightNumber)
+      : null;
+  const customWidthError = err('customWidth') ?? ratioMismatch?.message;
+
+  // After a failed submit: focus the first invalid field (DOM order), or the summary when none is focusable.
+  useEffect(() => {
+    if (failedSubmits === 0) return;
+    const first = formRef.current?.querySelector<HTMLElement>('[aria-invalid="true"]');
+    (first ?? summaryRef.current)?.focus();
+  }, [failedSubmits]);
+  useEffect(() => {
+    if (state.status === 'error') setFailedSubmits((n) => n + 1);
+  }, [state]);
+
+  /** Switching to a custom size starts from the size currently shown (so it matches the chosen ratio). */
+  const prefillCustomSize = () => {
+    if (!dimensions || isCustom) return;
+    setCustomWidth(String(dimensions.width));
+    setCustomHeight(String(dimensions.height));
+  };
 
   const onSubmit = (event: FormEvent<HTMLFormElement>) => {
     // Submit manually so React does not reset the form fields when the action returns validation errors.
@@ -126,6 +183,7 @@ export function ProjectForm({ limits }: { limits: ResourceLimits | null }) {
     if (!local.success) {
       setLocalErrors(local.fieldErrors);
       setLocalFormError(local.formError);
+      setFailedSubmits((n) => n + 1);
       return;
     }
     setLocalErrors(null);
@@ -141,25 +199,29 @@ export function ProjectForm({ limits }: { limits: ResourceLimits | null }) {
     );
 
   return (
-    <form onSubmit={onSubmit} noValidate className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_380px]">
+    <form ref={formRef} onSubmit={onSubmit} noValidate className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_380px]">
       {/* Hidden inputs mirror the controlled Radix widgets so FormData has every field. */}
       <input type="hidden" name={FORM_FIELDS.genre} value={genre} />
       <input type="hidden" name={FORM_FIELDS.durationUnit} value={durationUnit} />
       <input type="hidden" name={FORM_FIELDS.aspectRatio} value={aspectRatio} />
-      <input type="hidden" name={FORM_FIELDS.resolution} value={resolution} />
+      <input type="hidden" name={FORM_FIELDS.resolution} value={effectiveResolution} />
       <input type="hidden" name={FORM_FIELDS.voiceOverEnabled} value={voiceOver ? 'on' : ''} />
       <input type="hidden" name={FORM_FIELDS.voiceOverGender} value={voiceGender} />
       <input type="hidden" name={FORM_FIELDS.musicEnabled} value={music ? 'on' : ''} />
 
       <div className="flex min-w-0 flex-col gap-6">
-        {formError ? (
-          <Alert variant="destructive">
-            <TriangleAlert />
-            <AlertTitle>Could not create the project</AlertTitle>
-            <AlertDescription>
-              <p>{formError}</p>
-            </AlertDescription>
-          </Alert>
+        {errorSummary || extraFormError ? (
+          // The single live announcement for a failed submit (keyed so a repeated failure is announced again).
+          <div ref={summaryRef} tabIndex={-1} className="outline-none" key={failedSubmits}>
+            <Alert variant="destructive">
+              <TriangleAlert />
+              <AlertTitle>Could not create the project</AlertTitle>
+              <AlertDescription>
+                {errorSummary ? <p>{errorSummary}</p> : null}
+                {extraFormError ? <p>{extraFormError}</p> : null}
+              </AlertDescription>
+            </Alert>
+          </div>
         ) : null}
 
         <Card>
@@ -331,9 +393,7 @@ export function ProjectForm({ limits }: { limits: ResourceLimits | null }) {
                 ) : null}
               </div>
               {err('brandColors') ? (
-                <p className="text-xs font-medium text-destructive" role="alert">
-                  {err('brandColors')}
-                </p>
+                <p className="text-xs font-medium text-destructive">{err('brandColors')}</p>
               ) : null}
             </div>
           </CardContent>
@@ -350,10 +410,10 @@ export function ProjectForm({ limits }: { limits: ResourceLimits | null }) {
             <Field
               id={fid('duration')}
               label="Duration"
-              error={err('duration') ?? (overLimit && limits ? `Exceeds the configured limit of ${formatDurationLong(limits.maxDurationSeconds)}` : undefined)}
+              error={durationError}
               hint={
                 <>
-                  {duration.ok ? `${formatDuration(duration.seconds)}` : 'Enter a positive number'}
+                  {duration.ok ? `${formatDuration(duration.seconds)}` : duration.error}
                   {duration.ok && Number.isFinite(fpsNumber) && fpsNumber > 0
                     ? ` · ${formatNumber(Math.round(duration.seconds * fpsNumber))} frames`
                     : ''}
@@ -361,6 +421,8 @@ export function ProjectForm({ limits }: { limits: ResourceLimits | null }) {
                   {limits
                     ? `Configured limit: ${formatDurationLong(limits.maxDurationSeconds)}`
                     : 'Limit unavailable (API offline)'}
+                  <br />
+                  {DURATION_INPUT_HINT}
                 </>
               }
             >
@@ -372,7 +434,8 @@ export function ProjectForm({ limits }: { limits: ResourceLimits | null }) {
                   value={durationValue}
                   onChange={(e) => setDurationValue(e.currentTarget.value)}
                   className="flex-1"
-                  {...errorProps(fid('duration'), err('duration'))}
+                  aria-describedby={durationError ? undefined : `${fid('duration')}-hint`}
+                  {...errorProps(fid('duration'), durationError)}
                 />
                 <Select value={durationUnit} onValueChange={(v) => isDurationUnit(v) && setDurationUnit(v)}>
                   <SelectTrigger className="w-32" aria-label="Duration unit">
@@ -395,10 +458,12 @@ export function ProjectForm({ limits }: { limits: ResourceLimits | null }) {
                   value={aspectRatio}
                   onValueChange={(v) => {
                     const match = ASPECT_RATIO_OPTIONS.find((o) => o.value === v);
-                    if (match) setAspectRatio(match.value);
+                    if (!match) return;
+                    if (match.value === 'custom') prefillCustomSize();
+                    setAspectRatio(match.value);
                   }}
                 >
-                  <SelectTrigger id={fid('aspectRatio')}>
+                  <SelectTrigger id={fid('aspectRatio')} {...errorProps(fid('aspectRatio'), err('aspectRatio'))}>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -410,15 +475,27 @@ export function ProjectForm({ limits }: { limits: ResourceLimits | null }) {
                   </SelectContent>
                 </Select>
               </Field>
-              <Field id={fid('resolution')} label="Resolution" error={err('resolution')}>
+              <Field
+                id={fid('resolution')}
+                label="Resolution"
+                error={err('resolution')}
+                hint={aspectRatio === 'custom' ? 'Not used: a custom aspect ratio uses the width × height below.' : undefined}
+              >
                 <Select
-                  value={resolution}
+                  value={effectiveResolution}
+                  disabled={aspectRatio === 'custom'}
                   onValueChange={(v) => {
                     const match = RESOLUTION_OPTIONS.find((o) => o.value === v);
-                    if (match) setResolution(match.value);
+                    if (!match) return;
+                    if (match.value === 'custom') prefillCustomSize();
+                    setResolution(match.value);
                   }}
                 >
-                  <SelectTrigger id={fid('resolution')}>
+                  <SelectTrigger
+                    id={fid('resolution')}
+                    aria-describedby={aspectRatio === 'custom' ? `${fid('resolution')}-hint` : undefined}
+                    {...errorProps(fid('resolution'), err('resolution'))}
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -434,14 +511,14 @@ export function ProjectForm({ limits }: { limits: ResourceLimits | null }) {
 
             {isCustom ? (
               <div className="grid grid-cols-2 gap-3">
-                <Field id={fid('customWidth')} label="Width (px)" error={err('customWidth')}>
+                <Field id={fid('customWidth')} label="Width (px)" error={customWidthError}>
                   <Input
                     id={fid('customWidth')}
                     name={FORM_FIELDS.customWidth}
                     inputMode="numeric"
                     value={customWidth}
                     onChange={(e) => setCustomWidth(e.currentTarget.value)}
-                    {...errorProps(fid('customWidth'), err('customWidth'))}
+                    {...errorProps(fid('customWidth'), customWidthError)}
                   />
                 </Field>
                 <Field id={fid('customHeight')} label="Height (px)" error={err('customHeight')}>
@@ -454,7 +531,12 @@ export function ProjectForm({ limits }: { limits: ResourceLimits | null }) {
                     {...errorProps(fid('customHeight'), err('customHeight'))}
                   />
                 </Field>
-                <p className="col-span-2 text-xs text-muted-foreground">Even numbers between 16 and 8192.</p>
+                <p className="col-span-2 text-xs text-muted-foreground">
+                  Even numbers between 16 and 8192.
+                  {aspectRatio !== 'custom'
+                    ? ` Must match ${aspectRatio} — or choose “Custom W × H” as the aspect ratio for a free size.`
+                    : ''}
+                </p>
               </div>
             ) : null}
 

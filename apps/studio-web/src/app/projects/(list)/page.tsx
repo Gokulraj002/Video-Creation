@@ -46,10 +46,42 @@ export default async function ProjectsPage({
   );
 
   if (!result.ok) {
+    // A malformed / stale cursor (e.g. the project it pointed at was deleted) can never succeed on retry: offer the
+    // first page instead of a "Try again" that repeats the same request.
+    const badCursor =
+      cursor !== null && (result.failure.code === 'INVALID_CURSOR' || (result.failure.kind === 'http' && result.failure.status === 400));
     return (
       <>
         {header}
-        <ApiErrorState failure={result.failure} retryHref={cursor ? `/projects?cursor=${cursor}` : '/projects'} />
+        {badCursor ? (
+          <ApiErrorState
+            failure={result.failure}
+            title="This page of projects is no longer available"
+            description="The link points to a position in the list that does not exist anymore (for example, because projects were deleted)."
+            action={
+              <Button asChild variant="outline" size="sm">
+                <Link href="/projects">Back to first page</Link>
+              </Button>
+            }
+          />
+        ) : (
+          <ApiErrorState
+            failure={result.failure}
+            retryHref={cursor ? `/projects?cursor=${encodeURIComponent(cursor)}` : '/projects'}
+            action={
+              cursor ? (
+                <span className="flex flex-wrap gap-2">
+                  <Button asChild variant="outline" size="sm">
+                    <a href={`/projects?cursor=${encodeURIComponent(cursor)}`}>Try again</a>
+                  </Button>
+                  <Button asChild variant="ghost" size="sm">
+                    <Link href="/projects">Back to first page</Link>
+                  </Button>
+                </span>
+              ) : undefined
+            }
+          />
+        )}
       </>
     );
   }
