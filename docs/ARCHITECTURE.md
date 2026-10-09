@@ -179,25 +179,26 @@ flowchart LR
 | studio-web | Renders pages on the server. Mutations are Server Actions. Client-side progress polling goes through the route handler `src/app/api/runs/[runId]/route.ts`, which proxies to the API on the server. Every API response is validated with the `@vc/schema` DTO schemas. All pages are `dynamic = 'force-dynamic'`, so nothing calls the API at build time. Shows only actions that work. | studio-api (HTTP) |
 | studio-api | Authenticates bearer tokens, validates input with Zod, enforces limits, quotas and rate limits, scopes every query to the owner, persists projects and runs, enqueues director jobs, serves versions and usage. | Postgres, Redis (BullMQ driver) |
 | Director worker | Separate Node process when `QUEUE_DRIVER=bullmq`. Consumes `studio-director` jobs, runs the AI Director, persists progress, results and usage. Concurrency from `DIRECTOR_WORKER_CONCURRENCY`. Shuts down gracefully on SIGTERM and SIGINT. | Postgres, Redis, AI provider |
-| Inline queue | `QUEUE_DRIVER=inline` runs the same `process-run` asynchronously inside the API process and exposes `onIdle()`. Used by the API tests; usable for a single-process local setup. | Same as the worker |
+| Inline queue | `QUEUE_DRIVER=inline` runs the same `process-run` asynchronously inside the API process and exposes `onIdle()`. Used by the API tests; usable for single-process development, with no Redis needed. | Postgres, AI provider |
 | Postgres `video_studio` | Source of truth for users, tokens, projects, versions, runs and the stage cache. See [DATABASE.md](DATABASE.md). | — |
 | Redis | BullMQ transport only. Losing Redis loses queued jobs, not data. | — |
 
 ### 4.1 HTTP API surface (M1)
 
-All `/v1/*` routes require `Authorization: Bearer <token>` and return `{error: {code, message, details?}}` on failure.
+All `/v1/*` routes require `Authorization: Bearer <token>` and return `{error: {code, message, details?}}` on failure. Any
+route can return 429 `RATE_LIMITED`.
 
 | Method and path | Result | Notable errors |
 |---|---|---|
 | `GET /health` (public) | `{ok: true, version}` | — |
 | `GET /v1/me` | `MeDTO` | 401 `UNAUTHORIZED` |
 | `GET /v1/system/config` | `SystemConfigDTO`: AI provider (name, model, mode, configured), queue driver, limits, engine availability with reasons, template catalog summary, prompt version. Never contains secrets. | — |
-| `GET /v1/projects?limit=20&cursor=` | Paginated `ProjectSummaryDTO`, owner-scoped, `updatedAt` desc | — |
+| `GET /v1/projects?limit=20&cursor=` | Paginated `ProjectSummaryDTO`, owner-scoped, `updatedAt` desc | 400 `INVALID_CURSOR` |
 | `POST /v1/projects` | 201 `ProjectDetailDTO` | 400 `VALIDATION_ERROR`, 422 `LIMIT_EXCEEDED` |
-| `GET /v1/projects/:id` · `DELETE /v1/projects/:id` | `ProjectDetailDTO` · 204 | 404 `NOT_FOUND`; delete returns 409 while a run is active |
-| `POST /v1/projects/:id/director-runs` | 202 `DirectorRunDTO` | 409 `RUN_ACTIVE`, 429 `QUOTA_EXCEEDED` |
+| `GET /v1/projects/:id` · `DELETE /v1/projects/:id` | `ProjectDetailDTO` · 204 | 404 `NOT_FOUND`; delete returns 409 `RUN_ACTIVE` while a run is queued or running |
+| `POST /v1/projects/:id/director-runs` | 202 `DirectorRunDTO` | 409 `RUN_ACTIVE`, 429 `QUOTA_EXCEEDED`, 503 `QUEUE_UNAVAILABLE` |
 | `GET /v1/projects/:id/director-runs` | Latest 20 `DirectorRunDTO` | — |
-| `GET /v1/director-runs/:runId` · `POST /v1/director-runs/:runId/cancel` | `DirectorRunDTO` | cancel returns 409 unless the run is `QUEUED` or `RUNNING` |
+| `GET /v1/director-runs/:runId` · `POST /v1/director-runs/:runId/cancel` | `DirectorRunDTO` | cancel returns 409 `RUN_NOT_ACTIVE` unless the run is `QUEUED` or `RUNNING` |
 | `GET /v1/projects/:id/versions` · `GET /v1/projects/:id/versions/:version` | `ProjectVersionSummaryDTO[]` · `ProjectVersionDTO` (artifacts + timeline) | — |
 | `GET /v1/usage` | `UsageSummaryDTO` (today as a UTC day, and this month) | — |
 
@@ -333,13 +334,13 @@ sequenceDiagram
   A->>DB: insert Project (DRAFT)
   A-->>W: 201 ProjectDetailDTO
   W->>A: POST /v1/projects/:id/director-runs
-  A->>DB: active run for project? runs and cost today?
+  A->>DB: transaction with project row locked (FOR UPDATE): active run? runs and cost today?
   alt a run is QUEUED or RUNNING
     A-->>W: 409 RUN_ACTIVE
   else daily run or USD quota reached
     A-->>W: 429 QUOTA_EXCEEDED
   else accepted
-    A->>DB: insert DirectorRun (QUEUED), Project to DIRECTING
+    A->>DB: insert DirectorRun (QUEUED), Project to DIRECTING, commit
     A->>Q: add job with runId
     A-->>W: 202 DirectorRunDTO
   end
@@ -347,13 +348,12 @@ sequenceDiagram
 
   par Worker processes the job
     Q->>K: deliver job (runId)
-    K->>DB: load run and project
-    Note over K: skip unless the run is still QUEUED
-    K->>DB: run RUNNING, startedAt
+    K->>DB: claim: update QUEUED to RUNNING, startedAt
+    Note over K: no row matched means already claimed or cancelled, so skip
     loop brief, outline, 5 stages per chapter, compile
       K->>P: generateStructured (skipped on cache hit)
       P-->>K: output, validated and repaired if needed
-      K->>DB: persist progress (at most every 500 ms), read run status
+      K->>DB: progress write where status is RUNNING (at most every 500 ms)
     end
   and Browser polls progress
     loop until a terminal status
@@ -367,31 +367,36 @@ sequenceDiagram
   opt User cancels
     U->>W: Cancel (Server Action)
     W->>A: POST /v1/director-runs/:runId/cancel
-    A->>DB: run CANCELLED
+    A->>DB: run CANCELLED + finishedAt, Project READY if it has a version, else DRAFT
     A-->>W: DirectorRunDTO
-    K->>DB: next progress write sees CANCELLED
+    K->>DB: next progress write or 2 s status poll finds the run no longer RUNNING
     K->>K: abort the AbortController, in-flight provider request aborted
   end
 
   alt success
-    K->>DB: one transaction: ProjectVersion (max + 1), run SUCCEEDED with usage, Project READY + currentVersionId
-  else DirectorError, timeout or unexpected error
+    K->>DB: one transaction: run RUNNING to SUCCEEDED with usage, ProjectVersion (max + 1), Project READY + currentVersionId
+  else DirectorError, TIMEOUT or unexpected error
     K->>DB: run FAILED (errorCode, sanitized message), Project READY if it has a version, else FAILED
   else cancelled
-    K->>DB: run stays CANCELLED, Project READY if it has a version, else FAILED
+    K->>DB: run stays CANCELLED, project status already restored
   end
 ```
 
 Notes:
 
-- The job payload is `{runId}` only. The worker reloads everything from Postgres and does nothing if the run is no longer
-  `QUEUED`, so a duplicate delivery or a job for a run cancelled while queued is harmless.
-- Cancellation reaches the worker through the database: the cancel endpoint writes `CANCELLED`, and the worker checks the run
-  status when it persists progress. The director also checks `signal.aborted` before every provider call and every chapter,
-  and the signal is passed to the SDK so an in-flight request is aborted.
+- The job payload is `{runId}` only. The worker claims the run with one conditional update (`QUEUED` to `RUNNING`) and does
+  nothing if no row matches, so a duplicate delivery or a job for a run cancelled while queued is harmless.
+- Cancellation reaches the worker through the database. The cancel endpoint writes `CANCELLED` and restores the project status
+  in one transaction. The worker notices on its next progress event, or within about 2 s through a status poll that runs while
+  a provider call is in flight. The director also checks `signal.aborted` before every provider call and every chapter, and the
+  signal is passed to the SDK so an in-flight request is aborted.
+- The success transaction only matches a run that is still `RUNNING`. If a cancel lands while the worker is committing, the
+  transaction rolls back and the cancel wins.
+- If the job cannot be enqueued (Redis down), the run is marked `FAILED` with `QUEUE_UNAVAILABLE` and the API returns 503.
+- A cancelled first run returns the project to `DRAFT`, not `FAILED`. The full state machines are in
+  [DATABASE.md](DATABASE.md#5-status-enums-and-state-machines).
 - With `QUEUE_DRIVER=inline`, the "Worker processes the job" branch runs inside the API process instead of a separate worker,
   and Redis is not involved.
-- Status state machines for `Project` and `DirectorRun` are in [DATABASE.md](DATABASE.md#5-status-enums-and-state-machines).
 
 ## 8. Multi-engine scene model
 
@@ -471,7 +476,8 @@ the director does.
 
 **No provider is reported as connected unless it is configured.** `SystemConfigDTO.aiProvider.configured` reports whether the
 active provider has what it needs. Config validation refuses to start with `AI_PROVIDER=anthropic` and no `ANTHROPIC_API_KEY`.
-M1 does not make a test call to Claude at startup, so `configured` means "credentials present", not "verified working". No
+`configured` is always true for the mock, and true for Anthropic when a key is set. M1 does not make a test call to Claude at
+startup, so it means "credentials present", not "verified working". No
 video-generation, TTS, music or transcription provider exists in M1, and the UI does not imply one.
 
 ### 9.2 Planned: media provider adapters (M3 to M6)
@@ -557,11 +563,11 @@ Design intent:
 
 | Concern | M1 | Planned |
 |---|---|---|
-| Provider keys | `ANTHROPIC_API_KEY` lives only in the studio-api and worker environment. studio-web never receives it. `GET /v1/system/config` never returns secrets (covered by a test). pino `redact` removes authorization headers and API keys from logs. | — |
-| API tokens | Stored as SHA-256 hex in `ApiToken.tokenHash` and looked up by hash. Tokens are meant to be long random strings, not passwords, which is why a fast unsalted hash is adequate. A token with `revokedAt` set must not authenticate. M1 has no token-management endpoints; the seed script creates the dev token from `STUDIO_DEV_API_TOKEN` (at least 32 characters) and prints nothing secret. ([ADR-015](DECISIONS.md#adr-015-m1-auth-is-hashed-per-user-bearer-tokens-oidc-in-m8)) | OIDC login, sessions, teams and roles (M8) |
+| Provider keys | `ANTHROPIC_API_KEY` lives only in the studio-api and worker environment. studio-web never receives it. `GET /v1/system/config` never returns secrets (covered by a test). The API logs through Fastify's pino logger with `redact` paths for authorization headers and API keys; the worker uses a pino-compatible JSON logger that redacts keys that look like secrets (authorization, API key, token, secret, password). Run error messages are sanitized before they are stored (Anthropic-style keys and bearer tokens redacted). | — |
+| API tokens | Stored as SHA-256 hex in `ApiToken.tokenHash` and looked up by hash. Tokens are meant to be long random strings (the helper generates `vcs_` plus 256 random bits), not passwords, which is why a fast unsalted hash is adequate. Revoked tokens (`revokedAt` set) get 401. M1 has no token-management endpoints; the seed script creates the dev token from `STUDIO_DEV_API_TOKEN` (at least 32 characters) and prints nothing secret. ([ADR-015](DECISIONS.md#adr-015-m1-auth-is-hashed-per-user-bearer-tokens-oidc-in-m8)) | OIDC login, sessions, teams and roles (M8) |
 | Tenant isolation | Every project and run query is scoped by owner (`ownerId: user.id`). Foreign and missing ids both return 404 `NOT_FOUND`, so existence does not leak. | Organizations and sharing (M8) |
 | Input validation | Zod validates env at startup, request bodies, params and queries, every LLM output (plus semantic validators), and, in studio-web, every API response. Body limit 1 MB. Errors return `{error: {code, message, details?}}`; unknown errors return 500 `INTERNAL` with no stack trace. CORS allowlist from `CORS_ORIGINS`. | Upload size limits and MIME sniffing from content (M3) |
-| Abuse and cost | `@fastify/rate-limit` per token (`RATE_LIMIT_PER_MINUTE`). Daily per-user run and USD quotas (429 `QUOTA_EXCEEDED`). Resource limits (422 `LIMIT_EXCEEDED`) are checked before any provider call. One active run per project (409 `RUN_ACTIVE`). The USD quota uses estimated cost and is checked when a run starts, so one large run can overshoot it. | Per-plan quotas and billing (M8); per-job estimates and confirmation for generative video (M6) |
+| Abuse and cost | `@fastify/rate-limit` keyed by the hash of the bearer token, or by client IP for unauthenticated requests (`RATE_LIMIT_PER_MINUTE`, 429 `RATE_LIMITED`). Daily per-user run and USD quotas (429 `QUOTA_EXCEEDED`). Resource limits (422 `LIMIT_EXCEEDED`) are checked before any provider call. One active run per project (409 `RUN_ACTIVE`). The USD quota is soft: it is checked when a run starts, cost is only recorded for successful runs, and runs on different projects can start concurrently. | Per-plan quotas, billing and a per-call usage ledger (M8); per-job estimates and confirmation for generative video (M6) |
 | Asset URIs | `SafeUriSchema` accepts only `asset://<assetId>` and `https:`. It rejects `http:`, `file:`, `data:`, `javascript:`, embedded credentials, whitespace and control characters. M1 never fetches asset URIs. | When renderers and analysis start fetching (M2, M3): resolve `asset://` through the storage driver, and fetch `https:` only through an allowlist or proxy to prevent SSRF |
 | LLM output | Never executed. The model only picks catalog templates and fills props validated by per-template Zod schemas. Timeline-level JSON values are bounded (string length, array and object size, depth). LLM text is displayed as text (React escapes it), never injected as HTML. | Sandboxed render and analysis workers (M8) |
 | Prompt injection | The user prompt, style notes and reference data are wrapped in `<user_request>` and `<reference_profile>` tags, and each stage's system prompt says they are untrusted data, never instructions. The model has no tools, so injected text cannot trigger actions or exfiltrate data. Outputs are constrained by structured outputs and re-validated. The worst case is a poor plan in the requester's own project. | The same tagging for transcripts and sampled frames (M3) |
@@ -572,30 +578,30 @@ Design intent:
 
 | Concern | M1 behaviour | Planned |
 |---|---|---|
-| Timeouts | Whole run: `DIRECTOR_RUN_TIMEOUT_MS` (default 1 800 000 ms = 30 min), after which the run fails. Per Claude request: SDK timeout 600 000 ms. | Render timeouts (M2); provider job timeouts (M6) |
-| Cancellation | `QUEUED` or `RUNNING` runs can be cancelled. The worker notices on its next progress write and aborts an `AbortController`. The director checks the signal before every provider call and every chapter, and passes it to the SDK. | Render cancellation with temp cleanup (M2); analysis cancellation (M3) |
-| Idempotent jobs | Jobs carry `{runId}` only. Processing skips runs that are not `QUEUED`. Success is one transaction (new version, run `SUCCEEDED`, project `READY` with `currentVersionId`). `(projectId, version)` is unique. BullMQ `attempts: 1`, so a run is never processed twice by queue retries. | Idempotency keys on provider jobs (M6) |
+| Timeouts | Whole run: `DIRECTOR_RUN_TIMEOUT_MS` (default 1 800 000 ms = 30 min), after which the run is aborted and fails with `errorCode = TIMEOUT`. Per Claude request: SDK timeout 600 000 ms. | Render timeouts (M2); provider job timeouts (M6) |
+| Cancellation | `QUEUED` or `RUNNING` runs can be cancelled. The worker notices on its next progress event or through a status poll every 2 s, and aborts an `AbortController`. The director checks the signal before every provider call and every chapter, and passes it to the SDK. | Render cancellation with temp cleanup (M2); analysis cancellation (M3) |
+| Idempotent jobs | Jobs carry `{runId}` only. The worker claims a run with a conditional `QUEUED` to `RUNNING` update and skips it if nothing matches. Success is one transaction (run `SUCCEEDED` only if still `RUNNING`, new version, project `READY` with `currentVersionId`). `(projectId, version)` and `directorRunId` are unique. BullMQ `attempts: 1`, so a run is never processed twice by queue retries. If the BullMQ job itself fails, the run is marked `FAILED` (`INTERNAL`). | Idempotency keys on provider jobs (M6) |
 | Retries | SDK retries 408, 409, 429 and 5xx (`maxRetries` 2). The director repairs invalid outputs with fresh single-turn prompts (default 2 extra attempts). One prompt-mode retry on schema-related 400s. Refusals and config errors are not retried. Re-running a whole run is an explicit user action, and the stage cache makes it cheap. | Per-segment render retries (M2); resumable renders (M7) |
 | Temp files | The director keeps everything in memory and in Postgres; M1 writes no temp files. | Per-job temp directories removed on success, failure and cancellation, plus a sweep for orphans at worker start (M2, M3) |
-| Shutdown | The worker shuts down gracefully on SIGTERM and SIGINT. | — |
+| Shutdown | On SIGTERM or SIGINT the worker stops taking jobs, waits for active runs, and disconnects from Postgres. A second signal forces an immediate exit. | — |
+| Queue outage | If enqueueing fails, the run is marked `FAILED` (`QUEUE_UNAVAILABLE`), the project status is restored, and the API returns 503. Jobs already in Redis are lost if Redis loses its data; their runs stay `QUEUED`. | — |
 | Known gaps | A worker that dies mid-run leaves the run `RUNNING`; the project stays blocked (409) until the user cancels. There is no stale-run reaper yet ([ROADMAP](ROADMAP.md#known-gaps-carried-out-of-m1)). | Reaper based on heartbeat or `startedAt` + timeout (M2 candidate) |
 
 ## 13. Configuration and resource limits
 
 Configuration comes from environment variables, validated with Zod at startup (`apps/studio-api/src/config.ts`). An invalid or
-missing required value stops the process instead of failing later. Every variable is documented in the studio-api
-`.env.example` and in [DEVELOPMENT.md](DEVELOPMENT.md). Values below are the defaults from the M1 contract; where only the
-allowed values are listed, see `config.ts` for the default.
+missing required value stops the process instead of failing later. Every variable is documented in
+`apps/studio-api/.env.example` (copy it to `apps/studio-api/.env`) and in [DEVELOPMENT.md](DEVELOPMENT.md). Defaults:
 
 | Group | Variables |
 |---|---|
-| Server | `NODE_ENV`, `STUDIO_API_HOST=0.0.0.0`, `STUDIO_API_PORT=4100`, `CORS_ORIGINS=http://localhost:3000` (comma list), `LOG_LEVEL=info` |
-| Data and queue | `DATABASE_URL` (database `video_studio`), `REDIS_URL`, `QUEUE_DRIVER` (`bullmq` \| `inline`) |
-| AI provider | `AI_PROVIDER=mock` (or `anthropic`), `ANTHROPIC_API_KEY` (required only when `AI_PROVIDER=anthropic`), `ANTHROPIC_MODEL=claude-opus-5-5`, `ANTHROPIC_EFFORT=medium`, `ANTHROPIC_MAX_OUTPUT_TOKENS=16000`, `ANTHROPIC_FALLBACKS` (`default` \| `off`), `ANTHROPIC_STRUCTURED_OUTPUT` (`json_schema` \| `prompt`) |
-| Director | `DIRECTOR_MAX_REPAIR_ATTEMPTS=2`, `DIRECTOR_RUN_TIMEOUT_MS=1800000`, `DIRECTOR_CACHE` (`on` \| `off`), `DIRECTOR_PRICING_JSON` (optional pricing override), `DIRECTOR_WORKER_CONCURRENCY=2` |
-| Quotas and rate limit | `LIMIT_DIRECTOR_RUNS_PER_DAY=50`, `LIMIT_DIRECTOR_USD_PER_DAY=25`, `RATE_LIMIT_PER_MINUTE=300` |
+| Server | `NODE_ENV=development` (`development` \| `test` \| `production`), `STUDIO_API_HOST=0.0.0.0`, `STUDIO_API_PORT=4100`, `CORS_ORIGINS=http://localhost:3000` (comma list), `LOG_LEVEL=info` (`fatal` to `trace`, or `silent`) |
+| Data and queue | `DATABASE_URL` (database `video_studio`), `REDIS_URL=redis://localhost:6379`, `QUEUE_DRIVER=bullmq` (or `inline`), `TEST_DATABASE_URL` (tests only, default database `video_studio_test`) |
+| AI provider | `AI_PROVIDER=mock` (or `anthropic`), `ANTHROPIC_API_KEY` (required only when `AI_PROVIDER=anthropic`), `ANTHROPIC_MODEL=claude-opus-5-5`, `ANTHROPIC_EFFORT=medium` (`low` \| `medium` \| `high` \| `xhigh` \| `max`), `ANTHROPIC_MAX_OUTPUT_TOKENS=16000` (256 to 16 000), `ANTHROPIC_FALLBACKS=default` (or `off`), `ANTHROPIC_STRUCTURED_OUTPUT=json_schema` (or `prompt`) |
+| Director | `DIRECTOR_MAX_REPAIR_ATTEMPTS=2`, `DIRECTOR_RUN_TIMEOUT_MS=1800000`, `DIRECTOR_CACHE=on` (or `off`), `DIRECTOR_PRICING_JSON` (optional, merged over the built-in pricing table), `DIRECTOR_WORKER_CONCURRENCY=2` |
+| Quotas and rate limit | `LIMIT_DIRECTOR_RUNS_PER_DAY=50`, `LIMIT_DIRECTOR_USD_PER_DAY=25` (per user per UTC day), `RATE_LIMIT_PER_MINUTE=300` |
 | Dev seed | `STUDIO_DEV_USER_EMAIL=dev@localhost`, `STUDIO_DEV_API_TOKEN` (at least 32 characters, used only by the seed script) |
-| studio-web (`apps/studio-web/.env.example`) | `STUDIO_API_URL=http://localhost:4100`, `STUDIO_API_TOKEN` (server-side only) |
+| studio-web (`apps/studio-web/.env.example`) | `STUDIO_API_URL=http://localhost:4100`, `STUDIO_API_TOKEN` (server-side only; the same value as `STUDIO_DEV_API_TOKEN` in development) |
 
 Resource limits are configuration, not hardcoded maxima
 ([ADR-016](DECISIONS.md#adr-016-configurable-resource-limits-instead-of-hardcoded-duration-caps)). `@vc/schema` defines
@@ -609,7 +615,7 @@ Resource limits are configuration, not hardcoded maxima
 | `maxScenes` | `LIMIT_MAX_SCENES` | 2000 |
 | `maxChapters` | `LIMIT_MAX_CHAPTERS` | 200 |
 | `maxPromptChars` | `LIMIT_MAX_PROMPT_CHARS` | 20000 |
-| `maxTracks` / `maxAssets` | none in the M1 contract (schema defaults apply) | 50 / 500 |
+| `maxTracks` / `maxAssets` | `LIMIT_MAX_TRACKS` / `LIMIT_MAX_ASSETS` (optional) | 50 / 500 |
 
 Limits are checked at three points: `POST /v1/projects` (`checkVideoRequestLimits`, 422 `LIMIT_EXCEEDED`), the start of
 `planProject` (before any provider call), and after compilation (`checkTimelineLimits`). The schemas themselves impose no
@@ -629,8 +635,10 @@ Processes and ports in local development:
 
 M1:
 
-- **Logs.** Structured JSON logs with pino through Fastify's logger, level from `LOG_LEVEL`, with authorization headers and API
-  keys redacted. `AIDirector` accepts an injected logger.
+- **Logs.** Structured JSON lines, level from `LOG_LEVEL`. The API uses Fastify's pino logger (request logging, redaction of
+  authorization headers and API keys). The worker uses a pino-compatible logger tagged `service: studio-worker` that redacts
+  secret-looking keys. Run log lines carry `runId`, and the worker logs its queue, concurrency, provider, model and cache
+  setting at startup. `AIDirector` receives the logger through its factory.
 - **Run telemetry in Postgres.** Each `DirectorRun` stores status, progress (completed and total steps, current stage, message),
   `createdAt`, `startedAt` and `finishedAt` (queue wait and run duration), the error code and sanitized message, token totals,
   estimated cost, and, for successful runs, the full `UsageReport`. The report has one entry per stage call with chunk, provider, model, attempts,
@@ -640,8 +648,9 @@ M1:
 - The PRD's product metrics (PRD section 8.2) can be computed from these rows: success rate from run statuses, first-attempt
   validity from `attempts` per stage, refusal rate from `errorCode = PROVIDER_REFUSAL`, cache effectiveness from
   `cachedCalls`, cost per planned minute from `estimatedCostUsd` and `Project.durationSeconds`.
-- **Gap:** `DirectorResult.warnings` (for example engine-coercion warnings) has no column in the M1 schema, so warnings are not
-  persisted or shown in the UI unless the code adds them somewhere.
+- **Gaps.** `DirectorResult.warnings` (for example engine-coercion warnings) has no column in the M1 schema; only their count is
+  logged when a run succeeds, so they are not shown in the UI. Usage is recorded only for successful runs, so tokens spent by
+  failed, timed-out or cancelled runs do not appear in these figures (see [DATABASE.md](DATABASE.md#35-directorrun-table-director_runs)).
 
 Planned (M8): metrics (queue depth, run and render failure rates, stage latency, cost), tracing, dashboards and alerting; a
 readiness endpoint that reports Postgres, Redis and provider status separately.
@@ -661,8 +670,9 @@ client that satisfies `AnthropicLikeClient`. This is enforced by construction (m
 | `@vc/studio-web` | Unit (vitest) and build | Pure helpers: duration formatting and parsing, form to `VideoRequest` mapping. `next build` must pass. | `pnpm --filter @vc/studio-web test`, `build` |
 | Campaigns | Existing tests | Unchanged behaviour under the pnpm workspace | `pnpm test` |
 
-- The API tests use the `video_studio_test` database. A vitest global setup applies migrations with `prisma migrate deploy`,
-  tables are truncated between tests, and `fileParallelism: false` keeps files from sharing the database concurrently.
+- The API tests use the `video_studio_test` database (`TEST_DATABASE_URL`). A vitest global setup applies migrations with
+  `prisma migrate deploy` and refuses any URL that does not name `video_studio_test`. Tables are truncated between tests, and
+  `fileParallelism: false` keeps files from sharing the database concurrently.
 - Every package has a `typecheck` script; `pnpm typecheck`, `pnpm test` and `pnpm build` at the root run them all, and CI runs
   the same commands with Postgres and Redis service containers.
 - Live checks with a real key are manual and outside CI (see the M1 exit criteria in [ROADMAP.md](ROADMAP.md)).
