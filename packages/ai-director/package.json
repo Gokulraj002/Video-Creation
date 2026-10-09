@@ -1,0 +1,24 @@
+{
+  "name": "@vc/ai-director",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Claude AI Director: prompt -> brief -> script -> storyboard -> shot list -> engine selection -> validated timeline (server-only)",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.132.1",
+    "@vc/schema": "workspace:*",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "@types/node": "^22.15.0",
+    "vitest": "^5.0.3"
+  }
+}

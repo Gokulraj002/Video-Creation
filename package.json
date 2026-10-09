@@ -2,28 +2,38 @@
   "name": "video-creation",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@10.28.0",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
-  "workspaces": [
-    "packages/*",
-    "apps/*"
-  ],
   "scripts": {
-    "db:migrate": "npm run migrate -w @vc/core",
-    "dev:api": "npm run dev -w @vc/api",
-    "dev:worker": "npm run dev -w @vc/worker",
-    "dev:web": "npm run dev -w @vc/web",
-    "studio": "npm run studio -w @vc/video",
-    "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "vitest run",
-    "build:web": "npm run build -w @vc/web"
+    "typecheck": "pnpm -r --if-present typecheck",
+    "test": "pnpm -r --if-present test",
+    "build": "pnpm -r --if-present build",
+    "studio:db:migrate": "pnpm --filter @vc/studio-api db:migrate",
+    "studio:db:seed": "pnpm --filter @vc/studio-api db:seed",
+    "studio:dev:api": "pnpm --filter @vc/studio-api dev",
+    "studio:dev:worker": "pnpm --filter @vc/studio-api dev:worker",
+    "studio:dev:web": "pnpm --filter @vc/studio-web dev",
+    "campaigns:db:migrate": "pnpm --filter @vc/core migrate",
+    "campaigns:dev:api": "pnpm --filter @vc/api dev",
+    "campaigns:dev:worker": "pnpm --filter @vc/worker dev",
+    "campaigns:dev:web": "pnpm --filter @vc/web dev",
+    "campaigns:studio": "pnpm --filter @vc/video studio"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
     "tsx": "^4.20.0",
     "typescript": "^5.9.3",
-    "vite": "^6.4.4",
     "vitest": "^5.0.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@prisma/engines",
+      "esbuild",
+      "msgpackr-extract",
+      "prisma",
+      "sharp"
+    ]
   }
 }
