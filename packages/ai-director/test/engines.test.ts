@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import type { ChapterEngineSelection, EngineSelectionStageInput } from '../src';
-import { AIDirector, coerceEngineChoice, HeuristicMockProvider, resolveEngineAvailability } from '../src';
+import type { ChapterEngineSelection } from '@vc/schema';
+import type { EngineSelectionStageInput } from '../src';
+import { AIDirector, coerceEngineChoice, DirectorError, HeuristicMockProvider, resolveEngineAvailability } from '../src';
 import { delegatingProvider, expectValidResult, makeRequest } from './helpers';
 
 describe('coerceEngineChoice', () => {
@@ -83,5 +84,32 @@ describe('engine coercion in the pipeline', () => {
     const result = await new AIDirector({ provider }).planProject({ request: makeRequest() });
     expect(result.usage.stages.find((s) => s.stage === 'engineSelection')?.attempts).toBe(2);
     expect(provider.calls.filter((c) => c.stage === 'engineSelection')[1]?.prompt).toContain('is a "three" template, not "motion2d"');
+  });
+});
+
+describe('failed runs keep their warnings', () => {
+  it('attaches coercion warnings and usage to the DirectorError', async () => {
+    const provider = delegatingProvider((req) => {
+      if (req.stage === 'engineSelection') {
+        const input = req.input as EngineSelectionStageInput;
+        return {
+          chapterId: input.chapter.id,
+          choices: input.scenes.map((p) => ({ sceneId: p.scene.id, engine: 'footage', template: null, provider: null, rationale: 'stock' })),
+        };
+      }
+      if (req.stage === 'sceneSpecs') return { chapterId: 'c1', scenes: [] };
+      return undefined;
+    });
+    const err = await new AIDirector({ provider, maxRepairAttempts: 1 })
+      .planProject({ request: makeRequest() })
+      .then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(DirectorError);
+    const de = err as DirectorError;
+    expect(de.code).toBe('VALIDATION_FAILED');
+    expect(de.stage).toBe('sceneSpecs');
+    expect(de.warnings?.length).toBeGreaterThan(0);
+    expect(de.warnings?.every((w) => w.includes('engine "footage" is unavailable'))).toBe(true);
+    expect(de.usage?.stages.map((s) => s.stage)).toEqual(['brief', 'outline', 'script', 'storyboard', 'shotList', 'engineSelection', 'sceneSpecs']);
+    expect(de.usage?.stages.at(-1)?.attempts).toBe(2);
   });
 });

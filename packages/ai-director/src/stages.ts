@@ -17,7 +17,6 @@ import {
   type EngineType,
   type Shot,
   type StoryboardScene,
-  type TemplateSummary,
   type VideoGenre,
 } from '@vc/schema';
 
@@ -275,5 +274,3 @@ export interface StageInputMap {
   engineSelection: EngineSelectionStageInput;
   sceneSpecs: SceneSpecsStageInput;
 }
-
-export type TemplateCatalogSummary = TemplateSummary[];
