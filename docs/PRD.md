@@ -342,8 +342,9 @@ Numbers marked *target* have not been measured yet. M1 test runs and manual runs
   that is not `QUEUED`, so a duplicate delivery does nothing.
 - Success is committed in one transaction: the new version, run `SUCCEEDED` with usage, and the project set to `READY` with its
   current version.
-- On failure or cancellation, the project returns to `READY` if it already has a version, and becomes `FAILED` otherwise. The
-  run records an error code (`DirectorError` code or `INTERNAL`) and a sanitized message.
+- On failure, the project returns to `READY` if it already has a version, and becomes `FAILED` otherwise. On cancellation, it
+  returns to `READY` if it already has a version, and to `DRAFT` otherwise. A failed run records an error code (a
+  `DirectorError` code, or `TIMEOUT`, `QUEUE_UNAVAILABLE` or `INTERNAL` set by studio-api) and a sanitized message.
 - BullMQ jobs use `attempts: 1`. Retries happen inside the run (SDK retries for 408/409/429/5xx, the director's repair loop).
   Rerunning a whole run is an explicit user action, and the stage cache makes it cheap.
 - **Known M1 gap:** if a worker process dies mid-run, the run can stay `RUNNING`. The user can cancel it, but there is no

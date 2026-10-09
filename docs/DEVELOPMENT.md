@@ -341,7 +341,8 @@ as `LIMIT_DIRECTOR_USD_PER_DAY=2`. [PRD section 7.4](PRD.md#74-cost-controls) ha
 | `GET /v1/director-runs/:runId` | The run's `usage` report (`stages[]` and `totals`) |
 
 Usage is recorded when a run finishes, including the partial usage of runs that failed, timed out or were cancelled while running.
-Deleting a project keeps its runs, so usage totals and quotas do not drop. Costs are estimates from the pricing table in
+The exception is a run ended by a worker crash (section 5), which records none. Deleting a project keeps its runs, so usage
+totals and quotas do not drop. Costs are estimates from the pricing table in
 `packages/ai-director/src/pricing.ts` (USD per million tokens; for `claude-opus-5-5`: input 4.00, output 20.00, cache read 0.20,
 cache write 5.00). A model missing from the table, for example a fallback model, is counted as $0 with `pricingKnown: false`, and
 the Usage tab flags it. Add it with `DIRECTOR_PRICING_JSON`.
@@ -371,6 +372,12 @@ worker does. Start more worker processes, or raise `DIRECTOR_WORKER_CONCURRENCY`
 
 On SIGINT or SIGTERM the worker stops taking jobs and waits for active runs to finish. A second signal exits immediately.
 
+If a worker process dies mid-run (crash, `kill -9`, closed terminal), the run stays `RUNNING` while no worker is running. Once a
+worker runs again, BullMQ detects the stalled job (its 30 s lock expired) and the worker fails it instead of re-running it
+(`maxStalledCount: 0`). The run then becomes `FAILED` with `INTERNAL` ("The director worker stopped unexpectedly while
+processing this run"), and the project status is restored. In a local test this took about a minute after the restart. Tokens
+spent before the crash are not recorded for that run. Re-run the project; completed stages come from the cache.
+
 With `inline`, restarting the API (for example when `tsx watch` reloads after a file change) can interrupt a run in progress and
 leave it `RUNNING`. Cancel it from the project page or with `POST /v1/director-runs/:runId/cancel`.
 
@@ -395,6 +402,8 @@ The chapter count depends on genre and duration. Effective timeouts with the def
 | 2 h `long-form` | 25 | 128 | 256 min (about 4.3 h) |
 | 2 h `cinematic-ad`, `promo` or `social-short` | 84 | 423 | 846 min (about 14.1 h) |
 
+More example plans: [AI_DIRECTOR.md section 6.2](AI_DIRECTOR.md#62-example-plans-including-long-videos).
+
 When the budget runs out, the worker aborts the in-flight provider call and marks the run `FAILED` with code `TIMEOUT` and the
 message `Director run exceeded its timeout of <n> ms`. Usage up to that point is recorded, and cached chapters make a re-run
 cheaper. With the mock provider, runs finish in seconds and never come near the budget.
@@ -405,8 +414,8 @@ Tuning:
   minutes per step is a starting budget for effort `medium`. Raise `DIRECTOR_STEP_TIMEOUT_MS` for `high`, `xhigh` or `max`
   effort, a slow network, or if live runs fail with `TIMEOUT`.
 - Set `DIRECTOR_STEP_TIMEOUT_MS=0` to use `DIRECTOR_RUN_TIMEOUT_MS` as a fixed budget for every run.
-- The timeout runs inside the worker. If the worker process dies, nothing times the run out: it stays `RUNNING` until you cancel
-  it (section 11).
+- The timeout runs inside the worker. If the worker process dies, the timeout dies with it (section 5 describes what happens to
+  the run).
 
 ## 7. Testing
 
@@ -585,7 +594,7 @@ psql postgres://postgres:postgres@localhost:5432/video_studio -c 'SELECT id, sta
 | Starting a run returns 503 `QUEUE_UNAVAILABLE` | `QUEUE_DRIVER=bullmq` and Redis became unreachable after the API had connected. The API fails the run (`QUEUE_UNAVAILABLE`), and the project goes back to `READY` if it has a version, otherwise `FAILED`. | Start Redis, then re-run. Or use `QUEUE_DRIVER=inline` for Redis-free development. |
 | Starting a run hangs; the web app reports a timeout after 15 s | Redis was not reachable when the API started. The enqueue waits for Redis instead of failing: the run is already `QUEUED` and the project `DIRECTING`. | Start Redis; the pending request then completes and the run proceeds. If the API was restarted in the meantime, the run has no job: cancel it, then re-run. |
 | Run stays `queued` ("Queued") | `QUEUE_DRIVER=bullmq` and no worker is running | `pnpm studio:dev:worker`. The job waits in Redis and starts when the worker does. |
-| Run stays `running` and the project is blocked with 409 `RUN_ACTIVE` | The worker (or, with `inline`, the API) stopped mid-run. There is no stale-run reaper in M1. | Cancel the run (project page or `POST /v1/director-runs/:runId/cancel`), then re-run |
+| Run stays `running` and the project is blocked with 409 `RUN_ACTIVE` | The worker (or, with `inline`, the API) stopped mid-run. There is no stale-run reaper in M1. | With `bullmq`, start the worker again: about a minute later the run becomes `FAILED` (`INTERNAL`) (section 5). Or cancel it right away (project page or `POST /v1/director-runs/:runId/cancel`), then re-run. With `inline`, cancel it. |
 | 401 `UNAUTHORIZED` from the API, or the web app says its credentials were rejected | Missing header, a token that was never seeded, a token seeded into a different database than the API uses, or a revoked token | Make `STUDIO_API_TOKEN` (web) equal `STUDIO_DEV_API_TOKEN` (API), run `pnpm studio:db:seed` again, and restart the web dev server. Test with `curl -s -o /dev/null -w '%{http_code}\n' "$API/v1/me" -H "Authorization: Bearer $TOKEN"`. |
 | Web pages say the API is not configured | `STUDIO_API_TOKEN` is empty, or `STUDIO_API_URL` is not an http(s) URL | Fix `apps/studio-web/.env.local` and restart `pnpm studio:dev:web`. The Settings page shows whether a token is configured. |
 | Web pages say the API is unreachable | studio-api is not running, or `STUDIO_API_URL` points at the wrong port | Start `pnpm studio:dev:api`; check `curl -s http://localhost:4100/health` |

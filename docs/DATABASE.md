@@ -31,7 +31,7 @@ migrations in `db/migrations/`. The two share no tables before M7 (PRD open ques
 | Naming | PascalCase models and camelCase fields in Prisma; snake_case in Postgres through `@@map` and `@map`. Tables: `users`, `api_tokens`, `projects`, `project_versions`, `director_runs`, `director_cache_entries`. Enum types: `project_status`, `run_status`. Example: `DirectorRun.requestedById` is the column `director_runs.requested_by_id`. |
 | Migrations | `20261009082453_init` creates both enums, all six tables, their indexes and foreign keys. `20261009085125_run_accounting` makes `director_runs.project_id` nullable with `ON DELETE SET NULL` (it was `NOT NULL` with `ON DELETE CASCADE`), adds `director_runs.warnings` (`jsonb NOT NULL DEFAULT '[]'`) and adds `director_cache_entries.chunk` (`text`, nullable). |
 | Primary keys | `String @id @default(cuid())` on every model except `DirectorCacheEntry`, whose key is a user-scoped SHA-256 cache key (section 3.6) |
-| JSON | Prisma `Json` fields are `jsonb` in Postgres. Their contents are validated with Zod schemas from `@vc/schema` before they are written (section 4). |
+| JSON | Prisma `Json` fields are `jsonb` in Postgres. Their contents are validated with Zod schemas from `@vc/schema` before they are written (section 4). The exception is `DirectorRun.warnings`, a capped array of plain strings. |
 | Money | `DirectorRun.estimatedCostUsd` is `Decimal(12,6)` so sums are exact. DTOs expose it as a number. |
 | Only writer | `@vc/studio-api` (API process and director worker). studio-web never touches the database. |
 
@@ -96,7 +96,7 @@ erDiagram
     String promptVersion
     Json progress
     Json usage "UsageReport, nullable"
-    Json warnings "string array, default []"
+    Json warnings "string array, default empty array"
     Int inputTokens "default 0"
     Int outputTokens "default 0"
     Int cacheReadTokens "default 0"
@@ -227,7 +227,7 @@ One execution of the AI Director for a project. It is the source of truth for ru
 | `model` | String | Configured model (for example `mock-director-v1`, `claude-opus-5-5`). The model actually served for each call is in `usage.stages[].model`. |
 | `promptVersion` | String | `PROMPT_VERSION` of `@vc/ai-director` (`m1.0`) |
 | `progress` | Json | `{completedSteps, totalSteps, currentStage, message}` (section 4) |
-| `usage` | Json, nullable | `UsageReport` (section 4). Written when the run finishes: on success, and also on failure, timeout or cancellation with the usage consumed so far. Null for runs that never started work. |
+| `usage` | Json, nullable | `UsageReport` (section 4). Written when the run finishes: on success, and also on failure, timeout or cancellation with the usage consumed so far. Null for runs that made no provider calls and for runs ended by a worker crash (section 5.2). |
 | `warnings` | Json, default `[]` | Director warnings as a string array, for example engine-coercion notices. At most 500 entries of at most 2000 characters each. Written together with `usage`. Not exposed by the M1 API; read it from the database. |
 | `inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens` | Int, default 0 | Run totals, copied from `usage.totals` so usage and quota queries can sum columns |
 | `estimatedCostUsd` | Decimal(12,6), default 0 | Estimated USD for the run, from the pricing table (unknown models count as 0) |
@@ -278,7 +278,7 @@ schema name but not the schema body ([ROADMAP known gaps](ROADMAP.md#known-gaps-
 
 ## 4. JSON columns
 
-Every JSON document is validated with a `@vc/schema` Zod schema before it is written. Readers should parse it again with the
+Every JSON document except `DirectorRun.warnings` is validated with a `@vc/schema` Zod schema before it is written. Readers should parse it again with the
 same schema (for timelines, with `parseTimeline`) rather than trusting the database.
 
 | Column | Contents | Schema in `@vc/schema` | Written | Versioning |
@@ -646,24 +646,26 @@ M1 deletes nothing automatically. There is no TTL job, no archival and no backup
 
 | Data | Growth | M1 behaviour | Planned |
 |---|---|---|---|
-| `Project` with its versions and runs | Per project | `DELETE /v1/projects/:id` (refused with 409 while a run is active) cascades to its `ProjectVersion` and `DirectorRun` rows. | Delete with storage cleanup once assets and renders exist (M2, M3) |
+| `Project` with its versions | Per project | `DELETE /v1/projects/:id` (refused with 409 while a run is active) cascades to its `ProjectVersion` rows. Its `DirectorRun` rows are kept with `projectId` set to null. | Delete with storage cleanup once assets and renders exist (M2, M3) |
 | `ProjectVersion` | One per successful run. Each row holds a full timeline and all artifacts; size grows with scene count. | Kept until the project is deleted. No pruning. | Retention policy, for example keep the current version plus the last N, with the versions UI (M2) |
-| `DirectorRun` | One per run | Kept until the project is deleted. Runs are the usage and quota history. | — |
+| `DirectorRun` | One per run | Never pruned. Runs are the usage and quota history, so they survive project deletion (`projectId = null`). Deleted only with the user who requested them. | Usage ledger with billing (M8) |
 | `ApiToken` | Rare | Revoked tokens stay in the table. Deleted only with their user. | Token management (M8) |
-| `User` | Rare | No delete endpoint. Deleting a user in the database cascades to their tokens, projects (with versions and runs) and the runs they requested. | Account deletion (M8) |
-| `DirectorCacheEntry` | One per distinct stage call, deployment-wide | Unbounded: no TTL, no eviction ([ROADMAP known gaps](ROADMAP.md#known-gaps-carried-out-of-m1), PRD Q5). `DIRECTOR_CACHE=off` stops new writes. | Scope (per owner or organization) and TTL decision, M8 at the latest |
+| `User` | Rare | No delete endpoint. Deleting a user in the database cascades to their tokens, projects (with versions) and the runs they requested. Their cache entries stay (no foreign key). | Account deletion (M8) |
+| `DirectorCacheEntry` | One per distinct stage call per user | Unbounded: no TTL, no eviction ([ROADMAP known gaps](ROADMAP.md#known-gaps-carried-out-of-m1), PRD Q5). Entries are already scoped per user through the key. `DIRECTOR_CACHE=off` stops new reads and writes. | TTL or eviction decision, and organization scope with M8 |
 | BullMQ job records (Redis) | Per job | `removeOnComplete: 1000`, `removeOnFail: 5000`. Postgres stays the source of truth. | — |
 | `video_studio_test` | Per test | All six tables truncated between tests (`test/helpers.ts`). | — |
 
 Things to know before deleting data:
 
-- **Deleting a project removes its runs from usage and quota totals.** `/v1/usage` and the daily quotas are computed from
-  `DirectorRun` rows, which cascade with the project. A user can therefore lower today's counted runs and spend by deleting
-  projects. Together with the success-only usage recording (section 3.5), this makes M1 usage figures a lower bound. A usage
-  ledger that records every provider call and survives project deletion is the planned fix (with billing, M8).
-- **Cache entries outlive projects.** Deleting a project does not delete cache entries derived from its prompts. They hold model
-  outputs (briefs, scripts, storyboards) that may contain content from the user's request. For a privacy deletion, also clear
-  the cache.
+- **Deleting a project keeps its runs in usage and quota totals.** `/v1/usage` and the daily quotas are computed from
+  `DirectorRun` rows, which survive the project with `projectId = null`, so deleting projects does not lower today's counted runs
+  or spend. Run rows hold accounting data (provider, model, tokens, cost, status, error, warnings, progress message), not the
+  request or its prompts. Usage figures are estimates from the pricing table, and runs ended by a worker crash record no usage
+  (section 3.5). A usage ledger that records every provider call is planned with billing (M8).
+- **Cache entries outlive projects and users.** Deleting a project or a user does not delete cache entries derived from their
+  prompts. They hold model outputs (briefs, scripts, storyboards) that may contain content from the user's request. Because the
+  owner is only hashed into the key, one user's entries cannot be selected; for a privacy deletion, clear the cache table (or
+  delete by age, below).
 - **Cache entries are always safe to delete.** The only cost is cache misses, which means new provider calls and new spend on the
   next identical run. Entries from an old `PROMPT_VERSION` cannot be selected directly because the version is hashed into the
   key, but age-based cleanup removes them. For example, from a one-off script using the studio-api Prisma client:
@@ -676,10 +678,11 @@ Things to know before deleting data:
   });
   ```
 
-- **Losing Redis loses queued jobs.** If Redis is down when a run starts, the enqueue fails and the run is marked `FAILED`
-  (`QUEUE_UNAVAILABLE`). But jobs already in Redis when it is flushed or lost are gone: their runs stay `QUEUED`, and the projects
-  stay blocked with 409 `RUN_ACTIVE` until the runs are cancelled. This has the same remedy as a run stuck in `RUNNING`
-  (planned reaper, see the ROADMAP known gaps).
+- **Losing Redis loses queued jobs.** If Redis becomes unreachable while the API is running, starting a run fails fast and the
+  run is marked `FAILED` (`QUEUE_UNAVAILABLE`); if Redis was unreachable when the API started, the enqueue waits for it instead
+  (section 5.1). Jobs already in Redis when it is flushed or lost are gone: their runs stay `QUEUED`, and the projects stay
+  blocked with 409 `RUN_ACTIVE` until the runs are cancelled. This has the same remedy as a run stuck in `RUNNING` (planned
+  reaper, see the ROADMAP known gaps).
 - **Backups.** None in M1. Local data lives in the `pgdata` Docker volume. Postgres backups with tested restores are
   **planned (M8)**.
 - **Planned tables.** Render temp files are removed on success, failure and cancellation (M2). Segment files are kept until the
