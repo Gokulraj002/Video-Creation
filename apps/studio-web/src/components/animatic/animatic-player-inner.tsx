@@ -18,6 +18,9 @@ import { AnimaticPlaceholder } from './animatic-placeholder';
 /** Above this many scenes the jump bar lists chapters instead of individual scenes. */
 const MAX_SCENE_CHIPS = 120;
 
+/** Frames until a scene card's text has fully entered (see the enter animations in AnimaticComposition). */
+const ENTRANCE_SETTLE_FRAMES = 26;
+
 function LoadedPlayer({ timeline }: { timeline: Timeline }) {
   const playerRef = useRef<PlayerRef>(null);
   const [frame, setFrame] = useState(0);
@@ -47,12 +50,13 @@ function LoadedPlayer({ timeline }: { timeline: Timeline }) {
     setFrame(target);
   };
 
-  // A scene's first frames belong to its incoming transition, where the previous scene is still
-  // showing; jump to the first fully visible frame instead. Chapter starts are scene starts too.
+  // A scene's first frames belong to its incoming transition (the previous scene is still showing)
+  // and to the card's entrance animation (text fades in over ~26 frames in AnimaticComposition);
+  // jump to the first fully visible frame instead. Chapter starts are scene starts too.
   const settledFrame = (startFrame: number) => {
     const scene = scenesByStart.get(startFrame);
     if (!scene) return startFrame;
-    const settle = scene.transitionIn?.durationInFrames ?? 0;
+    const settle = (scene.transitionIn?.durationInFrames ?? 0) + ENTRANCE_SETTLE_FRAMES;
     return Math.min(startFrame + settle, startFrame + scene.durationInFrames - 1);
   };
 

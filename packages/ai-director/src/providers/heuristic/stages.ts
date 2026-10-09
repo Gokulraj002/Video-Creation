@@ -263,9 +263,10 @@ function onScreenFor(ctx: LeadContext, lead: string): string | null {
   }
   if (p.genre === 'comedy' || p.genre === 'cartoon') return comicLine(beat, brief.title, index) ?? shortLine(lead, 8);
   if (p.genre === 'sop-training') return shortLine(sopStep(ctx).text, 8);
-  if (p.genre === 'real-estate' && topic.features.length > 0) {
-    const [first, ...rest] = topic.features;
-    if (first !== undefined) return clip(cycle([first, ...rest], index), 120);
+  if (p.genre === 'real-estate') {
+    // One feature per scene in prompt order; once they are used up, fall through instead of repeating.
+    const feature = topic.features[index - 1];
+    if (feature !== undefined) return clip(feature, 120);
   }
   if (beat === 'data' || beat === 'proof') {
     const fact = topic.numericFacts[index % Math.max(1, topic.numericFacts.length)];

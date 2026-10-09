@@ -83,11 +83,20 @@ const CTA_HINT =
   /\b(call|visit|book|buy|order|shop|sign up|subscribe|download|register|join|contact|learn more|get started|try it|try now|follow|apply|reserve|schedule)\b/i;
 const CAUTION_HINT = /\b(caution|warning|danger|careful|never|do not|don't|avoid|ensure|safety|protective|hazard)\b/i;
 const STEP_LINE = /^\s*(?:step\s*\d+\s*[:.)-]?|\d+\s*[.)]|[-*•])\s+(.+)$/gim;
-const PRICE = /(?:[$€£₹]\s?\d[\d,.]*\s?(?:k|m|million|lakh|crore)?|\d[\d,.]*\s?(?:USD|EUR|GBP|INR))/i;
+const PRICE = /(?:[$€£₹]\s?\d[\d,.]*\s?(?:k|m|million|lakh|crore|cr|l)?|\bRs\.?\s?\d[\d,.]*\s?(?:k|lakh|lakhs|crore|crores|cr|l)?|\d[\d,.]*\s?(?:USD|EUR|GBP|INR|lakh|lakhs|crore|crores|Cr))/i;
 const FEATURE =
-  /\b\d+(?:[.,]\d+)?\s?(?:-|\s)?(?:bed(?:room)?s?|bath(?:room)?s?|car garage|sq\.?\s?ft|square (?:feet|meters|metres)|m²|sqm|acres?|floors?|stor(?:y|ies))\b/gi;
+  /\b\d+(?:[.,]\d+)?\s?(?:-|\s)?(?:bhk|bed(?:room)?s?|bath(?:room)?s?|car garage|sq\.?\s?ft|square (?:feet|meters|metres)|m²|sqm|acres?|floors?|stor(?:y|ies))\b/gi;
 const AMENITIES = [
+  'private pool',
+  'swimming pool',
   'pool',
+  'clubhouse',
+  'club house',
+  'gated community',
+  'play area',
+  'jogging track',
+  'power backup',
+  '24/7 security',
   'garden',
   'garage',
   'balcony',
@@ -181,7 +190,10 @@ export function analyzeRequest(request: RequestDigest, profile: GenreProfile): T
   for (const match of text.matchAll(FEATURE)) features.push(clip(match[0], 120));
   const lower = text.toLowerCase();
   for (const amenity of AMENITIES) {
-    if (lower.includes(amenity)) features.push(capitalize(amenity));
+    // AMENITIES lists longer phrases first; skip one already covered (e.g. "pool" after "private pool").
+    if (lower.includes(amenity) && !features.some((f) => f.toLowerCase().includes(amenity))) {
+      features.push(capitalize(amenity));
+    }
   }
 
   const location = LOCATION.exec(text)?.[1] ?? null;
