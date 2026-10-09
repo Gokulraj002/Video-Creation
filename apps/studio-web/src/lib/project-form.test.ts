@@ -175,6 +175,13 @@ describe('error mapping', () => {
       }),
     ).toEqual({ title: 'Too long', duration: 'Too long a video' });
     expect(apiErrorDetailsToFieldErrors([{ path: ['fps'], message: 'bad fps' }])).toEqual({ fps: 'bad fps' });
+    // studio-api sends dot-joined string paths: [{path: 'brand.colors.0', message, code}]
+    expect(
+      apiErrorDetailsToFieldErrors([
+        { path: 'brand.colors.0', message: 'Invalid hex color', code: 'invalid_format' },
+        { path: 'durationSeconds', message: 'Too small', code: 'too_small' },
+      ]),
+    ).toEqual({ brandColors: 'Invalid hex color', duration: 'Too small' });
     expect(apiErrorDetailsToFieldErrors('nope')).toEqual({});
     expect(apiErrorDetailsToFieldErrors(undefined)).toEqual({});
   });

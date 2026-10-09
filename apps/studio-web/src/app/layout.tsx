@@ -1,7 +1,7 @@
 import type { Metadata, Viewport } from 'next';
 import type { ReactNode } from 'react';
 import { AppShell } from '@/components/layout/app-shell';
-import { THEME_INIT_SCRIPT } from '@/components/layout/theme-toggle';
+import { THEME_INIT_SCRIPT } from '@/lib/theme';
 import './globals.css';
 
 export const dynamic = 'force-dynamic';

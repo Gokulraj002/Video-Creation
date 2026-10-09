@@ -100,7 +100,6 @@ export function RunPanel({
   initialRun: DirectorRunDTO | null;
   notice: string | null;
 }) {
-  const router = useRouter();
   const { run, setRun, pollError } = useRunPolling(initialRun);
   const [actionError, setActionError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
@@ -110,10 +109,10 @@ export function RunPanel({
   const start = () =>
     startTransition(async () => {
       setActionError(null);
+      // On success the Server Action calls `refresh()`, so the page re-renders with the new run.
       const result = await startDirectorRunAction(projectId);
       if (!result.ok) setActionError(result.message);
       else if (result.run) setRun(result.run);
-      router.refresh();
     });
 
   const cancel = (runId: string) =>
@@ -122,7 +121,6 @@ export function RunPanel({
       const result = await cancelDirectorRunAction(runId);
       if (!result.ok) setActionError(result.message);
       else if (result.run) setRun(result.run);
-      router.refresh();
     });
 
   const percent = run ? runProgressPercent(run.progress, run.status) : 0;

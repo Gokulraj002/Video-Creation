@@ -269,14 +269,19 @@ export function parseProjectForm(form: FormLike, limits?: ResourceLimits | null)
   };
 }
 
+/** API validation issue: `path` is either an array of keys or a dot-joined string (`brand.colors.0`). */
 const ApiIssueSchema = z.object({
-  path: z.array(z.union([z.string(), z.number()])),
+  path: z.union([
+    z.array(z.union([z.string(), z.number()])),
+    z.string().transform((p) => (p === '' ? [] : p.split('.'))),
+  ]),
   message: z.string(),
 });
 
 /**
  * Best-effort mapping of API error `details` (400 VALIDATION_ERROR issues or 422 LIMIT_EXCEEDED violations) onto
- * form fields. Accepts `[...]`, `{issues: [...]}` and `{violations: [...]}` shapes; unknown shapes map to nothing.
+ * form fields. Accepts `[...]`, `{issues: [...]}` and `{violations: [...]}` shapes (issue paths as arrays or
+ * dot-joined strings); unknown shapes map to nothing.
  */
 export function apiErrorDetailsToFieldErrors(details: unknown): FieldErrors {
   const out: FieldErrors = {};

@@ -222,7 +222,8 @@ export default async function ProjectPage({ params, searchParams }: PageParams) 
           )
         ) : null}
 
-        <ProjectTabs tabs={tabs} defaultValue={tabs[0]?.value ?? 'usage'} />
+        {/* Keyed by version so the default tab resets when a new version appears. */}
+        <ProjectTabs key={version?.version ?? 'none'} tabs={tabs} defaultValue={tabs[0]?.value ?? 'usage'} />
       </div>
     </>
   );
