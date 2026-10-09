@@ -1,0 +1,100 @@
+'use client';
+
+import { Player, type CallbackListener, type PlayerRef } from '@remotion/player';
+import { formatTimecode, type Timeline } from '@vc/schema';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { findSpanIndex } from '@/lib/animatic';
+import { formatFrameDuration } from '@/lib/duration';
+import { cn } from '@/lib/utils';
+import { AnimaticComposition, type AnimaticProps } from './animatic-composition';
+
+/** Above this many scenes the jump bar lists chapters instead of individual scenes. */
+const MAX_SCENE_CHIPS = 120;
+
+export default function AnimaticPlayerInner({ timeline }: { timeline: Timeline }) {
+  const playerRef = useRef<PlayerRef>(null);
+  const [frame, setFrame] = useState(0);
+  const inputProps = useMemo<AnimaticProps>(() => ({ timeline }), [timeline]);
+  const { width, height, fps } = timeline.settings;
+
+  useEffect(() => {
+    const player = playerRef.current;
+    if (!player) return;
+    const onFrame: CallbackListener<'frameupdate'> = (event) => setFrame(event.detail.frame);
+    const onSeek: CallbackListener<'seeked'> = (event) => setFrame(event.detail.frame);
+    player.addEventListener('frameupdate', onFrame);
+    player.addEventListener('seeked', onSeek);
+    return () => {
+      player.removeEventListener('frameupdate', onFrame);
+      player.removeEventListener('seeked', onSeek);
+    };
+  }, []);
+
+  const useChapters = timeline.scenes.length > MAX_SCENE_CHIPS;
+  const marks = useChapters ? timeline.chapters : timeline.scenes;
+  const activeIndex = findSpanIndex(marks, frame);
+
+  const seek = (target: number) => {
+    playerRef.current?.seekTo(target);
+    setFrame(target);
+  };
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div
+        className="mx-auto w-full overflow-hidden rounded-lg border bg-black shadow-sm"
+        style={{ maxWidth: `min(100%, calc(70vh * ${width / height}))` }}
+      >
+        <Player
+          ref={playerRef}
+          component={AnimaticComposition}
+          inputProps={inputProps}
+          durationInFrames={timeline.durationInFrames}
+          compositionWidth={width}
+          compositionHeight={height}
+          fps={fps}
+          controls
+          loop
+          clickToPlay
+          doubleClickToFullscreen
+          allowFullscreen
+          spaceKeyToPlayOrPause
+          style={{ width: '100%', aspectRatio: `${width} / ${height}` }}
+        />
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+        <span className="font-mono tabular-nums">
+          {formatTimecode(frame, fps)} / {formatTimecode(Math.max(0, timeline.durationInFrames - 1), fps)}
+        </span>
+        <span>
+          {width}×{height} · {fps} fps · {timeline.durationInFrames.toLocaleString('en-US')} frames ·{' '}
+          {formatFrameDuration(timeline.durationInFrames, fps)}
+        </span>
+      </div>
+
+      <div>
+        <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          Jump to {useChapters ? 'chapter' : 'scene'}
+        </p>
+        <div className="flex max-h-40 flex-wrap gap-1.5 overflow-y-auto">
+          {marks.map((mark, index) => (
+            <button
+              key={mark.id}
+              type="button"
+              onClick={() => seek(mark.startFrame)}
+              title={`${mark.title} · ${formatTimecode(mark.startFrame, fps)}`}
+              className={cn(
+                'max-w-56 truncate rounded-md border px-2 py-1 text-left text-xs transition-colors hover:bg-accent hover:text-accent-foreground',
+                index === activeIndex ? 'border-primary bg-primary/10 text-foreground' : 'bg-card text-muted-foreground',
+              )}
+            >
+              <span className="mr-1 font-mono tabular-nums">{index + 1}.</span>
+              {mark.title}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}

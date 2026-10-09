@@ -1,0 +1,151 @@
+// Universal AI Video Studio — studio-api data model (Prisma 7, PostgreSQL).
+// The datasource URL lives in prisma.config.ts (DATABASE_URL); the client is generated into
+// src/generated/prisma (gitignored) and used with the @prisma/adapter-pg driver adapter.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum ProjectStatus {
+  DRAFT
+  DIRECTING
+  READY
+  FAILED
+
+  @@map("project_status")
+}
+
+enum RunStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+
+  @@map("run_status")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  apiTokens    ApiToken[]
+  projects     Project[]
+  directorRuns DirectorRun[]
+
+  @@map("users")
+}
+
+model ApiToken {
+  id         String    @id @default(cuid())
+  userId     String    @map("user_id")
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  label      String
+  /// sha256 hex of the raw bearer token; the raw token is never stored.
+  tokenHash  String    @unique @map("token_hash")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  lastUsedAt DateTime? @map("last_used_at")
+  revokedAt  DateTime? @map("revoked_at")
+
+  @@index([userId])
+  @@map("api_tokens")
+}
+
+model Project {
+  id               String          @id @default(cuid())
+  ownerId          String          @map("owner_id")
+  owner            User            @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  title            String
+  genre            String
+  durationSeconds  Float           @map("duration_seconds")
+  aspectRatio      String          @map("aspect_ratio")
+  status           ProjectStatus   @default(DRAFT)
+  /// The validated VideoRequest (@vc/schema) the project was created from.
+  request          Json
+  currentVersionId String?         @unique @map("current_version_id")
+  currentVersion   ProjectVersion? @relation("CurrentVersion", fields: [currentVersionId], references: [id], onDelete: SetNull)
+  createdAt        DateTime        @default(now()) @map("created_at")
+  updatedAt        DateTime        @updatedAt @map("updated_at")
+
+  versions     ProjectVersion[] @relation("ProjectVersions")
+  directorRuns DirectorRun[]
+
+  @@index([ownerId, updatedAt])
+  @@map("projects")
+}
+
+model ProjectVersion {
+  id            String       @id @default(cuid())
+  projectId     String       @map("project_id")
+  project       Project      @relation("ProjectVersions", fields: [projectId], references: [id], onDelete: Cascade)
+  version       Int
+  schemaVersion Int          @map("schema_version")
+  /// Timeline v1 document (@vc/schema TimelineSchema).
+  timeline      Json
+  /// DirectorArtifacts (@vc/schema DirectorArtifactsSchema).
+  artifacts     Json
+  /// The director run that produced this version (null if the run row was removed).
+  directorRunId String?      @unique @map("director_run_id")
+  directorRun   DirectorRun? @relation(fields: [directorRunId], references: [id], onDelete: SetNull)
+  createdAt     DateTime     @default(now()) @map("created_at")
+
+  currentOf Project? @relation("CurrentVersion")
+
+  @@unique([projectId, version])
+  @@map("project_versions")
+}
+
+model DirectorRun {
+  id               String    @id @default(cuid())
+  projectId        String    @map("project_id")
+  project          Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  requestedById    String    @map("requested_by_id")
+  requestedBy      User      @relation(fields: [requestedById], references: [id], onDelete: Cascade)
+  status           RunStatus @default(QUEUED)
+  provider         String
+  model            String
+  promptVersion    String    @map("prompt_version")
+  /// {completedSteps, totalSteps, currentStage, message}
+  progress         Json
+  /// UsageReport (@vc/schema) once the run finished.
+  usage            Json?
+  inputTokens      Int       @default(0) @map("input_tokens")
+  outputTokens     Int       @default(0) @map("output_tokens")
+  cacheReadTokens  Int       @default(0) @map("cache_read_tokens")
+  cacheWriteTokens Int       @default(0) @map("cache_write_tokens")
+  estimatedCostUsd Decimal   @default(0) @map("estimated_cost_usd") @db.Decimal(12, 6)
+  errorCode        String?   @map("error_code")
+  errorMessage     String?   @map("error_message")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  startedAt        DateTime? @map("started_at")
+  finishedAt       DateTime? @map("finished_at")
+
+  version ProjectVersion?
+
+  @@index([projectId, createdAt])
+  @@index([requestedById, createdAt])
+  @@map("director_runs")
+}
+
+/// Validated AI Director stage outputs keyed by computeCacheKey (sha256 hex).
+model DirectorCacheEntry {
+  key       String    @id
+  stage     String
+  model     String
+  provider  String
+  output    Json
+  usage     Json
+  hits      Int       @default(0)
+  createdAt DateTime  @default(now()) @map("created_at")
+  lastHitAt DateTime? @map("last_hit_at")
+
+  @@map("director_cache_entries")
+}

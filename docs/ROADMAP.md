@@ -4,34 +4,38 @@
 |---|---|
 | Last updated | 2026-10-09 |
 | Current milestone | **M1 Foundation (in progress)** |
-| Related | [PRD.md](PRD.md) (requirements by milestone) · [DECISIONS.md](DECISIONS.md) (ADRs) |
+| Related | [PRD.md](PRD.md) (requirements by milestone) · [DECISIONS.md](DECISIONS.md) (ADRs) · [ARCHITECTURE.md](ARCHITECTURE.md) · [DEVELOPMENT.md](DEVELOPMENT.md) |
 
-Status legend: **In progress**: being built now. **Planned**: scoped, not started; nothing described under a planned milestone
-exists in the code. Scope for M2 to M8 is a plan and may change. Changes are recorded here and, when they reverse a decision,
-in [DECISIONS.md](DECISIONS.md).
+**Status legend.** *In progress*: being built now. *Planned*: scoped but not started. Nothing listed under a planned milestone
+exists in the code. Scope for M2 to M8 is a plan and may change. Scope changes are recorded in this file. A change that reverses
+an accepted decision also gets a new ADR in [DECISIONS.md](DECISIONS.md) that supersedes the old one.
+
+No milestone has a date. Dates will be added once M1 gives a baseline for how long this kind of work takes.
 
 ## Overview
 
 | Milestone | Theme | Status | Depends on |
 |---|---|---|---|
-| M1 | Foundation: schemas, AI Director, studio API, studio web, docs | **In progress** | Existing repo |
-| M2 | Remotion 2D engine, render pipeline, basic editor | Planned | M1 |
-| M3 | Assets and reference analysis | Planned | M1 |
-| M4 | Voice and music | Planned | M2, M3 |
-| M5 | 3D engine | Planned | M2, M3 |
-| M6 | Generative video and footage | Planned | M2, M3 |
-| M7 | Long-form at scale, editor v2, campaigns merge | Planned | M2, M4, M6 |
-| M8 | Production hardening | Planned | M7 (parts can start earlier) |
+| [M1](#m1-foundation) | Foundation: docs, pnpm monorepo, timeline v1, AI Director, prompt-to-storyboard API and web flow, tests | **In progress** | Existing repo |
+| [M2](#m2-remotion-2d-engine-render-pipeline-and-basic-editor) | Remotion 2D engine, render pipeline, basic editor | Planned | M1 |
+| [M3](#m3-assets-and-reference-analysis) | Assets and reference analysis | Planned | M1 |
+| [M4](#m4-voice-and-music) | Voice and music | Planned | M2, M3 |
+| [M5](#m5-3d-engine) | 3D engine | Planned | M2, M3 |
+| [M6](#m6-generative-video-and-footage) | Generative video and footage | Planned | M2, M3 |
+| [M7](#m7-long-form-at-scale-editor-v2-campaigns-merge) | Long-form at scale, editor v2, campaigns merge | Planned | M2, M4, M6 |
+| [M8](#m8-production-hardening) | Production hardening | Planned | M7 (OIDC and observability can start after M1) |
+
+## Dependency graph
 
 ```mermaid
 flowchart LR
   M1["M1 Foundation<br/>IN PROGRESS"]
-  M2["M2 Remotion 2D engine<br/>render pipeline, basic editor"]
+  M2["M2 Remotion 2D engine,<br/>render pipeline, basic editor"]
   M3["M3 Assets and<br/>reference analysis"]
   M4["M4 Voice and music"]
   M5["M5 3D engine"]
   M6["M6 Generative video<br/>and footage"]
-  M7["M7 Long-form at scale<br/>editor v2, campaigns merge"]
+  M7["M7 Long-form at scale,<br/>editor v2, campaigns merge"]
   M8["M8 Production hardening"]
 
   M1 --> M2
@@ -46,7 +50,7 @@ flowchart LR
   M4 --> M7
   M6 --> M7
   M7 --> M8
-  M1 -. "OIDC, observability<br/>can start early" .-> M8
+  M1 -. "OIDC, observability<br/>may start early" .-> M8
 
   classDef active fill:#fde68a,stroke:#b45309,color:#111827;
   classDef planned fill:#e5e7eb,stroke:#6b7280,color:#111827;
@@ -54,141 +58,219 @@ flowchart LR
   class M2,M3,M4,M5,M6,M7,M8 planned;
 ```
 
-Why the edges exist:
+Why each edge exists:
 
-- **M2 → M4, M5, M6, M7:** each of these produces content that has to be rendered, so all need the M2 render pipeline.
-- **M3 → M4:** voice and music files need storage, and voice-over alignment reuses the M3 transcription adapter.
-- **M3 → M5:** GLB uploads need storage and upload validation.
-- **M3 → M6:** footage, image and screen scenes need uploaded assets; generated clips need storage.
-- **M4 → M7:** editor v2 edits audio tracks, and campaigns depends on voice-over and ducked music.
-- **M6 → M7:** campaigns appends a shared base video, which in studio terms is a footage scene.
+- **M1 → M2, M3.** Both build on the timeline v1 schema, the template catalog, the director and the studio API from M1.
+  M2 and M3 do not depend on each other and can run in parallel.
+- **M2 → M4, M5, M6, M7.** Each of these produces content that has to be rendered, so each needs the M2 render pipeline.
+- **M3 → M4.** Voice and music files need asset storage. Voice-over alignment can reuse the M3 transcription adapter.
+- **M3 → M5.** GLB uploads need storage and upload validation.
+- **M3 → M6.** Footage, image and screen scenes need uploaded assets. Generated clips need somewhere to be stored.
+- **M4 → M7.** Editor v2 edits audio tracks, and the campaigns flows depend on voice-over and ducked music.
+- **M6 → M7.** Campaigns appends a shared base video after the personalized intro. In studio terms that is a footage scene.
+- **M7 → M8.** Teams, billing and OIDC should land on one product with one auth system, which exists only after the campaigns
+  merge. OIDC and observability do not need M7 and may start any time after M1.
 
-## Workflow
+## How a milestone closes
 
-- Each milestone is developed on its own branch and merged when its exit criteria are verified. The verification commands for
-  each milestone are listed below.
-- Exit criteria are checked by running the package scripts (`pnpm --filter <pkg> typecheck`, `test`, `build`) plus the manual
-  checks listed for the milestone. CI must run the same commands.
-- At milestone close, this file, [PRD.md](PRD.md) and any affected docs are updated so they describe the code that shipped.
+- Every exit criterion below is checked by running the package scripts (`pnpm --filter <pkg> typecheck`, `test`, `build`) plus
+  the manual checks listed for that milestone. CI (`.github/workflows/ci.yml`) runs `pnpm install --frozen-lockfile`,
+  `pnpm --filter @vc/studio-api db:generate`, `pnpm typecheck`, `pnpm test` and `pnpm build` with Postgres 16 and Redis 7
+  services and `AI_PROVIDER=mock`.
+- Measurements named in exit criteria (memory, latency, drift) are recorded in the milestone's closing notes, not only asserted.
+- At close, this file, [PRD.md](PRD.md) and any affected docs are updated so they describe the code that shipped, and the next
+  milestone's scope is reviewed.
 
 ---
 
 ## M1: Foundation
 
-**Status: In progress.** Contract: the M1 implementation spec. Only the items below are M1.
+**Status: In progress.**
+
+### Goal
+
+Prove the planning half of the product end to end. A written request becomes validated director artifacts and a versioned,
+frame-exact timeline, which a user can inspect and preview as an animatic in the browser. All of it must work without any paid
+service.
 
 ### Scope
 
-Build the Universal AI Video Studio beside the existing campaigns MVP, without modifying `apps/api`, `apps/worker`,
-`apps/web`, `packages/core`, `packages/video` or `db/migrations`. Deliver the planning half of the product: prompt in, validated
-director artifacts and a versioned timeline out, visible in a web UI with an animatic preview.
+Build the Universal AI Video Studio beside the existing campaigns MVP
+([ADR-002](DECISIONS.md#adr-002-build-the-studio-beside-the-campaigns-mvp-merge-in-m7)). The campaigns directories
+(`apps/api`, `apps/worker`, `apps/web`, `packages/core`, `packages/video`, `db/migrations`) are not changed, apart from the
+package manifests touched by the pnpm migration.
+
+- Repository: move from npm workspaces to a pnpm workspace
+  ([ADR-001](DECISIONS.md#adr-001-pnpm-workspace-monorepo-migrated-from-npm-workspaces)). This landed at the start of M1,
+  together with the CI switch to pnpm and the `video_studio` / `video_studio_test` databases in `docker-compose.yml`.
+- `@vc/schema`: timeline v1 and every other shared contract.
+- `@vc/ai-director`: the planning pipeline with a heuristic mock provider (default), a scripted mock (tests) and an Anthropic
+  adapter.
+- `@vc/studio-api`: the prompt-to-storyboard API and the director worker.
+- `@vc/studio-web`: the web flow from request form to storyboard and animatic.
+- Tests for all four packages, and the eight docs in `docs/`.
 
 ### Deliverables
 
 | Path | Package | Contents |
 |---|---|---|
-| `packages/schema` | `@vc/schema` | Isomorphic Zod v4 schemas and types: common primitives (ids, hex colours, frames, safe URIs), render settings and `resolveDimensions`, frame math (`secondsToFrames`, largest-remainder `allocateFrames`, `formatTimecode`), assets, camera tracks and `expandCameraPreset`, transitions, 2D layers, scene content for 6 engines, scenes, chapters, brand kit, tracks, **Timeline v1** with invariants, resource limits, migrations, `ReferenceProfile` v1, director artifacts (LLM-safe), template catalog (14 templates), API DTOs. |
-| `packages/ai-director` | `@vc/ai-director` | `AIProvider` interface; `HeuristicMockProvider` (default), `ScriptedMockProvider` (tests), `AnthropicProvider` (structured outputs, refusal fallbacks, typed error mapping, prompt-mode retry); `toStructuredOutputSchema`; pricing and usage tracking; content-hash cache (`MemoryDirectorCache`); `planStructure`; `AIDirector.planProject` and `regenerateScene`; repair loop and semantic validators; deterministic compiler; versioned prompts (`PROMPT_VERSION = 'm1.0'`). |
-| `apps/studio-api` | `@vc/studio-api` | Fastify 5 API on port 4100; Prisma 7 schema and initial migration (`User`, `ApiToken`, `Project`, `ProjectVersion`, `DirectorRun`, `DirectorCacheEntry`); bearer-token auth; owner-scoped routes for health, me, system config, projects, director runs, versions, usage; quotas, limits, rate limit; BullMQ worker and inline queue; Prisma-backed director cache; seed script. |
-| `apps/studio-web` | `@vc/studio-web` | Next.js 16 App Router on port 3000: dashboard, new-project form, project page (progress, cancel, re-run; tabs Storyboard, Preview (Remotion Player animatic), Brief, Script, Shot list, Timeline JSON, Usage), settings page; server-only API client; run-polling route handler; loading, error and not-found states. |
+| repo root | — | `pnpm-workspace.yaml`, `pnpm-lock.yaml`, root `studio:*` and `campaigns:*` scripts, `docker/postgres/init-databases.sql` (creates `video_studio` and `video_studio_test`), CI on pnpm with Postgres and Redis services and `AI_PROVIDER=mock`. |
+| `packages/schema` | `@vc/schema` | Isomorphic Zod v4 schemas and types: common primitives (ids, hex colours, frames, safe URIs), render settings and `resolveDimensions`, frame math (`secondsToFrames`, largest-remainder `allocateFrames`, `formatTimecode`), assets, camera tracks and `expandCameraPreset`, transitions, 2D layers, scene content for 6 engines, scenes, chapters, brand kit, tracks, **Timeline v1** with invariants, resource limits, migrations, `ReferenceProfile` v1, LLM-safe director artifacts, the template catalog (14 templates: 11 `motion2d`, 3 `three`), API DTOs. |
+| `packages/ai-director` | `@vc/ai-director` | `AIProvider` interface; `HeuristicMockProvider` (default), `ScriptedMockProvider` (tests), `AnthropicProvider` (structured outputs, refusal fallbacks, typed error mapping, prompt-mode retry); `toStructuredOutputSchema`; pricing and usage tracking; content-hash stage cache (`MemoryDirectorCache`); `planStructure`; `AIDirector.planProject` and `regenerateScene`; repair loop and semantic validators; deterministic timeline compiler; versioned prompts (`PROMPT_VERSION = 'm1.0'`). |
+| `apps/studio-api` | `@vc/studio-api` | Fastify 5 API on port 4100; Prisma 7 schema and initial migration (`User`, `ApiToken`, `Project`, `ProjectVersion`, `DirectorRun`, `DirectorCacheEntry`); hashed bearer-token auth; owner-scoped routes for health, me, system config, projects, director runs, versions and usage; resource limits, daily quotas, per-token rate limit; BullMQ worker and inline queue; Prisma-backed director cache; seed script. |
+| `apps/studio-web` | `@vc/studio-web` | Next.js 16 App Router on port 3000: dashboard, new-project form, project page (run progress, Cancel, Re-run; tabs Storyboard, Preview (Remotion Player animatic), Brief, Script, Shot list, Timeline JSON, Usage), settings page; server-only API client; run-polling route handler; loading, error and not-found states. |
 | `docs/` | — | PRD, ARCHITECTURE, AI_DIRECTOR, TIMELINE_SCHEMA, DATABASE, ROADMAP, DECISIONS, DEVELOPMENT. |
 
-Also part of M1: the repository moved from npm workspaces to a pnpm workspace
-([ADR-001](DECISIONS.md#adr-001-pnpm-workspace-monorepo-migrated-from-npm-workspaces)).
+Build order inside M1 (arrows point from a package to the packages that consume it):
+
+```mermaid
+flowchart LR
+  S["@vc/schema"] --> D["@vc/ai-director"]
+  S --> A["@vc/studio-api"]
+  D --> A
+  S --> W["@vc/studio-web"]
+  A -. "HTTP, server-side only" .-> W
+```
 
 ### Explicitly not in M1
 
 | Not in M1 | Where it lands |
 |---|---|
-| Rendering to MP4 or any export | M2 |
-| Template render components (the preview is an animatic of branded cards) | M2 (2D), M5 (3D) |
-| Editing scenes, text or colours; reordering; versions UI | M2 |
-| HTTP endpoint or UI for regenerating one scene (the library function `regenerateScene` exists and is tested) | M2 |
-| Uploads, storage, reference analysis (`ReferenceProfile` schema exists, nothing produces profiles) | M3 |
-| Text-to-speech, music, audio mixing (voice-over text and a derived caption track exist in the timeline) | M4 |
-| 3D rendering (3D scenes can be planned and appear as animatic cards) | M5 |
-| Video-generation providers, and footage/image/screen engines (reported unavailable; the director coerces such choices to motion2d with a warning) | M6 |
+| Rendering to MP4 or any other export | M2 |
+| Template render components. The M1 preview is an animatic of branded cards, not the templates themselves. | M2 (2D), M5 (3D) |
+| Editing scenes, text or colours; reordering scenes; a versions UI | M2 |
+| An HTTP endpoint or UI for regenerating one scene. The library function `regenerateScene` exists and is tested. | M2 |
+| Uploads, storage and reference analysis. The `ReferenceProfile` schema exists; nothing produces profiles. | M3 |
+| Text-to-speech, music and audio mixing. Voice-over text and a caption track derived from it are in the timeline. | M4 |
+| 3D rendering. 3D scenes can be planned and appear as animatic cards. | M5 |
+| Video-generation providers, and the footage, image and screen engines. They are reported unavailable, and the director coerces such choices to `motion2d` with a warning. | M6 |
 | Login UI, teams, billing | M8 |
 
 ### Exit criteria and verification
 
-To be ticked at M1 close. Nothing is ticked yet because M1 is in progress.
+Ticked at M1 close. Nothing is ticked yet because M1 is in progress.
 
-- [ ] `pnpm --filter @vc/schema typecheck` and `pnpm --filter @vc/schema test` pass. Tests cover `resolveDimensions` examples,
-      `allocateFrames` (exact sums, minimums, tie-breaking, `RangeError`), every timeline invariant with a precise error path,
-      `SafeUriSchema` rejections, limits, and migrations with an injected fake v0→v1 migration.
-- [ ] `pnpm --filter @vc/ai-director typecheck` and `test` pass with no network access. Tests cover: LLM-facing schema fixtures
-      (valid and invalid); `toStructuredOutputSchema` stripping unsupported keywords and closing objects; the full pipeline with
-      `HeuristicMockProvider` for genres × {5 s, 30 s, 10 min, 25 min, 2 h} (valid timeline, exact frame sums, chunked
-      chapters, scene counts in range); repair success and exhaustion (`VALIDATION_FAILED`); a second identical run making 0
-      provider calls; cost maths; the engine-coercion warning; `regenerateScene` leaving other scenes and timing identical;
-      cancellation; `LIMIT_EXCEEDED` before any provider call; `AnthropicProvider` request shape (model,
-      `output_config.effort`/`format`, system `cache_control`, `betas` + `fallbacks`, no `thinking` or `temperature`) and
-      response handling (text extraction, usage mapping, refusal, `max_tokens`, BadRequest → prompt-mode retry) against an
-      injected fake client.
-- [ ] `pnpm --filter @vc/studio-api typecheck` and `test` pass against the `video_studio_test` database (migrated with
-      `prisma migrate deploy`). Tests cover: health; 401 without a token and with a bad token; project CRUD; 400 validation;
-      422 limits; owner isolation (404); a director run end to end producing version 1 with a timeline that re-parses with
-      `TimelineSchema` and usage; a second run producing version 2 with cache hits and 0 new tokens; 409 on a concurrent run;
-      cancel; 429 quota; provider failure recorded as run `FAILED` with a code; system config containing no secrets.
+- [ ] `pnpm --filter @vc/schema typecheck` and `test` pass. Tests cover the `resolveDimensions` examples, `allocateFrames`
+      (exact sums, minimums, tie-breaking, `RangeError`), every timeline invariant with a precise error path, `SafeUriSchema`
+      rejections, limits, and migrations with an injected fake v0→v1 migration.
+- [ ] `pnpm --filter @vc/ai-director typecheck` and `test` pass with no network access. Tests cover: valid and invalid
+      fixtures for every LLM-facing schema; `toStructuredOutputSchema` stripping unsupported keywords and closing objects;
+      the full pipeline with `HeuristicMockProvider` for genres × {5 s, 30 s, 10 min, 25 min, 2 h} (valid timeline, exact
+      frame sums, chunked chapters, scene counts in range); repair success and exhaustion (`VALIDATION_FAILED`); a second
+      identical run making 0 provider calls; cost maths; the engine-coercion warning; `regenerateScene` leaving other scenes
+      and timing identical; cancellation; `LIMIT_EXCEEDED` before any provider call; the `AnthropicProvider` request shape
+      (model, `output_config.effort` and `format`, system `cache_control`, `betas` plus `fallbacks`, no `thinking` or
+      `temperature`) and response handling (text extraction, usage mapping, refusal, `max_tokens`, BadRequest → prompt-mode
+      retry) against an injected fake client.
+- [ ] `pnpm --filter @vc/studio-api typecheck` and `test` pass against `video_studio_test` (migrated with
+      `prisma migrate deploy`). Tests cover: health; 401 without a token and with a bad token; project create, list, get and
+      delete; 400 validation; 422 limits; owner isolation (404); a director run end to end producing version 1, whose timeline
+      re-parses with `TimelineSchema`, and usage; a second run producing version 2 with cache hits and 0 new tokens; 409 on a
+      concurrent run; cancel; 429 quota; a provider failure recorded as run `FAILED` with a code; system config containing no
+      secrets.
 - [ ] The initial Prisma migration SQL is committed under `apps/studio-api/prisma/migrations`.
 - [ ] `pnpm --filter @vc/studio-web typecheck`, `test` (pure helpers: duration formatting and parsing, form → `VideoRequest`
       mapping) and `build` pass.
-- [ ] Manual check with `AI_PROVIDER=mock` and `QUEUE_DRIVER=bullmq`: run the API, worker and web app; create a project; watch
-      progress; open every tab; play the animatic; cancel a run; re-run and see cached calls in Usage.
-- [ ] Optional manual check with `AI_PROVIDER=anthropic` and a real key: one short run, with usage and cost shown. This is not
-      part of CI.
-- [ ] The campaigns MVP still typechecks, and its existing tests pass, under the pnpm workspace.
+- [ ] The campaigns MVP still typechecks and `pnpm --filter @vc/core test` passes under the pnpm workspace.
+- [ ] CI passes on the M1 branch.
+- [ ] Manual check with `AI_PROVIDER=mock` and `QUEUE_DRIVER=bullmq`: start the API, the worker and the web app; create a
+      project; watch progress; open every tab; play the animatic; cancel a run; re-run and see cached calls in the Usage tab.
+- [ ] Optional manual check with `AI_PROVIDER=anthropic` and a real key: one short run, with usage and estimated cost shown,
+      and the observed latency per call written down. Not part of CI.
 - [ ] Docs describe the shipped code and label everything else as planned.
 
 ### Dependencies
 
-None beyond the existing repo, Postgres 16 and Redis 7 (`docker-compose.yml`).
+- The existing repository, Node ≥ 22, pnpm 10.28 (`corepack enable`).
+- Postgres 16 and Redis 7 from `docker-compose.yml` (or local installs).
+- No paid service. An Anthropic API key is optional and only needed for the manual live check.
 
 ### Risks
 
-- Live Claude behaviour (validity rate, refusals, latency, cost) is not covered by CI. Mitigations: repair loop, prompt-mode
-  fallback, refusal fallbacks, and a manual live check.
-- The animatic could be mistaken for final output. Mitigation: the UI labels it as a preview and labels mock mode.
+| Risk | Mitigation in M1 |
+|---|---|
+| Live Claude behaviour (validity rate, refusals, latency, cost) is not covered by CI. | Repair loop, prompt-mode fallback, server-side refusal fallbacks, the manual live check. An automated live evaluation is PRD Q15. |
+| Long live runs may exceed `DIRECTOR_RUN_TIMEOUT_MS` (default 30 min). A 2 h `long-form` plan makes 127 sequential LLM calls. If a call takes 30 s (not measured), the run needs over an hour. | Operators raise the timeout for long requests. Record real per-call latency in the live check. Parallel chapters may be revisited after measurement ([ADR-010](DECISIONS.md#adr-010-chapter-chunked-generation-for-long-videos)). |
+| The scene-specs output schema is a union over the whole template catalog and could be rejected by the structured-output endpoint as too complex. | The adapter retries once in prompt mode on a schema-related 400 ([ADR-006](DECISIONS.md#adr-006-claude-structured-outputs-instead-of-forced-tool-use)). |
+| Four packages are built at the same time against one contract, so they can drift apart. | All DTOs live in `@vc/schema`. studio-web validates every API response with those schemas, and the API tests re-parse stored timelines. |
+| The animatic could be mistaken for final output, and mock output for real AI output. | The UI labels the preview as an animatic and shows mock mode explicitly. |
 
 ---
 
 ## M2: Remotion 2D engine, render pipeline and basic editor
 
-**Status: Planned.** Depends on M1.
+**Status: Planned.**
+
+### Goal
+
+Turn a timeline into a validated video file, and let users fix a plan without regenerating all of it.
 
 ### Scope
 
-Remotion 2D engine and render pipeline: template components, frame-range segment rendering, FFmpeg assembly, render queue with
-progress and cancel, export validation. Basic editor: scene list and reorder, text and colour edits, regenerate-scene endpoint
-and UI, project versions UI.
+Remotion 2D engine and render pipeline: template components, frame-range segment rendering, FFmpeg assembly, a render queue
+with progress and cancel, export validation. Basic editor: scene list and reorder, text and colour edits, a regenerate-scene
+endpoint and UI, a project versions UI.
 
 ### Planned deliverables
 
-- Remotion components for all 11 motion2d templates, driven by timeline props, layers, cameras and transitions.
-- Render jobs (queue abstraction from [ADR-014](DECISIONS.md#adr-014-queue-abstraction-bullmq-with-an-inline-driver-for-tests)),
-  rendering frame-range segments with identical encoder settings, assembled with FFmpeg concat, audio muxed.
-- Render progress, cancellation, per-segment retry, render timeouts, temp-file cleanup.
-- Export validation with ffprobe (duration within 1 frame of `durationInFrames / fps`, fps, dimensions, codecs, streams).
-- Render outputs written through a storage interface (local disk driver first; the S3-compatible driver arrives in M3).
-- Editor: scene list, reorder (frames re-allocated by the compiler), text and colour edits validated against each template's
-  props schema, regenerate one scene (`POST` endpoint wrapping `AIDirector.regenerateScene`), and a versions list and viewer.
-  Every edit saves a new immutable version.
+- Remotion components for all 11 `motion2d` templates, driven by timeline props, 2D layers, 2D camera tracks, transitions and
+  the caption track.
+- A render worker process using `@remotion/renderer`. It renders frame ranges of the timeline composition as separate segments
+  with identical encoder settings, joins them with FFmpeg concat and muxes one continuous audio track. (The campaigns worker
+  already joins identically encoded segments with `-c copy`. The approach is ported, not imported, because the products share
+  no code before M7.)
+- Render jobs and segments persisted in Postgres (the data model is designed in M2), queued through the queue abstraction
+  ([ADR-014](DECISIONS.md#adr-014-queue-abstraction-bullmq-with-an-inline-driver-for-tests)) on a queue separate from director
+  runs.
+- Render progress, cancellation, per-segment retry, render timeouts, and temp-file cleanup on success, failure and cancel.
+- Export validation with ffprobe before an export is offered: duration within 1 frame of `durationInFrames / fps`, fps,
+  dimensions, codecs, expected streams.
+- A storage interface for render outputs, with a local-disk driver. The S3-compatible driver arrives in M3.
+- Editor: scene list, reorder (the compiler re-allocates frames), text and colour edits validated against each template's
+  props schema, regenerate one scene (a `POST` endpoint wrapping `AIDirector.regenerateScene`, plus UI), and a versions list
+  and viewer. Every edit saves a new immutable `ProjectVersion`.
+- Decisions on PRD open questions Q1 (is `three` reported available before M5), Q3 (burned-in captions and/or SRT/VTT),
+  Q4 (first codecs), Q6 (bypassing the stage cache for a fresh take), Q12 (containerizing the studio apps) and Q15 (live
+  evaluation).
+- A stale-run reaper for director runs (see [Known gaps](#known-gaps-carried-out-of-m1)).
 
 ### Exit criteria and verification
 
-- A 30 s 16:9 1080p motion2d timeline renders to a validated MP4.
-- A 10 min timeline renders in segments with peak worker memory independent of length (measured and recorded).
-- Killing one segment's render causes only that segment to retry. Cancelling mid-render stops the work and removes temp files.
-- Each motion2d template has a still-frame render test at fixed frames.
-- Reordering and editing produce new versions that re-parse with `TimelineSchema`. Regenerating a scene leaves the other scenes
-  byte-identical.
+- A 30 s 16:9 1080p `motion2d` timeline renders to an MP4 that passes ffprobe validation. Each aspect-ratio preset (9:16,
+  16:9, 1:1, 4:5) renders at least once in tests.
+- A 10 min timeline renders in segments. Peak worker memory is measured and recorded, and it does not grow with video length
+  (compared against the 30 s run).
+- Killing one segment's render retries only that segment. Cancelling mid-render stops all work and removes temp files.
+- Each `motion2d` template has a still-frame render test at fixed frames.
+- A deliberately corrupted output fails export validation and is never offered for download.
+- Reordering and editing produce new versions that re-parse with `TimelineSchema`. Regenerating a scene leaves every other
+  scene byte-identical in the new version.
+
+### Dependencies
+
+- M1: timeline v1, template catalog, `regenerateScene`, queue abstraction, `ProjectVersion`.
+- FFmpeg and ffprobe on render hosts, plus Chromium (Remotion downloads `chrome-headless-shell` unless a path is configured, as
+  the campaigns worker already allows).
+
+### Risks
+
+| Risk | Mitigation |
+|---|---|
+| Audio at segment joins. Encoding audio per segment adds AAC priming and padding, which causes gaps or clicks at joins. | Render video segments without audio and mux one audio track for the whole timeline. |
+| Fonts. Headless Chromium only has the fonts it is given; timelines default to `Inter`. | Bundle a fixed font set with the render worker. Reject or substitute unknown `FontFamily` values with a warning. |
+| Render cost and time for long videos on a single worker. | Segment rendering in M2; distribution across workers in M7. |
+| Remotion licensing. Remotion is free for individuals and companies with up to 3 employees; larger companies need a company license. | Confirm licensing before any deployment by a larger organization. |
+| Template visual quality falls short of "professional motion graphics". | Still-frame tests catch regressions, not taste. Review renders of every template before M2 closes. |
 
 ---
 
 ## M3: Assets and reference analysis
 
-**Status: Planned.** Depends on M1.
+**Status: Planned.**
+
+### Goal
+
+Let users bring their own material, and turn reference videos into structured style data that the director can use.
 
 ### Scope
 
@@ -197,26 +279,50 @@ transcription adapter; camera-movement classification; `ReferenceProfile` genera
 
 ### Planned deliverables
 
-- S3-compatible storage driver (S3, MinIO, R2). MinIO added to local development.
-- Upload endpoints with configurable size limits, MIME sniffing from content, and `asset://` references in timelines.
-- Analysis jobs: ffprobe metadata, scene detection, keyframe sampling (downscaled stills), audio extraction, transcription
-  adapter (mock by default), palette extraction, typography/transition/camera-movement classification, pacing.
-- `ReferenceProfile` v1 produced and validated, then passed to the director.
+- An S3-compatible storage driver (S3, MinIO, R2) behind the storage interface from M2, with MinIO added to local development.
+- Upload endpoints with configurable size limits, MIME sniffing from file content (not the extension or the client's header),
+  persisted asset records, and `asset://` references in timelines.
+- Analysis jobs on the queue, cancellable: ffprobe metadata, scene detection, keyframe sampling (downscaled stills), audio
+  extraction, a transcription adapter (mock by default), palette extraction, typography, transition and camera-movement
+  classification, and pacing (average shot length, cuts per minute).
+- `ReferenceProfile` v1 produced, validated with the M1 schema, stored, and passed to the director.
 - Claude vision on sampled frames, metadata and transcript only. Raw video is never sent to the model.
-- New-project form: reference uploads and a brand logo.
+- New-project form: reference uploads (up to 20 per request, the existing `referenceAssetIds` field) and a brand logo.
+- Decisions on PRD Q2 (should the image engine move earlier), Q8 (transcription provider) and Q9 (object storage, signed URLs).
 
 ### Exit criteria and verification
 
-- An upload with a mismatched extension or declared type is rejected. Oversize uploads are rejected before they are fully read.
-- A sample reference video yields a `ReferenceProfile` that passes the schema, and a `reference-based` run uses its pacing.
-- Tests assert that requests to the provider contain image blocks and text only, with no video payload.
+- An upload whose content does not match its declared type or extension is rejected. Oversize uploads are rejected before they
+  are fully read.
+- A sample reference video yields a `ReferenceProfile` that passes the schema, and a `reference-based` run uses its
+  `pacing.averageShotSeconds`.
+- Tests assert that provider requests contain only image blocks and text, with no video payload.
 - Temp files from analysis are removed on success, failure and cancellation.
+
+### Dependencies
+
+- M1: `ReferenceProfile` v1 schema, `AssetRef` and `SafeUriSchema`, director support for references.
+- ffmpeg and ffprobe on analysis hosts. A transcription provider is optional (the mock is the default).
+- Independent of M2, except that the storage interface should be shared. Whichever milestone starts first defines it.
+
+### Risks
+
+| Risk | Mitigation |
+|---|---|
+| Malicious or malformed media (polyglot files, decompression bombs, crafted inputs for FFmpeg) reaching the analysis worker. | Content sniffing, size and duration limits, per-job timeouts, a separate worker process. Full sandboxing is M8. |
+| Vision cost grows with the number of sampled frames. | Sample a capped number of downscaled keyframes per reference; record vision tokens per stage like every other call. |
+| Camera-movement and typography classification may be inaccurate. | Treat these fields as hints. They are optional in the schema, and the profile carries `warnings`. |
+| Rights and retention of uploaded reference material and the frames sampled from it. | Define retention and deletion before M3 closes; deleting a project or asset must delete derived frames. |
 
 ---
 
 ## M4: Voice and music
 
-**Status: Planned.** Depends on M2 and M3.
+**Status: Planned.**
+
+### Goal
+
+Videos that speak: narration, music and captions that line up with what is on screen.
 
 ### Scope
 
@@ -224,23 +330,43 @@ TTS and music provider adapters, voice-over alignment, word-timed captions, duck
 
 ### Planned deliverables
 
-- TTS and music adapters behind provider interfaces (mock by default; real providers only when configured).
-- Voice-over alignment producing word timestamps; caption cues re-timed from them, replacing M1's proportional cues.
-- Music ducking under voice and loudness normalization in the render pipeline. The campaigns worker already uses sidechain
-  ducking and -16 LUFS voice normalization, and that can be reused.
-- A decided policy for reconciling voice-over length with scene durations (PRD open question Q7).
+- TTS and music adapters behind provider interfaces. Mock by default; a real provider is shown as connected only when its
+  credentials are configured. The campaigns MVP already uses ElevenLabs, which is a candidate (PRD Q8).
+- Voice-over generation from the narration text already in timeline v1, producing assets on the `voiceover` audio track.
+- Alignment that produces word timestamps. Caption cues are re-timed from them, replacing M1's proportional cues.
+- Music ducking under voice and loudness normalization in the render pipeline. The campaigns worker already does sidechain
+  ducking and normalizes voice to -16 LUFS; that approach can be ported.
+- A decided policy for reconciling voice-over length with scene durations (PRD Q7) and an export loudness target (PRD Q11).
 
 ### Exit criteria and verification
 
-- A rendered export with voice-over and music passes loudness checks against the chosen target, and word-timed captions line
-  up with the audio within a tested tolerance.
-- With no TTS provider configured, the system reports it as unavailable and still renders.
+- A rendered export with voice-over and music meets the chosen loudness target, measured in a test.
+- Word-timed captions line up with the voice-over within a tolerance fixed and tested in M4.
+- With no TTS provider configured, voice-over is reported unavailable and the video still renders, with captions.
+
+### Dependencies
+
+- M2 (render pipeline and audio muxing) and M3 (storage for audio assets; the transcription adapter for alignment).
+- At least one TTS provider account for the manual live check. CI uses the mock.
+
+### Risks
+
+| Risk | Mitigation |
+|---|---|
+| Synthesized narration is longer or shorter than the planned scenes. | Decide Q7 first. Any re-timing must go through the compiler so frame invariants still hold. |
+| Voice consent and licensing, especially for cloned voices. | Only provider voices with clear terms in M4; voice cloning is not in scope. |
+| Alignment quality varies by language. | Test at least the languages the studio claims to support; fall back to proportional cues with a warning. |
+| TTS cost for long videos. | Per-run estimates and quotas like the director's; cached synthesis for unchanged narration. |
 
 ---
 
 ## M5: 3D engine
 
-**Status: Planned.** Depends on M2 and M3.
+**Status: Planned.**
+
+### Goal
+
+Render the 3D scenes that the director can already plan.
 
 ### Scope
 
@@ -248,60 +374,98 @@ React Three Fiber, `@remotion/three` and Drei; GLB uploads; camera presets.
 
 ### Planned deliverables
 
-- Components for `product-turntable`, `logo-reveal-3d` and `floating-shapes`, rendered deterministically from the frame number
-  (no wall-clock or random state).
+- Components for `product-turntable`, `logo-reveal-3d` and `floating-shapes`, rendered from the frame number only (no
+  wall-clock time, no unseeded randomness).
 - 3D camera tracks from `expandCameraPreset` (orbit, dolly, crane, push-in) applied in render.
-- GLB uploads (validated and size-limited) bound through `three.modelAssetId`.
-- Environment and lighting presets as defined by the timeline schema.
+- GLB uploads, validated and size-limited, bound through `three.modelAssetId`.
+- The environment and lighting presets defined by the timeline schema.
+- Engine availability for `three` reflects whether the render worker can actually render WebGL.
 
 ### Exit criteria and verification
 
-- Each 3D template renders headless in the worker, and a still-frame test at fixed frames passes.
+- Each 3D template renders headless in the render worker, and still-frame tests at fixed frames pass within a fixed pixel
+  tolerance.
 - An uploaded GLB replaces the primitive in `product-turntable`.
+- A worker without WebGL support reports `three` as unavailable with a reason, instead of failing renders.
+
+### Dependencies
+
+- M2 (render pipeline) and M3 (uploads and storage for GLB files).
+
+### Risks
+
+| Risk | Mitigation |
+|---|---|
+| Headless WebGL. Without a GPU, rendering falls back to software GL and can be very slow. | Measure software-GL render time per frame. Decide whether 3D scenes need GPU workers before M5 closes. |
+| Heavy or hostile GLB files (huge textures, extreme polygon counts). | Limits on file size, texture size and polygon count, checked at upload. |
+| Pixel output differs between GPU and software rendering. | Still-frame tests use a tolerance and run on one pinned worker image. |
 
 ---
 
 ## M6: Generative video and footage
 
-**Status: Planned.** Depends on M2 and M3.
+**Status: Planned.**
+
+### Goal
+
+Add footage, images, screen recordings and AI-generated clips as scene engines, with cost kept under control.
 
 ### Scope
 
-Provider adapters (for example Runway, Kling, Pika; not connected until configured), async jobs, cost controls; footage, screen
-and image engines.
+Provider adapters (for example Runway, Kling, Pika; none is connected until configured), async jobs, cost controls; the
+footage, screen and image engines.
 
 ### Planned deliverables
 
-- A video-generation provider interface. Each adapter reports itself available only when credentials are configured and a
-  health check passes. A mock provider is used for tests.
-- Async generation jobs: a `generated` scene goes `pending` → `queued` → `ready` (with an asset) or `failed`. Polling or
-  webhooks; timeouts; cancellation.
-- Cost controls: a per-job estimate, per-user daily caps, and explicit confirmation before expensive jobs.
-- Footage, image and screen engines: trim, playback rate, fit, Ken Burns/zoom/pan/parallax, zoom regions, cursor highlight.
-- Engine availability computed from configuration and assets instead of static M1 values.
+- A video-generation provider interface. An adapter reports itself available only when its credentials are configured and a
+  health check passes. A mock provider is used in tests.
+- Async generation jobs: a `generated` scene moves `pending` → `queued` → `ready` (with an asset) or `failed`, through
+  polling or verified webhooks, with timeouts and cancellation.
+- Cost controls: an estimate per job, per-user daily caps, and explicit confirmation before expensive jobs.
+- Footage, image and screen engines: trim, playback rate, fit, Ken Burns, zoom, pan and parallax, zoom regions, cursor
+  highlight, as defined in timeline v1.
+- Engine availability computed from configuration and available assets, replacing the static values reported in M1.
 
 ### Exit criteria and verification
 
-- With no provider configured, `generated` is reported unavailable and the director coerces such choices to motion2d (already
-  M1 behaviour, re-verified).
-- With the mock video provider, a timeline containing generated scenes completes end to end, and failed jobs leave a scene
-  that can be retried.
-- A footage scene renders from an uploaded clip.
+- With no provider configured, `generated` is reported unavailable and the director coerces such choices to `motion2d`
+  (M1 behaviour, re-verified).
+- With the mock video provider, a timeline containing generated scenes completes end to end, and a failed job leaves a scene
+  that can be retried on its own.
+- A job whose estimate exceeds the configured cap is refused before any provider call.
+- A footage scene renders from an uploaded clip, and an image scene renders with each animation preset.
+
+### Dependencies
+
+- M2 (render pipeline) and M3 (uploads and storage). A provider account per adapter for manual live checks.
+
+### Risks
+
+| Risk | Mitigation |
+|---|---|
+| High and variable cost per generated second. | Estimates, caps and confirmation before any job; usage recorded per job. |
+| Provider APIs, pricing and content policies change often. | One adapter per provider behind a narrow interface; provider errors map to typed, retryable or non-retryable errors. |
+| Visual consistency between generated clips and template scenes (characters, brand colours). | Pass brand and style data from the brief into generation prompts; keep templates for text and brand-critical scenes. |
+| Webhooks are an inbound attack surface. | Verify signatures; accept only known job ids. |
 
 ---
 
 ## M7: Long-form at scale, editor v2, campaigns merge
 
-**Status: Planned.** Depends on M2, M4 and M6.
+**Status: Planned.**
+
+### Goal
+
+Make videos of 20 minutes and longer routine to render and edit, and fold the campaigns MVP into the studio.
 
 ### Scope
 
-Distributed chapter/segment rendering, resumable renders, validation beyond 20 minutes, editor v2 (tracks, transitions, audio),
-and the campaigns MVP merged as a module.
+Distributed chapter/segment rendering, resumable renders, validation beyond 20 minutes, editor v2 (tracks, transitions,
+audio), and the campaigns MVP merged as a module.
 
 ### Planned deliverables
 
-- Chapter and segment render jobs fanned out across workers. Completed segments are persisted so a render can resume after a
+- Chapter and segment render jobs fanned out across workers. Completed segments are persisted, so a render resumes after a
   crash without redoing them.
 - End-to-end validation of long exports (25 min and 2 h test cases): duration, A/V sync at the end of the file, chapter
   boundaries.
@@ -309,21 +473,40 @@ and the campaigns MVP merged as a module.
   overlaps on the scene track, it becomes timeline schema v2 with a migration
   ([ADR-011](DECISIONS.md#adr-011-integer-frames-and-a-versioned-timeline-with-migrations)).
 - Campaigns as a studio module: a campaign binds CSV variables into a studio project or template, renders per contact through
-  the studio pipeline, and sends via WhatsApp. One auth system; campaign data migrated; old campaigns apps retired after
-  regression tests pass.
+  the studio pipeline, and sends via WhatsApp. One auth system; campaign data migrated; the old campaigns apps are retired
+  only after regression tests pass on the module. PRD Q13 (Prisma or raw SQL for campaigns tables; porting Express routes) is
+  decided at the start of M7.
 
 ### Exit criteria and verification
 
 - A 25-minute render completes after a worker is killed midway, without re-rendering segments that had already finished.
-- A 2-hour export passes validation. *Target:* A/V drift of at most 1 frame at the end.
-- The campaigns flows (CSV import, per-contact render, dry-run send, status webhooks) pass regression tests on the merged
-  module.
+- A 2-hour export passes validation. *Target:* A/V drift of at most 1 frame at the end of the file.
+- The campaigns flows (CSV import, per-contact render, dry-run send, delivery-status webhooks, one message per contact)
+  pass regression tests on the merged module.
+
+### Dependencies
+
+- M2 (render pipeline), M4 (audio, needed by editor v2 and campaigns), M6 (footage scenes, needed for the campaigns base
+  video), and M3 through those.
+
+### Risks
+
+| Risk | Mitigation |
+|---|---|
+| Coordinating many render workers (partial failures, duplicate segment work, storage throughput). | Segment state in Postgres as the source of truth, idempotent segment jobs, measured throughput. |
+| A/V drift over 2 h from rounding in audio or video timing. | Integer frames throughout ([ADR-011](DECISIONS.md#adr-011-integer-frames-and-a-versioned-timeline-with-migrations)); one continuous audio track; a drift test. |
+| The campaigns merge regresses a working product (double sends, broken webhooks). | Regression tests before retiring anything; keep the old apps runnable until the module passes them. |
+| Editor v2 forces a timeline v2. | Plan the migration early; v1 timelines must keep opening. |
 
 ---
 
 ## M8: Production hardening
 
-**Status: Planned.** Depends on M7. OIDC and observability work can start earlier.
+**Status: Planned.**
+
+### Goal
+
+Make the studio safe to run for several organizations on the public internet.
 
 ### Scope
 
@@ -334,27 +517,50 @@ OIDC auth, teams, billing and quotas, observability, sandboxed workers, backups,
 - OIDC login with sessions in studio-web, replacing the single server-side token. API tokens remain for programmatic access
   ([ADR-015](DECISIONS.md#adr-015-m1-auth-is-hashed-per-user-bearer-tokens-oidc-in-m8)).
 - Organizations and teams with roles; project sharing.
-- Billing, plans and per-plan quotas, replacing the deployment-wide env limits.
+- Billing, plans and per-plan quotas, replacing the deployment-wide env limits as the main control (PRD Q14).
+- Director-cache scoping and eviction (PRD Q5).
 - Metrics, tracing, dashboards and alerting (queue depth, run and render failure rates, cost).
-- Render and analysis workers in sandboxes (isolated containers, no outbound network by default, restricted filesystem).
+- Render and analysis workers in sandboxes: isolated containers, no outbound network by default, restricted filesystem.
 - Postgres backups with tested restores; object-storage versioning; CDN for delivery.
 
 ### Exit criteria and verification
 
-- Security review completed. A restore drill succeeds. A load test at the agreed target passes. Quotas are enforced per plan.
+- Security review completed and its findings resolved or accepted in writing.
+- A restore drill from backup succeeds.
+- A load test at a target agreed at the start of M8 passes.
+- Quotas are enforced per plan, and users in one organization cannot read another organization's projects, runs, assets or
+  cache entries.
+- studio-web can be exposed publicly without an authenticating proxy in front of it.
+
+### Dependencies
+
+- M7 (one product and one auth system). OIDC and observability can start any time after M1.
+- An OIDC identity provider and a billing provider (not chosen).
+
+### Risks
+
+| Risk | Mitigation |
+|---|---|
+| Moving from per-user tokens to organizations touches every owner-scoped query. | All queries are already owner-scoped in M1; switch the scope key in one place per service and test isolation per organization. |
+| Sandboxing Chromium and FFmpeg can break rendering or slow it down. | Measure render time inside and outside the sandbox before switching. |
+| Billing errors directly affect users' money. | Reconcile usage records against provider invoices before charging. |
 
 ---
 
 ## Known gaps carried out of M1
 
-These were found while writing M1 and are not part of any milestone's scope above. Each needs an owner.
+Found while writing M1. They are not part of any milestone's scope above unless a milestone says so. Each needs an owner.
 
 | Gap | Impact | Suggested handling |
 |---|---|---|
-| `.github/workflows/ci.yml` still runs `npm ci`, `npm run typecheck`, `npm test`, `npm run build:web`, but `package-lock.json` has been removed and the root scripts changed in the pnpm migration | CI fails until it is updated to pnpm (`pnpm install --frozen-lockfile`, `pnpm typecheck`, `pnpm test`, `pnpm build`) | Fix at M1 close |
-| The root `README.md` documents the campaigns MVP with npm commands | Wrong setup instructions | Update alongside DEVELOPMENT.md |
-| A worker crash can leave a director run `RUNNING`. Processing skips non-`QUEUED` runs, so a redelivered job does nothing. | The project stays blocked with 409 `RUN_ACTIVE` until the user cancels | Stale-run reaper (heartbeat or `startedAt` + timeout). M2 candidate |
-| `DirectorCacheEntry` has no eviction or TTL, and the cache is shared across users | Unbounded growth; a cache hit reveals that someone submitted an identical request | PRD Q5. M8 at the latest |
-| The cache key covers the prompt text and schema name, not the schema body | Changing an LLM-facing schema without bumping `PROMPT_VERSION` can serve stale cached outputs | Rule: bump `PROMPT_VERSION` on any prompt or LLM-facing schema change |
-| studio-web acts as one configured API user | Must not be exposed publicly without an authenticating proxy | Documented. Fixed by OIDC in M8 |
-| No live-provider evaluation runs automatically | Prompt or model regressions are invisible to CI | PRD Q15 |
+| A worker crash can leave a director run `RUNNING`. BullMQ may redeliver the stalled job, but processing skips any run that is not `QUEUED`, so nothing resumes it. | The project stays blocked with 409 `RUN_ACTIVE` until the user cancels the run. | A stale-run reaper (heartbeat, or `startedAt` + `DIRECTOR_RUN_TIMEOUT_MS`). Listed in M2. |
+| Live 2 h runs probably exceed the default `DIRECTOR_RUN_TIMEOUT_MS` of 30 min (not measured). | Long live runs time out and fail; a rerun reuses the cached chapters. | Measure in the live check; document a recommended timeout per duration in DEVELOPMENT.md. |
+| `DirectorCacheEntry` has no eviction or TTL, and the cache is shared by all users of a deployment. | Unbounded table growth. A cache hit reveals that someone else submitted an identical request. | PRD Q5. M8 at the latest. |
+| The cache key covers the prompt text and schema name, not the schema body. | Changing an LLM-facing schema or template props schema without changing the prompt text could serve stale cached outputs. | Rule: bump `PROMPT_VERSION` on any change to a prompt, an LLM-facing schema or a template props schema. |
+| studio-web acts as one configured API user. | Anyone who can reach studio-web acts as that user. It must not be exposed publicly without an authenticating proxy. | Documented in PRD 7.3. Fixed by OIDC in M8. |
+| M1 has no endpoint to issue or revoke API tokens; the seed script creates the dev token. | Extra users or token rotation need manual database work. | An admin CLI if needed before M8; OIDC in M8. |
+| No automated live-provider evaluation. | Prompt or model regressions are invisible to CI, which only runs the mock. | PRD Q15, decided in M2. |
+| `three` is reported available for planning although nothing renders it until M5. footage, image and screen report "requires uploaded assets (Milestone 3)", but they render only from M6. | The settings page can suggest more than the product does. | PRD Q1 and Q2. Decide in M2 and M3, and adjust the reasons then. |
+| The Prisma client is generated into a gitignored folder and no install hook generates it. CI runs `db:generate` explicitly, but the README quick start has no such step. | A fresh clone that follows the README may fail to start studio-api. | Add `pnpm --filter @vc/studio-api db:generate` to the README quick start and DEVELOPMENT.md. |
+
+Resolved during M1: CI and the root README were moved from npm to pnpm together with the workspace migration.
