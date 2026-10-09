@@ -19,8 +19,9 @@ async function main(): Promise<void> {
     concurrency: config.director.workerConcurrency,
     logger,
     processor: (job) => processDirectorRun(job.runId, deps),
-    onJobFailed: async (job, error) => {
-      await markRunFailed(prisma, job.runId, 'INTERNAL', `Director job failed in the worker: ${error.message}`.slice(0, 500));
+    // Stalled job (crashed worker) or an unexpected processor error: details go to the log only.
+    onJobFailed: async (job) => {
+      await markRunFailed(prisma, job.runId, 'INTERNAL', 'The director worker stopped unexpectedly while processing this run');
     },
   });
 
