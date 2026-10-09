@@ -4,14 +4,14 @@
 |---|---|
 | Document status | Living document. Describes the code as shipped in Milestone 1. Revised at each milestone close. |
 | Last updated | 2026-10-09 |
-| Package | `packages/ai-director` (`@vc/ai-director` 0.1.0, server-only). Prompt version `m1.0`. |
+| Package | `packages/ai-director` (`@vc/ai-director` 0.1.0, server-only). Prompt version `m1.1`. |
 | Contract | [M1 spec, section 2](milestones/M1_IMPLEMENTATION_SPEC.md#2-vcai-director-packagesai-director--contract). Where the code differs, see [section 21](#21-deviations-from-the-m1-spec). |
 | Related | [ARCHITECTURE.md](ARCHITECTURE.md) · [TIMELINE_SCHEMA.md](TIMELINE_SCHEMA.md) · [DATABASE.md](DATABASE.md) · [DECISIONS.md](DECISIONS.md) ([ADR-005](DECISIONS.md#adr-005-zod-v4-as-the-single-source-of-truth-json-schema-derived-for-llm-outputs) to [ADR-013](DECISIONS.md#adr-013-content-hash-stage-cache-and-repairs-as-fresh-single-turn-requests)) · [DEVELOPMENT.md](DEVELOPMENT.md) |
 
 **Status labels.** **M1** means the behaviour exists in the code today. **Planned (Mx)** means it does not exist yet and is
 scheduled for milestone Mx. This document was written from `packages/ai-director/src`, its tests (`packages/ai-director/test`,
-143 tests, all passing with no network access) and `apps/studio-api/src/director`. If this document and the code disagree,
-the code is right and this document has a bug.
+184 tests, all passing with no network access) and `apps/studio-api/src/director`. It was revised after the M1 review
+(2026-10-09). If this document and the code disagree, the code is right and this document has a bug.
 
 ---
 
@@ -50,8 +50,9 @@ validates every answer and compiles the frames.
 
 **Responsibilities (M1)**
 
-- Validate the input: `VideoRequest`, optional `ReferenceProfile[]` and `AssetRef[]`, against their Zod schemas and the
-  configured `ResourceLimits`. A request over a limit fails before any provider call.
+- Validate the input: `VideoRequest`, optional `ReferenceProfile[]` (at most 20, and at most `maxAssets`) and `AssetRef[]`,
+  against their Zod schemas and the configured `ResourceLimits`. Asset ids that collide with the ids the director generates, or
+  with each other, are rejected. Anything invalid or over a limit fails before any provider call.
 - Plan the structure deterministically: chapter count, per-chapter target durations and scene-count ranges
   ([section 6](#6-structure-planning)).
 - Run seven LLM stages (brief, outline, then script, storyboard, shot list, engine selection and scene specs per chapter).

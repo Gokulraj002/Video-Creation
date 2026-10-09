@@ -50,8 +50,9 @@ pnpm install
 ```
 
 `@vc/studio-api` has a `postinstall` script (`prisma generate`), so `pnpm install` also generates the Prisma client into
-`apps/studio-api/src/generated/prisma` (gitignored). Generating needs no database: `apps/studio-api/prisma.config.ts` falls back
-to the local `video_studio` URL. Regenerate by hand after a change to `prisma/schema.prisma`:
+`apps/studio-api/src/generated/prisma` (gitignored). Generating needs no database: `apps/studio-api/prisma.config.ts` loads
+`apps/studio-api/.env` when it exists and otherwise falls back to the local `video_studio` URL. Regenerate by hand after a
+change to `prisma/schema.prisma`:
 
 ```bash
 pnpm --filter @vc/studio-api db:generate
@@ -91,7 +92,9 @@ cp apps/studio-web/.env.example apps/studio-web/.env.local
 ```
 
 Both files are gitignored. Next, create the development API token. It must be at least 32 characters long, and the API and the
-web app must use the same value:
+web app must use the same value. Skipping this step makes `pnpm studio:db:seed` fail with
+`STUDIO_DEV_API_TOKEN: required by the seed script (at least 32 characters)`, and every web page then shows the
+"not configured" state (`CONFIG_MISSING_TOKEN`):
 
 ```bash
 TOKEN=$(openssl rand -hex 32)      # 64 hex characters
@@ -114,11 +117,15 @@ pnpm studio:db:seed        # upserts dev@localhost and stores the sha256 hash of
 ```
 
 The seed prints the user and token ids, never the token. It is idempotent: re-running it with the same token keeps one token row,
-and a new token value adds another row (older tokens stay valid). See [DATABASE.md](DATABASE.md#7-migration-workflow) for
-schema changes, resets and the test database.
+and a new token value adds another row (older tokens stay valid). It never modifies an existing token row: a token that was
+revoked (`revokedAt` set) stays revoked, and a token row that belongs to another user stays with that user. Both cases print a
+`WARNING:` line on stderr; set a new `STUDIO_DEV_API_TOKEN` value to get a working token. See
+[DATABASE.md](DATABASE.md#7-migration-workflow) for schema changes, resets and the test database.
 
-`studio:db:migrate` runs the Prisma CLI, which reads `DATABASE_URL` from the shell, not from `apps/studio-api/.env`. Without it,
-the CLI uses `postgres://postgres:postgres@localhost:5432/video_studio`. The seed script does load `apps/studio-api/.env`.
+`studio:db:migrate` runs the Prisma CLI. `apps/studio-api/prisma.config.ts` loads `apps/studio-api/.env` with
+`process.loadEnvFile` (only when the file exists, and without overriding variables already set in the shell), so the CLI uses
+the same `DATABASE_URL` as the API. Without either, it falls back to `postgres://postgres:postgres@localhost:5432/video_studio`.
+The seed script loads `apps/studio-api/.env` too (`tsx --env-file-if-exists=.env`).
 
 ### 2.5 Start the processes
 
@@ -126,22 +133,28 @@ Use three terminals:
 
 ```bash
 pnpm studio:dev:api        # Fastify API on http://localhost:4100 (tsx watch)
-pnpm studio:dev:worker     # BullMQ director worker (tsx watch)
-pnpm studio:dev:web        # Next.js dev server on http://localhost:3000
+pnpm studio:dev:worker     # BullMQ director worker and stale-run reaper (tsx watch)
+pnpm studio:dev:web        # Next.js dev server on http://127.0.0.1:3000
 ```
 
 The API logs `studio-api ready` with the provider, model and queue driver. The worker logs `studio-worker ready` with its queue
-(`studio-director`), concurrency, provider, model and cache setting. Check the API:
+(`studio-director`), concurrency, provider, model, cache setting, job lock duration and reaper interval. Check the API:
 
 ```bash
-curl -s http://localhost:4100/health      # {"ok":true,"version":"0.1.0"}
+curl -s http://localhost:4100/health      # {"ok":true,"version":"0.1.0"}  liveness, no I/O
+curl -s http://localhost:4100/ready       # {"ok":true,"checks":{"database":"ok","queue":"ok"}}  503 when a check fails
 ```
+
+The web dev server and `next start` bind `127.0.0.1` only (`-H 127.0.0.1` in `apps/studio-web/package.json`). In M1 anyone
+who can reach studio-web acts as the user whose token it holds, so it is not reachable from other machines by default
+([PRD 7.3](PRD.md#73-security)).
 
 ### 2.6 Open the studio
 
-Open <http://localhost:3000>. The dashboard lists projects and shows today's runs and estimated cost. **New project** creates a
-project and starts a director run right away. The project page shows the run's progress bar, then the tabs Storyboard, Preview
-(animatic), Brief, Script, Shot list, Timeline JSON and Usage. **Settings** shows the AI provider, queue driver, limits, engine
+Open <http://127.0.0.1:3000> (`http://localhost:3000` also works when `localhost` resolves to `127.0.0.1`). The dashboard
+lists projects and shows today's runs and estimated cost. **New project** creates a project and starts a director run right
+away. The project page shows the run's progress bar, then the tabs Storyboard, Preview (animatic), Brief, Script, Shot list,
+Timeline JSON, Usage and Request (the stored `VideoRequest`). **Settings** shows the AI provider, queue driver, limits, engine
 availability and the template catalog as reported by the API, plus whether the web app has a token configured.
 
 With the mock provider a 30-second video finishes in about a second (one chapter, 8 steps, 7 mock calls).
@@ -172,8 +185,11 @@ mode to pick up `.env` changes. After editing `apps/studio-web/.env.local`, rest
 - The `dev`, `dev:worker` and `db:seed` scripts load `apps/studio-api/.env` (`tsx --env-file-if-exists=.env`). Variables already
   set in the shell take precedence over the file, so `LOG_LEVEL=debug pnpm studio:dev:api` works for one-off overrides.
 - The `start` and `start:worker` scripts do **not** load `.env`. They expect a real environment (production-style).
-- Prisma CLI commands (`db:generate`, `db:migrate`, `db:migrate:dev`, `prisma ...`) do **not** load `.env`. They read
-  `DATABASE_URL` from the shell through `apps/studio-api/prisma.config.ts`, which falls back to the local `video_studio` URL.
+- Prisma CLI commands (`db:generate`, `db:migrate`, `db:migrate:dev`, `prisma ...`) go through
+  `apps/studio-api/prisma.config.ts`, which loads `.env` from the current directory (`apps/studio-api` when run through the
+  package scripts or `pnpm --filter @vc/studio-api exec`) with `process.loadEnvFile`. Variables already set in the shell win,
+  so `DATABASE_URL=... pnpm --filter @vc/studio-api db:migrate` targets another database. Without any `DATABASE_URL` the CLI
+  falls back to the local `video_studio` URL.
 - **studio-web** reads `STUDIO_API_URL` and `STUDIO_API_TOKEN` on the server only (`apps/studio-web/src/lib/studio-api.ts`,
   imported with `server-only`). Next.js loads them from `apps/studio-web/.env.local` (or `.env`). Never prefix them with
   `NEXT_PUBLIC_`: that would ship the token to the browser.
@@ -182,6 +198,10 @@ mode to pick up `.env` changes. After editing `apps/studio-web/.env.local`, rest
 
 Defaults below are the values `loadConfig` applies when a variable is unset. They were checked by calling `loadConfig` with only
 `DATABASE_URL` set. "Secret" means: keep it out of version control, logs and screenshots.
+
+Every `*_MS` variable below is an integer number of milliseconds capped at 2 147 483 647 (about 24.8 days, `MAX_TIMER_MS` in
+`config.ts`): Node.js fires larger `setTimeout` delays immediately, so a larger value fails validation instead. The scaled run
+timeout (section 6) is clamped to the same maximum.
 
 **Runtime**
 
@@ -198,8 +218,12 @@ Defaults below are the values `loadConfig` applies when a variable is unset. The
 | Variable | Default | Required | Secret | Description |
 |---|---|---|---|---|
 | `DATABASE_URL` | none | **Yes** | Yes (contains the password) | Postgres URL; must start with `postgres://` or `postgresql://`. `.env.example` sets `postgres://postgres:postgres@localhost:5432/video_studio`. Unlike the Prisma CLI, the app has no fallback. |
-| `REDIS_URL` | `redis://localhost:6379` | No | Yes if it contains a password | `redis://` or `rediss://` URL. Used by the API (producer) and the worker when `QUEUE_DRIVER=bullmq`. |
+| `DATABASE_POOL_MAX` | `10` | No | No | Size of the `pg` pool of each process (integer, 1 to 1 000). The API and the worker have one pool each; the seed uses 2 connections. |
+| `DATABASE_CONNECTION_TIMEOUT_MS` | `5000` | No | No | How long a query waits for a free pooled connection before it fails instead of hanging (100 or more). |
+| `REDIS_URL` | `redis://localhost:6379` | No | Yes if it contains a password | `redis://` or `rediss://` URL. Used by the API (producer, readiness check) and the worker when `QUEUE_DRIVER=bullmq`. |
 | `QUEUE_DRIVER` | `bullmq` | No | No | `bullmq`: the API enqueues to the Redis queue `studio-director` and the worker processes runs. `inline`: runs execute inside the API process, with no Redis and no worker (section 5). |
+| `QUEUE_ENQUEUE_TIMEOUT_MS` | `3000` | No | No | Budget of one enqueue, queue job lookup (reaper) or Redis ping (`/ready`), 50 or more. An enqueue that cannot reach Redis in time fails: `POST .../director-runs` answers 503 `QUEUE_UNAVAILABLE` and the run is recorded `FAILED` without counting toward the daily run quota. |
+| `DIRECTOR_JOB_LOCK_MS` | `300000` (5 min) | No | No | BullMQ job lock duration (30 000 or more). A worker that cannot renew its lock for this long (for example during a Redis outage) has its job counted as stalled; the run is then failed only if its heartbeat is stale too (section 5). BullMQ's own default is 30 s. Worker only. |
 
 **AI provider**
 
@@ -218,11 +242,14 @@ Defaults below are the values `loadConfig` applies when a variable is unset. The
 | Variable | Default | Required | Secret | Description |
 |---|---|---|---|---|
 | `DIRECTOR_MAX_REPAIR_ATTEMPTS` | `2` | No | No | Extra attempts per stage call when the output fails Zod or semantic validation (integer, 0 or more). After the last attempt the run fails with `VALIDATION_FAILED`. |
-| `DIRECTOR_RUN_TIMEOUT_MS` | `1800000` (30 min) | No | No | Minimum wall-clock budget for one run (integer above 0). The effective timeout scales with the plan (section 6). Exceeded runs fail with `TIMEOUT`. |
+| `DIRECTOR_RUN_TIMEOUT_MS` | `1800000` (30 min) | No | No | Minimum wall-clock budget for one run (integer, 1 or more). The effective timeout scales with the plan (section 6). Exceeded runs fail with `TIMEOUT`. |
 | `DIRECTOR_STEP_TIMEOUT_MS` | `120000` (2 min) | No | No | Per-step budget used for that scaling (integer, 0 or more). `0` disables scaling. |
-| `DIRECTOR_CACHE` | `on` | No | No | `on`: validated stage outputs are cached in Postgres (`director_cache_entries`), per user, so an identical re-run costs 0 tokens. `off`: no cache reads or writes. |
-| `DIRECTOR_PRICING_JSON` | unset | No | No | JSON object merged over the built-in pricing table, in USD per million tokens. Each entry needs exactly `inputPerMTok`, `outputPerMTok`, `cacheReadPerMTok` and `cacheWritePerMTok` (numbers, 0 or more). Example: `{"claude-opus-5-5":{"inputPerMTok":4,"outputPerMTok":20,"cacheReadPerMTok":0.2,"cacheWritePerMTok":5}}`. |
+| `DIRECTOR_CACHE` | `on` | No | No | `on`: validated stage outputs are cached in Postgres (`director_cache_entries`), per user, so an identical re-run costs 0 tokens. The key covers the rendered prompt, a hash of the structured stage input and the provider settings ([AI_DIRECTOR.md section 12](AI_DIRECTOR.md#12-caching)). `off`: no cache reads or writes. |
+| `DIRECTOR_PRICING_JSON` | unset | No | No | JSON object merged over the built-in pricing table, in USD per million tokens. Each entry needs exactly `inputPerMTok`, `outputPerMTok`, `cacheReadPerMTok` and `cacheWritePerMTok` (numbers, 0 or more). Example: `{"claude-opus-5-5":{"inputPerMTok":4,"outputPerMTok":20,"cacheReadPerMTok":0.2,"cacheWritePerMTok":5}}`. The run cost ceilings (section 4.4) use the same merged table. |
 | `DIRECTOR_WORKER_CONCURRENCY` | `2` | No | No | Parallel director runs per worker process (integer above 0). Worker only. |
+| `DIRECTOR_HEARTBEAT_STALE_MS` | `60000` (1 min) | No | No | A `RUNNING` run writes a heartbeat about every 2 s. The reaper fails a `RUNNING` run whose heartbeat is older than this with `WORKER_LOST` (5 000 or more; section 5). |
+| `DIRECTOR_QUEUED_STALE_MS` | `600000` (10 min) | No | No | The reaper fails a `QUEUED` run older than this whose queue job is missing, failed or completed with `QUEUE_LOST` (10 000 or more). It never re-queues. |
+| `DIRECTOR_REAPER_INTERVAL_MS` | `30000` | No | No | How often the stale-run reaper runs: in the worker, and in the API process with `QUEUE_DRIVER=inline`. `0` disables it; otherwise at least 1 000. |
 
 **Resource limits** (all positive integers; [ADR-016](DECISIONS.md#adr-016-configurable-resource-limits-instead-of-hardcoded-duration-caps))
 
@@ -241,20 +268,23 @@ Defaults below are the values `loadConfig` applies when a variable is unset. The
 Limits are checked when a project is created (422 `LIMIT_EXCEEDED`), when a run starts planning, and after compilation. Lowering
 a limit below an existing project's request makes that project's next run fail with `LIMIT_EXCEEDED`.
 
-**Quotas and rate limiting**
+**Quotas, rate limiting and caching**
 
 | Variable | Default | Required | Secret | Description |
 |---|---|---|---|---|
-| `LIMIT_DIRECTOR_RUNS_PER_DAY` | `50` | No | No | Director runs a user may start per UTC day (integer, 0 or more). Runs of every status count, including runs of deleted projects. `0` blocks all runs. |
-| `LIMIT_DIRECTOR_USD_PER_DAY` | `25` | No | No | Estimated spend per user per UTC day, in USD (number, 0 or more, decimals allowed). `0` blocks all runs. |
-| `RATE_LIMIT_PER_MINUTE` | `300` | No | No | Requests per minute per bearer token, or per IP without a token (integer above 0). `/health` is exempt. Exceeding it returns 429 `RATE_LIMITED`. |
+| `LIMIT_DIRECTOR_RUNS_PER_DAY` | `50` | No | No | Director runs a user may start per UTC day (integer, 0 or more). Runs of every status count, including runs of deleted projects, except runs that failed before they started because the queue was unavailable or lost them (`QUEUE_UNAVAILABLE`, `QUEUE_LOST`). `0` blocks all runs. |
+| `LIMIT_DIRECTOR_USD_PER_DAY` | `25` | No | No | Estimated spend per user per UTC day, in USD (number, 0 or more, decimals allowed). A start is refused when today's spend plus the unspent cost ceilings reserved by the user's active runs plus this run's cost ceiling would exceed it, and a running run is stopped once today's actual spend reaches it (section 4.4). `0` blocks all runs, mock runs included. |
+| `LIMIT_ACTIVE_RUNS_PER_USER` | `2` | No | No | Queued plus running director runs per user, across all projects (integer above 0). Beyond it a start returns 429 `QUOTA_EXCEEDED`. |
+| `RATE_LIMIT_PER_MINUTE` | `300` | No | No | Requests per minute per authenticated user (integer above 0); all of a user's tokens share the budget. Checked after authentication. Exceeding it returns 429 `RATE_LIMITED` with `retry-after`. `/health` and `/ready` are exempt. |
+| `RATE_LIMIT_UNAUTH_PER_MINUTE` | `60` | No | No | Failed authentications (missing, unknown or revoked token) per minute per client IP (IPv6 grouped per /64). Checked before authentication: once an IP is over it, every `/v1` request from that IP gets 429 `RATE_LIMITED` without a token lookup until the window resets. Successful requests do not consume this budget. |
+| `VERSION_CACHE_MAX_BYTES` | `67108864` (64 MiB) | No | No | Size budget (UTF-16 code units of JSON text) of the in-process LRU cache of serialized `ProjectVersionDTO`s. Versions are immutable, so each one is loaded and validated once per process. `0` disables the cache. API only. |
 
 **Development seed**
 
 | Variable | Default | Required | Secret | Description |
 |---|---|---|---|---|
 | `STUDIO_DEV_USER_EMAIL` | `dev@localhost` | No | No | Email of the user the seed script upserts (loose `x@y` check, up to 320 characters) |
-| `STUDIO_DEV_API_TOKEN` | none | Only for `pnpm studio:db:seed` | **Yes** | Raw development bearer token, at least 32 characters. Read only by the seed script, which stores its sha256 hash. If set, it must still be 32 characters or more, otherwise the API and worker refuse to start. |
+| `STUDIO_DEV_API_TOKEN` | none | Only for `pnpm studio:db:seed` | **Yes** | Raw development bearer token, at least 32 characters (`openssl rand -hex 32` gives 64). Read only by the seed script, which stores its sha256 hash. If set, it must still be 32 characters or more, otherwise the API and worker refuse to start. |
 
 ### 3.3 studio-web (`apps/studio-web/.env.local`)
 
@@ -263,9 +293,9 @@ a limit below an existing project's request makes that project's next run fail w
 | `STUDIO_API_URL` | `http://localhost:4100` | No | No | Base URL of studio-api; `http` or `https`, trailing slashes removed. Read on the server only. |
 | `STUDIO_API_TOKEN` | none | **Yes** for every page except the health check | **Yes** | Bearer token the web server sends to the API; in development, the `STUDIO_DEV_API_TOKEN` value. Without it pages show a "not configured" state (`CONFIG_MISSING_TOKEN`). |
 
-Fixed in code, not configurable: the web app's API request timeout (15 s) and its port (3000, set in the `dev` and `start`
-scripts). Browsers poll run status through the same-origin route `/api/runs/:runId` (every 1.5 s, backing off to 10 s on errors),
-so the token never reaches the browser.
+Fixed in code, not configurable: the web app's API request timeout (15 s), its port (3000) and its bind address
+(`127.0.0.1`), both set in the `dev` and `start` scripts. Browsers poll run status through the same-origin route
+`/api/runs/:runId` (every 1.5 s, backing off to 10 s on errors), so the token never reaches the browser.
 
 M1 studio-web acts as the single user whose token it holds. Do not expose it publicly without an authenticating proxy in front of
 it ([PRD 7.3](PRD.md#73-security)).
@@ -274,7 +304,7 @@ it ([PRD 7.3](PRD.md#73-security)).
 
 | Variable | Default | Description |
 |---|---|---|
-| `TEST_DATABASE_URL` | `postgres://postgres:postgres@localhost:5432/video_studio_test` | Database used by the studio-api tests (`vitest.config.ts`, `test/global-setup.ts`, `test/helpers.ts`). The database name must end in `_test`, or the test setup refuses to run, because tests truncate every table. |
+| `TEST_DATABASE_URL` | `postgres://postgres:postgres@localhost:5432/video_studio_test` | Database used by the studio-api tests (`vitest.config.ts`, `test/global-setup.ts`, `test/helpers.ts`). The database name must end in `_test`, or the global setup refuses to run (`Refusing to run tests against non-test database`), because tests truncate every table. |
 
 The test helpers build their own configuration (`QUEUE_DRIVER=inline`, `AI_PROVIDER=mock`, `LOG_LEVEL=silent`) and do not read
 `apps/studio-api/.env`.
@@ -286,8 +316,9 @@ The test helpers build their own configuration (`QUEUE_DRIVER=inline`, `AI_PROVI
 `AI_PROVIDER=mock` is the default in both `config.ts` and `.env.example`. The heuristic mock provider (`mock`, model
 `mock-director-v1`) runs the whole director pipeline offline: brief, outline, then script, storyboard, shot list, engine selection
 and scene specs per chapter, and the deterministic compile into a Timeline v1. Its outputs pass the same validation as Claude's.
-It reports synthetic token counts so the Usage tab has data, but `mock-director-v1` is priced at $0, so estimated cost stays $0.
-Mock runs still count toward `LIMIT_DIRECTOR_RUNS_PER_DAY`.
+It reports synthetic token counts so the Usage tab has data, but `mock-director-v1` is priced at $0, so estimated cost stays $0
+and the run's cost ceiling is $0. Mock runs still count toward `LIMIT_DIRECTOR_RUNS_PER_DAY` and `LIMIT_ACTIVE_RUNS_PER_USER`.
+The mock writes English text whatever the request's `language`; only Claude follows the language tag.
 
 `GET /v1/system/config` (and the Settings page) reports
 `aiProvider: {"name":"mock","model":"mock-director-v1","mode":"mock","configured":true}`.
@@ -324,12 +355,17 @@ How the provider calls Claude (`packages/ai-director/src/providers/anthropic.ts`
   env.
 - Failures map onto run error codes: `PROVIDER_CONFIG` (missing or invalid key, permissions), `PROVIDER_UNAVAILABLE` (rate limits,
   overload, connection problems), `PROVIDER_REQUEST` (rejected request), `PROVIDER_REFUSAL`, `PROVIDER_TRUNCATED` (output hit
-  `max_tokens`) and `VALIDATION_FAILED` (repairs exhausted).
-- Switching between `mock` and `anthropic` never reuses cached outputs: the provider, model and prompt version are part of the
-  cache key.
+  `max_tokens` on the last allowed attempt; earlier truncations are repaired) and `VALIDATION_FAILED` (repairs exhausted).
+- Switching between `mock` and `anthropic`, or changing the model, effort, `ANTHROPIC_MAX_OUTPUT_TOKENS`, fallbacks or
+  structured-output mode, never reuses cached outputs: the provider name, model, prompt version and the provider's
+  configuration fingerprint are part of the cache key.
+- If the API rejects a structured-output schema, the provider retries that call once in prompt mode and remembers the
+  rejection for that model and schema for the rest of the process, so later calls go straight to prompt mode.
 
 Suggested first live run: a 30-second video (one chapter: 7 LLM calls), effort `low` or `medium`, and a small daily budget such
-as `LIMIT_DIRECTOR_USD_PER_DAY=2`. [PRD section 7.4](PRD.md#74-cost-controls) has illustrative cost arithmetic.
+as `LIMIT_DIRECTOR_USD_PER_DAY=5`. The budget must cover the run's cost ceiling, not only its expected cost: a one-chapter run
+on `claude-opus-5-5` reserves $2.32, so a limit of $2 refuses it (section 4.4). [PRD section 7.4](PRD.md#74-cost-controls) has
+illustrative cost arithmetic.
 
 ### 4.3 Seeing what a run cost
 
@@ -340,20 +376,67 @@ as `LIMIT_DIRECTOR_USD_PER_DAY=2`. [PRD section 7.4](PRD.md#74-cost-controls) ha
 | `GET /v1/usage` | `{today, month}`, each with `runs`, the four token counts and `estimatedCostUsd`, for the calling user |
 | `GET /v1/director-runs/:runId` | The run's `usage` report (`stages[]` and `totals`) |
 
-Usage is recorded when a run finishes, including the partial usage of runs that failed, timed out or were cancelled while running.
-The exception is a run ended by a worker crash (section 5), which records none. Deleting a project keeps its runs, so usage
-totals and quotas do not drop. Costs are estimates from the pricing table in
-`packages/ai-director/src/pricing.ts` (USD per million tokens; for `claude-opus-5-5`: input 4.00, output 20.00, cache read 0.20,
-cache write 5.00). A model missing from the table, for example a fallback model, is counted as $0 with `pricingKnown: false`, and
-the Usage tab flags it. Add it with `DIRECTOR_PRICING_JSON`.
+While a run is `RUNNING`, its token and cost columns are updated with every progress write (the tokens of every provider
+request so far, refused and truncated attempts included, each priced at the model that served it). When the run ends, the full
+per-stage `usage` report is written, also for runs that failed, timed out, were stopped by the spend limit, were shut down or
+were cancelled while running. A run ended by a worker crash (`WORKER_LOST`, section 5) keeps the token and cost columns of its
+last progress write, but has no per-stage report. Usage is attributed to the UTC day and month in which the run was
+created. Deleting a project keeps its runs, so usage totals and quotas do not drop. Costs are estimates from the pricing table
+in `packages/ai-director/src/pricing.ts` (USD per million tokens; for `claude-opus-5-5`: input 4.00, output 20.00, cache read
+0.20, cache write 5.00). A model missing from the table, for example a fallback model, is counted as $0 with
+`pricingKnown: false`, and the Usage tab flags it. Add it with `DIRECTOR_PRICING_JSON`.
 
 ### 4.4 Quotas
 
-`POST /v1/projects/:id/director-runs` checks the calling user's runs and estimated spend since the start of the current UTC day.
-When either `LIMIT_DIRECTOR_RUNS_PER_DAY` or `LIMIT_DIRECTOR_USD_PER_DAY` is reached it returns 429 `QUOTA_EXCEEDED` with
-`details: {runsToday, runsPerDayLimit, estimatedCostTodayUsd, usdPerDayLimit}`. The check happens only when a run starts, so one
-long run can go past the USD limit, and simultaneous starts on different projects can each pass it. To reset during development,
-raise the limits and restart the API, or wait for the next UTC day.
+`POST /v1/projects/:id/director-runs` checks the calling user's quotas in one transaction, after taking a per-user advisory lock
+(`pg_advisory_xact_lock`), so concurrent starts by the same user, on any of their projects, are serialized and cannot race the
+checks. In order, it answers 429 `QUOTA_EXCEEDED` when:
+
+1. the user already has `LIMIT_ACTIVE_RUNS_PER_USER` (default 2) runs `QUEUED` or `RUNNING`, on any project;
+2. the user started `LIMIT_DIRECTOR_RUNS_PER_DAY` (default 50) runs today (UTC), not counting runs that never started
+   (`QUEUE_UNAVAILABLE`, `QUEUE_LOST`);
+3. today's committed spend has already reached `LIMIT_DIRECTOR_USD_PER_DAY` (default 25);
+4. today's committed spend plus this run's **cost ceiling** would exceed `LIMIT_DIRECTOR_USD_PER_DAY`.
+
+"Committed spend" is today's estimated spend plus, for each of the user's active runs created today, the part of its
+reservation it has not spent yet (`max(0, reservedCostUsd − estimatedCostUsd)`). The run that starts stores its own ceiling in
+`DirectorRun.reservedCostUsd`. The ceiling is computed before the run by `estimateRunCostCeilingUsd` (`@vc/ai-director`) from the
+plan's chapter count, the configured model and the merged pricing table: every stage call is assumed to produce its full
+`max_tokens` (capped by `ANTHROPIC_MAX_OUTPUT_TOKENS`) plus a generous input budget priced at the higher of the input and
+cache-write rates. Repairs are not included.
+
+```text
+ceiling = Σ over LLM stages of  calls(stage) × (maxOutput(stage) × outputPrice + inputBudget(stage) × max(inputPrice, cacheWritePrice)) / 1 000 000
+calls   = 1 for brief and outline, chapterCount for script, storyboard, shotList, engineSelection and sceneSpecs
+maxOutput   = min(ANTHROPIC_MAX_OUTPUT_TOKENS, 8 000 | 12 000 | 16 000 | 16 000 | 16 000 | 12 000 | 16 000)   (brief … sceneSpecs)
+inputBudget = 8 000 | 8 000 | 8 000 | 12 000 | 12 000 | 12 000 | 20 000                                      (brief … sceneSpecs)
+```
+
+On `claude-opus-5-5` with the defaults this is **$0.48 + $1.84 × chapterCount**:
+
+| Request | Chapters | Cost ceiling | Starts with the default $25/day? |
+|---|---|---|---|
+| Any video up to 120 s | 1 | $2.32 | Yes |
+| 10 min `explainer` | 4 | $7.84 | Yes |
+| 25 min `explainer` | 9 | $17.04 | Yes, while at most $7.96 is already committed today |
+| 1 h `long-form` | 13 | $24.40 | Only while at most $0.60 is already committed today |
+| 2 h `long-form` | 25 | $46.48 | **No.** Refused before it starts; raise `LIMIT_DIRECTOR_USD_PER_DAY` to at least 46.48 |
+| 2 h `social-short` | 84 | $155.04 | **No** |
+
+With $25 per day, 13 chapters is the most a single `claude-opus-5-5` run can have. The longest durations that fit are about
+62 minutes of `long-form`, 52 minutes of `presentation` or `corporate-training`, 36 minutes of `explainer` and 13 minutes of
+`social-short` (computed with `planStructure` and `estimateRunCostCeilingUsd`). The mock provider and models without pricing
+have a ceiling of $0; Sonnet 5.5 costs half of Opus 5.5 ($0.24 + $0.92 per chapter).
+
+While the run is `RUNNING`, the worker checks the spend before every LLM stage: when today's spend of the user's other runs plus
+this run's live spend reaches `LIMIT_DIRECTOR_USD_PER_DAY`, it aborts the run and records `FAILED` with code `QUOTA_EXCEEDED`
+(partial usage kept). Compile makes no provider call, so a finished plan is never discarded. Repairs can make a run cost more
+than its ceiling; the live check bounds that.
+
+`details` of the 429 response:
+`{runsToday, runsPerDayLimit, activeRuns, activeRunsLimit, estimatedCostTodayUsd, reservedCostUsd, runCostCeilingUsd, usdPerDayLimit}`,
+and the message names the ceiling, the chapter count and the model. To reset during development, raise the limits and restart
+the API and the worker, or wait for the next UTC day.
 
 ## 5. Queue drivers and the worker
 
@@ -368,25 +451,54 @@ With `bullmq`, the API adds a job named `direct` with payload `{runId}` to the q
 each job has one attempt, and BullMQ keeps the last 1 000 completed and 5 000 failed job records. The `DirectorRun` row in Postgres
 is the source of truth: the worker claims a run only if it is still `QUEUED`, so duplicate deliveries do nothing. Jobs wait in
 Redis until a worker is available, so a run started while no worker is running stays `QUEUED` ("Queued") and starts as soon as the
-worker does. Start more worker processes, or raise `DIRECTOR_WORKER_CONCURRENCY`, to run more projects in parallel.
+worker does. Start more worker processes, or raise `DIRECTOR_WORKER_CONCURRENCY`, to run more projects in parallel (each user is
+still limited to `LIMIT_ACTIVE_RUNS_PER_USER` active runs).
 
-On SIGINT or SIGTERM the worker stops taking jobs and waits for active runs to finish. A second signal exits immediately.
+The enqueue fails fast instead of waiting for Redis: the producer connection has no offline queue, and every enqueue is bounded
+by `QUEUE_ENQUEUE_TIMEOUT_MS` (3 s). When it fails, the run is recorded `FAILED` with `QUEUE_UNAVAILABLE` (it does not count
+toward the daily run quota), the project goes back to the status it had before the start, and the API answers 503
+`QUEUE_UNAVAILABLE`. This holds whether Redis went down before or after the API started.
 
-If a worker process dies mid-run (crash, `kill -9`, closed terminal), the run stays `RUNNING` while no worker is running. Once a
-worker runs again, BullMQ detects the stalled job (its 30 s lock expired) and the worker fails it instead of re-running it
-(`maxStalledCount: 0`). The run then becomes `FAILED` with `INTERNAL` ("The director worker stopped unexpectedly while
-processing this run"), and the project status is restored. In a local test this took about a minute after the restart. Tokens
-spent before the crash are not recorded for that run. Re-run the project; completed stages come from the cache.
+**Heartbeat and reaper.** A `RUNNING` run writes `heartbeatAt` about every 2 s (the same write notices a cancellation), and its
+token and cost columns are updated with each progress write. The stale-run reaper runs every `DIRECTOR_REAPER_INTERVAL_MS`
+(30 s) in the worker, and in the API process with `QUEUE_DRIVER=inline`. Each pass:
 
-With `inline`, restarting the API (for example when `tsx watch` reloads after a file change) can interrupt a run in progress and
-leave it `RUNNING`. Cancel it from the project page or with `POST /v1/director-runs/:runId/cancel`.
+- fails `RUNNING` runs whose heartbeat is older than `DIRECTOR_HEARTBEAT_STALE_MS` (1 min) with `WORKER_LOST` ("The director
+  worker stopped responding while processing this run; start it again (completed stages are cached)"), keeps the usage written
+  with progress, and restores the project status;
+- fails `QUEUED` runs older than `DIRECTOR_QUEUED_STALE_MS` (10 min) whose queue job is missing, failed or completed with
+  `QUEUE_LOST`. Runs whose job is still waiting or active are left alone, and so are runs whose job state cannot be read
+  (Redis down); a later pass retries them.
+
+Runs are never re-queued: a re-queue during a crash or restart loop could run, and bill, the same request repeatedly. Every
+transition is a conditional update, so any number of workers and reapers can run side by side, and a late worker cannot revive
+a reaped run.
+
+**Worker crash.** If a worker process dies mid-run (crash, `kill -9`, closed terminal), its runs stop heart-beating. About one
+minute later (`DIRECTOR_HEARTBEAT_STALE_MS` plus up to one reaper interval) any running worker or inline API marks them
+`FAILED` with `WORKER_LOST`; this no longer needs the dead worker to come back. Independently, BullMQ counts the job as stalled
+once its lock (`DIRECTOR_JOB_LOCK_MS`, 5 min) expires and fails it instead of re-running it (`maxStalledCount: 0`). The worker's
+failed-job handler then marks the run `FAILED` with `INTERNAL` ("The director worker stopped unexpectedly while processing this
+run") only if no process is still working on it: not this process, and no heartbeat fresher than `DIRECTOR_HEARTBEAT_STALE_MS`.
+Re-run the project; completed stages come from the cache.
+
+**Shutdown.** On SIGINT or SIGTERM the worker stops taking jobs, aborts its in-flight runs and records them `FAILED` with code
+`SHUTDOWN` (partial usage kept, project status restored), then exits. A job delivered while shutting down is recorded `SHUTDOWN`
+without starting. A second signal exits immediately. The API does the same for inline runs on shutdown and forces an exit after
+90 s.
+
+With `inline`, restarting the API (for example when `tsx watch` reloads after a file change) ends the runs of that process. A
+clean shutdown (SIGINT or SIGTERM) records them `SHUTDOWN`. If the process is killed instead, a run that was `RUNNING` is reaped
+as `WORKER_LOST` about a minute after the API is back, and a `QUEUED` run as `QUEUE_LOST` after 10 minutes (the inline queue only
+knows the jobs of its own process). You can also cancel such a run right away from the project page or with
+`POST /v1/director-runs/:runId/cancel`.
 
 ## 6. Timeouts
 
 Each run gets a wall-clock budget, computed by `effectiveRunTimeoutMs` in `apps/studio-api/src/config.ts`:
 
 ```text
-timeout = max(DIRECTOR_RUN_TIMEOUT_MS, steps × DIRECTOR_STEP_TIMEOUT_MS)
+timeout = min(2 147 483 647, max(DIRECTOR_RUN_TIMEOUT_MS, steps × DIRECTOR_STEP_TIMEOUT_MS))
 steps   = 2 + 5 × chapters + 1        (brief, outline, 5 stages per chapter, compile)
 ```
 
@@ -414,8 +526,11 @@ Tuning:
   minutes per step is a starting budget for effort `medium`. Raise `DIRECTOR_STEP_TIMEOUT_MS` for `high`, `xhigh` or `max`
   effort, a slow network, or if live runs fail with `TIMEOUT`.
 - Set `DIRECTOR_STEP_TIMEOUT_MS=0` to use `DIRECTOR_RUN_TIMEOUT_MS` as a fixed budget for every run.
-- The timeout runs inside the worker. If the worker process dies, the timeout dies with it (section 5 describes what happens to
-  the run).
+- The timeout runs inside the worker. If the worker process dies, the timeout dies with it; the reaper then fails the run with
+  `WORKER_LOST` once its heartbeat is stale (section 5).
+- The timeout bounds wall-clock time, not spend. Spend is bounded by `LIMIT_DIRECTOR_USD_PER_DAY` (section 4.4). Chapters run
+  sequentially, so a live multi-hour plan takes hours: at an assumed 30 s per call, a 2 h `long-form` plan (127 calls) needs
+  more than an hour.
 
 ## 7. Testing
 
@@ -473,6 +588,12 @@ pnpm --filter @vc/studio-web build && pnpm --filter @vc/studio-web start
 Sourcing the file with the shell strips unquoted double quotes, so wrap JSON values such as `DIRECTOR_PRICING_JSON` in single
 quotes in `.env`. Node's env-file loader, used by the `dev` scripts, accepts the quoted form too.
 
+**Remotion license.** studio-web uses the Remotion Player (`@remotion/player` 4.0.534) for the animatic. Remotion is free for
+individuals and for companies with up to 3 employees; larger companies need a Remotion company license. The `<Player>` is
+rendered **without** the `acknowledgeRemotionLicense` prop on purpose: setting it is the owner's licensing decision, so the Player
+may log Remotion's license notice in the browser console until that decision is made. The same terms apply to the campaigns
+worker and to the M2 renderer.
+
 ## 9. API quick reference
 
 Every `/v1/*` route requires `Authorization: Bearer <token>`. Errors use one envelope:
@@ -480,23 +601,27 @@ Every `/v1/*` route requires `Authorization: Bearer <token>`. Errors use one env
 
 | Method | Path | Success | Common errors |
 |---|---|---|---|
-| GET | `/health` | 200 `{ok, version}` (public, not rate limited) | — |
+| GET | `/health` | 200 `{ok: true, version}`: liveness, no I/O (public, not rate limited) | — |
+| GET | `/ready` | 200 `{ok, checks: {database, queue}}`, each `ok`, `error` or `skipped` (queue is `skipped` with `inline`); 503 when a check fails. Public, not rate limited, results reused for 1 s, no error details. | 503 |
 | GET | `/v1/me` | 200 `{id, email, name}` | 401 `UNAUTHORIZED` |
 | GET | `/v1/system/config` | 200 provider, queue driver, limits, engines, templates, prompt version (no secrets) | 401 |
 | GET | `/v1/usage` | 200 `{today, month}` | 401 |
-| GET | `/v1/projects?limit=&cursor=` | 200 `{items, nextCursor}`, newest update first, `limit` 1 to 100 (default 20) | 400 `INVALID_CURSOR` |
+| GET | `/v1/projects?limit=&cursor=` | 200 `{items, nextCursor, total}`, newest update first, `limit` 1 to 100 (default 20). `nextCursor` is an opaque string (base64url of the last row's `updatedAt` and `id`); `total` counts all of the user's projects. | 400 `INVALID_CURSOR` |
 | POST | `/v1/projects` | 201 project detail | 400 `VALIDATION_ERROR`, 422 `LIMIT_EXCEEDED` |
 | GET | `/v1/projects/:id` | 200 project detail with `request` and `latestRun` | 404 `NOT_FOUND` |
 | DELETE | `/v1/projects/:id` | 204 | 409 `RUN_ACTIVE` |
-| GET | `/v1/projects/:id/versions` | 200 version summaries, newest first | 404 |
-| GET | `/v1/projects/:id/versions/:version` | 200 version with `timeline` and `artifacts` | 404 |
+| GET | `/v1/projects/:id/versions` | 200 the latest 100 version summaries, newest first (not paginated) | 404 |
+| GET | `/v1/projects/:id/versions/:version` | 200 version with `timeline` and `artifacts`, with a strong `ETag` and `Cache-Control: private, max-age=31536000, immutable`; 304 for a matching `If-None-Match` | 404 |
 | POST | `/v1/projects/:id/director-runs` | 202 run (`queued`) | 409 `RUN_ACTIVE`, 429 `QUOTA_EXCEEDED`, 503 `QUEUE_UNAVAILABLE` |
 | GET | `/v1/projects/:id/director-runs` | 200 latest 20 runs | 404 |
 | GET | `/v1/director-runs/:runId` | 200 run | 404 |
 | POST | `/v1/director-runs/:runId/cancel` | 200 run (`cancelled`) | 409 `RUN_NOT_ACTIVE` |
 
-Any route can also return 429 `RATE_LIMITED`. The full contract is in
-[M1 spec section 3](milestones/M1_IMPLEMENTATION_SPEC.md#3-vcstudio-api-appsstudio-api--contract).
+Any `/v1` route can also return 429 `RATE_LIMITED` (per user after authentication, or per IP after too many failed
+authentications; section 3.2) and 500 `DATA_INTEGRITY` when a stored row fails validation on read (generic message; the details
+go to the server log). The original contract is in
+[M1 spec section 3](milestones/M1_IMPLEMENTATION_SPEC.md#3-vcstudio-api-appsstudio-api--contract); its
+[amendments](milestones/M1_IMPLEMENTATION_SPEC.md#amendments-after-review-2026-10-09) list where the API now differs.
 
 The examples use `curl` and `jq`:
 
@@ -539,8 +664,12 @@ done
 curl -s "$API/v1/director-runs/$RUN_ID" -H "Authorization: Bearer $TOKEN" \
   | jq '{status, versionNumber, progress, error, totals: .usage.totals}'
 
-# Versions: list, then fetch one (timeline + artifacts)
+# Readiness (public): database and Redis
+curl -s "$API/ready"
+
+# Versions: list, then fetch one (timeline + artifacts); the version JSON is immutable (ETag, 304 on If-None-Match)
 curl -s "$API/v1/projects/$PROJECT_ID/versions" -H "Authorization: Bearer $TOKEN"
+curl -s -D - -o /dev/null "$API/v1/projects/$PROJECT_ID/versions/1" -H "Authorization: Bearer $TOKEN" | grep -i -E '^(etag|cache-control):'
 curl -s "$API/v1/projects/$PROJECT_ID/versions/1" -H "Authorization: Bearer $TOKEN" \
   | jq '{version, sceneCount, durationInFrames, fps, artifacts: (.artifacts | keys)}'
 curl -s "$API/v1/projects/$PROJECT_ID/versions/1" -H "Authorization: Bearer $TOKEN" | jq .timeline > timeline.json
@@ -559,7 +688,7 @@ With the mock provider, the finished run of this example looks like this (ids an
   "versionNumber": 1,
   "progress": { "completedSteps": 8, "totalSteps": 8, "currentStage": "compile", "message": "Timeline ready" },
   "error": null,
-  "totals": { "inputTokens": 25686, "outputTokens": 3675, "cacheReadTokens": 0, "cacheWriteTokens": 0,
+  "totals": { "inputTokens": 27195, "outputTokens": 3704, "cacheReadTokens": 0, "cacheWriteTokens": 0,
               "estimatedCostUsd": 0, "calls": 7, "cachedCalls": 0 }
 }
 ```
@@ -591,15 +720,20 @@ psql postgres://postgres:postgres@localhost:5432/video_studio -c 'SELECT id, sta
 | An error that database `video_studio` (or `video_studio_test`) does not exist, from the API, the seed, the tests or `prisma migrate` | The `pgdata` volume predates `docker/postgres/init-databases.sql`, or a local Postgres without the studio databases | Create the databases (section 2.2), then `pnpm studio:db:migrate` |
 | studio-api tests fail to start: `Refusing to run tests against non-test database` | `TEST_DATABASE_URL` names a database that does not end in `_test` | Point it at `video_studio_test` |
 | Connection refused on 5432 or 6379 | Postgres or Redis is not running, or another server holds the port | `docker compose up -d` and `docker compose ps`; stop a conflicting local server |
-| Starting a run returns 503 `QUEUE_UNAVAILABLE` | `QUEUE_DRIVER=bullmq` and Redis became unreachable after the API had connected. The API fails the run (`QUEUE_UNAVAILABLE`), and the project goes back to `READY` if it has a version, otherwise `FAILED`. | Start Redis, then re-run. Or use `QUEUE_DRIVER=inline` for Redis-free development. |
-| Starting a run hangs; the web app reports a timeout after 15 s | Redis was not reachable when the API started. The enqueue waits for Redis instead of failing: the run is already `QUEUED` and the project `DIRECTING`. | Start Redis; the pending request then completes and the run proceeds. If the API was restarted in the meantime, the run has no job: cancel it, then re-run. |
-| Run stays `queued` ("Queued") | `QUEUE_DRIVER=bullmq` and no worker is running | `pnpm studio:dev:worker`. The job waits in Redis and starts when the worker does. |
-| Run stays `running` and the project is blocked with 409 `RUN_ACTIVE` | The worker (or, with `inline`, the API) stopped mid-run. There is no stale-run reaper in M1. | With `bullmq`, start the worker again: about a minute later the run becomes `FAILED` (`INTERNAL`) (section 5). Or cancel it right away (project page or `POST /v1/director-runs/:runId/cancel`), then re-run. With `inline`, cancel it. |
-| 401 `UNAUTHORIZED` from the API, or the web app says its credentials were rejected | Missing header, a token that was never seeded, a token seeded into a different database than the API uses, or a revoked token | Make `STUDIO_API_TOKEN` (web) equal `STUDIO_DEV_API_TOKEN` (API), run `pnpm studio:db:seed` again, and restart the web dev server. Test with `curl -s -o /dev/null -w '%{http_code}\n' "$API/v1/me" -H "Authorization: Bearer $TOKEN"`. |
+| Starting a run returns 503 `QUEUE_UNAVAILABLE` | `QUEUE_DRIVER=bullmq` and Redis did not answer within `QUEUE_ENQUEUE_TIMEOUT_MS` (3 s), whether it went down before or after the API started. The API fails the run (`QUEUE_UNAVAILABLE`, not counted toward the daily run quota), and the project goes back to the status it had before the start. `GET /ready` reports `"queue":"error"`. | Start Redis, then re-run. Or use `QUEUE_DRIVER=inline` for Redis-free development. |
+| Run stays `queued` ("Queued") | `QUEUE_DRIVER=bullmq` and no worker is running | `pnpm studio:dev:worker`. The job waits in Redis and starts when the worker does. If the job itself was lost (Redis flushed), the reaper fails the run with `QUEUE_LOST` 10 minutes after it was created (`DIRECTOR_QUEUED_STALE_MS`), once a worker runs. |
+| Run stays `running` and the project is blocked with 409 `RUN_ACTIVE` | The worker (or, with `inline`, the API) stopped mid-run without a clean shutdown | Start the worker (or the API with `inline`) again: the reaper fails the run with `WORKER_LOST` about a minute after its last heartbeat (section 5). Or cancel it right away (project page or `POST /v1/director-runs/:runId/cancel`), then re-run. |
+| Run fails with `WORKER_LOST`, `QUEUE_LOST` or `SHUTDOWN` | The worker died mid-run, the queue lost the job, or the worker was stopped while the run was in flight (section 5) | Re-run. Completed stages come from the cache. |
+| `GET /v1/projects/:id/versions` (or the project page) answers 500 `INTERNAL`, and the API log says a column such as `project_versions.scene_count` does not exist | The database is behind the code: a migration was not applied | `pnpm studio:db:migrate`, then restart the API and the worker |
+| 500 `DATA_INTEGRITY` | A stored row (project request, version timeline or artifacts) fails validation on read. The response is generic; the API log names the entity, id and issues. | Inspect the row named in the log. Usually it was edited by hand or written by incompatible code. |
+| 401 `UNAUTHORIZED` from the API, or the web app says its credentials were rejected | Missing header, a token that was never seeded, a token seeded into a different database than the API uses, or a revoked token (re-seeding never re-activates a revoked token; the seed prints a `WARNING:`) | Make `STUDIO_API_TOKEN` (web) equal `STUDIO_DEV_API_TOKEN` (API), run `pnpm studio:db:seed` again (with a new token value if it warned), and restart the web dev server. Test with `curl -s -o /dev/null -w '%{http_code}\n' "$API/v1/me" -H "Authorization: Bearer $TOKEN"`. |
+| `pnpm studio:db:seed` fails with `STUDIO_DEV_API_TOKEN: required by the seed script` | No token in `apps/studio-api/.env` | Generate one (section 2.3) and put the same value in `apps/studio-web/.env.local` |
 | Web pages say the API is not configured | `STUDIO_API_TOKEN` is empty, or `STUDIO_API_URL` is not an http(s) URL | Fix `apps/studio-web/.env.local` and restart `pnpm studio:dev:web`. The Settings page shows whether a token is configured. |
-| Web pages say the API is unreachable | studio-api is not running, or `STUDIO_API_URL` points at the wrong port | Start `pnpm studio:dev:api`; check `curl -s http://localhost:4100/health` |
-| 429 `QUOTA_EXCEEDED` when starting a run | Today's (UTC) runs or estimated spend reached `LIMIT_DIRECTOR_RUNS_PER_DAY` or `LIMIT_DIRECTOR_USD_PER_DAY`. Runs of deleted projects still count. | Raise the limits in `apps/studio-api/.env` and restart the API, or wait for the next UTC day. `details` shows the counts. |
-| 429 `RATE_LIMITED` | More than `RATE_LIMIT_PER_MINUTE` requests per minute with one token | Slow the client down or raise the limit |
+| Web pages say the API is unreachable | studio-api is not running, or `STUDIO_API_URL` points at the wrong port | Start `pnpm studio:dev:api`; check `curl -s http://localhost:4100/health` and `curl -s http://localhost:4100/ready` |
+| The web app cannot be opened from another machine | studio-web binds `127.0.0.1` (section 2.5) | Intended. Put an authenticating proxy in front of it rather than binding it publicly. |
+| 429 `QUOTA_EXCEEDED` when starting a run | Too many active runs (`LIMIT_ACTIVE_RUNS_PER_USER`), today's (UTC) runs reached `LIMIT_DIRECTOR_RUNS_PER_DAY`, or today's committed spend plus this run's cost ceiling would exceed `LIMIT_DIRECTOR_USD_PER_DAY` (section 4.4). Runs of deleted projects still count. | Wait for or cancel an active run; raise the limits in `apps/studio-api/.env` and restart the API and the worker; or wait for the next UTC day. `details` shows the counts, the reservation and the ceiling. A long video on a large model may need a higher USD limit (for example 50 for a 2 h `long-form` video on `claude-opus-5-5`). |
+| Run fails with `QUOTA_EXCEEDED` | The running run was stopped because today's actual spend reached `LIMIT_DIRECTOR_USD_PER_DAY` | Raise the limit or wait for the next UTC day, then re-run; completed stages come from the cache |
+| 429 `RATE_LIMITED` | More than `RATE_LIMIT_PER_MINUTE` requests per minute by one user, or more than `RATE_LIMIT_UNAUTH_PER_MINUTE` failed authentications per minute from one IP (then every `/v1` request from that IP is refused for the rest of the window) | Slow the client down, fix the token, or raise the limit. `retry-after` gives the seconds to wait. |
 | 409 `RUN_ACTIVE` when starting a run or deleting a project | A run of that project is still `QUEUED` or `RUNNING` | Wait for it, or cancel it first |
 | Run fails with `PROVIDER_CONFIG` | Invalid Anthropic key or missing permissions | Check `ANTHROPIC_API_KEY`; restart the API and the worker |
 | Run fails with `PROVIDER_UNAVAILABLE` | Rate limit, overload or network problem after the SDK's retries | Re-run later. Completed stages come from the cache. |
