@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ConfigError, loadConfig } from '../src/config';
+import { ConfigError, effectiveRunTimeoutMs, loadConfig } from '../src/config';
 
 const BASE = { DATABASE_URL: 'postgres://u:p@localhost:5432/db' };
 
@@ -21,6 +21,7 @@ describe('loadConfig', () => {
     expect(c.director).toMatchObject({
       maxRepairAttempts: 2,
       runTimeoutMs: 1_800_000,
+      stepTimeoutMs: 120_000,
       cacheEnabled: true,
       pricingOverrides: null,
       workerConcurrency: 2,
@@ -94,5 +95,15 @@ describe('loadConfig', () => {
       expect(String(err)).toMatch(/STUDIO_DEV_API_TOKEN/);
       expect(String(err)).not.toContain(secret);
     }
+  });
+
+  it('scales the run timeout with the plan size', () => {
+    const c = loadConfig(BASE);
+    // 30 s video: 8 steps × 2 min < 30 min minimum.
+    expect(effectiveRunTimeoutMs(c, 8)).toBe(1_800_000);
+    // 2 h video: 24 chapters → 2 + 5 × 24 + 1 = 123 steps × 2 min.
+    expect(effectiveRunTimeoutMs(c, 123)).toBe(123 * 120_000);
+    const noScale = loadConfig({ ...BASE, DIRECTOR_STEP_TIMEOUT_MS: '0', DIRECTOR_RUN_TIMEOUT_MS: '5000' });
+    expect(effectiveRunTimeoutMs(noScale, 500)).toBe(5000);
   });
 });

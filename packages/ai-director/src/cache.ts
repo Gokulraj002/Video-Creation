@@ -2,6 +2,9 @@ import type { DirectorStage, TokenUsage } from '@vc/schema';
 import { canonicalJson, sha256Hex } from './util/json';
 
 export interface CacheEntry {
+  /** Stage / chunk that produced the output (lets persistent caches index and report entries). */
+  stage: DirectorStage;
+  chunk: string | null;
   /** A VALIDATED stage output. */
   output: unknown;
   usage: TokenUsage;
@@ -11,8 +14,15 @@ export interface CacheEntry {
   createdAt: string;
 }
 
+/** Stage context passed alongside every cache lookup (optional for implementations to use). */
+export interface CacheLookupContext {
+  stage: DirectorStage;
+  chunk: string | null;
+}
+
 export interface DirectorCache {
-  get(key: string): Promise<CacheEntry | null>;
+  get(key: string, context?: CacheLookupContext): Promise<CacheEntry | null>;
+  /** `entry.stage` / `entry.chunk` identify the producing stage. */
   set(key: string, entry: CacheEntry): Promise<void>;
 }
 

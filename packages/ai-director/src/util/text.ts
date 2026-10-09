@@ -41,7 +41,7 @@ export function limitWords(text: string, maxWords: number): string {
 export function sentences(text: string): string[] {
   return text
     .split(/(?<=[.!?])\s+|\n+/)
-    .map((s) => s.replace(/^[\s\-*•\d.)]+/, '').trim())
+    .map((s) => s.replace(/^\s*(?:[-*•]|\d+[.)])\s+/, '').trim())
     .filter((s) => s.length > 0);
 }
 

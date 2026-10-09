@@ -29,8 +29,10 @@ export class DirectorError extends Error {
   /** Stage / chunk where the error happened (set by the director when known). */
   stage: DirectorStage | null;
   chunk: string | null;
-  /** Usage accumulated by the run before it failed (set by the director), so failed runs can still be billed. */
-  usage: UsageReport | null = null;
+  /** Usage consumed by the run before it failed (set by the director), so partial runs can still be billed. */
+  usage: UsageReport | undefined = undefined;
+  /** Warnings recorded by the run before it failed (set by the director). */
+  warnings?: string[];
 
   constructor(code: DirectorErrorCode, message: string, options: DirectorErrorOptions = {}) {
     super(message, options.cause !== undefined ? { cause: options.cause } : undefined);

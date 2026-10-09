@@ -1,11 +1,12 @@
 import { DirectorError, type DirectorProgress, type DirectorResult } from '@vc/ai-director';
 import { VideoRequestSchema, type DirectorRunProgress, type UsageReport } from '@vc/schema';
-import type { AppConfig } from '../config';
+import { effectiveRunTimeoutMs, type AppConfig } from '../config';
 import { Prisma, ProjectStatus, RunStatus, type PrismaClient } from '../db';
 import { toJsonInput } from '../lib/json';
 import type { Logger } from '../lib/logger';
 import { restoreProjectStatus, type RunOutcome } from '../services/project-status';
 import type { DirectorFactory } from './factory';
+import { plannedTotalSteps } from './plan';
 import { PrismaDirectorCache } from './prisma-cache';
 
 export interface ProcessRunDeps {
@@ -53,6 +54,10 @@ function usageColumns(usage: UsageReport) {
   };
 }
 
+function warningsJson(warnings: readonly string[] | undefined): string[] {
+  return (warnings ?? []).slice(0, 500).map((w) => w.slice(0, 2000));
+}
+
 class RunNoLongerActiveError extends Error {
   constructor() {
     super('Director run is no longer RUNNING');
@@ -65,33 +70,38 @@ type AbortReason = 'cancelled' | 'timeout';
 /**
  * Processes one director run (shared by the BullMQ worker and the inline queue):
  * claim QUEUED → RUNNING, run the AI Director with progress persistence + cancellation + timeout, then
- * persist the new ProjectVersion atomically (or record FAILED / CANCELLED). Never throws for run-level
- * failures; those are recorded on the run row.
+ * persist the new ProjectVersion atomically (or record FAILED / CANCELLED). Usage consumed before a
+ * failure or cancellation is always persisted (quotas and /v1/usage count real spend). Never throws for
+ * run-level failures; those are recorded on the run row.
  */
 export async function processDirectorRun(runId: string, deps: ProcessRunDeps): Promise<void> {
   const { prisma, config, logger } = deps;
   const log = (level: 'info' | 'warn' | 'error', obj: object, msg: string) => logger[level]({ runId, ...obj }, msg);
 
-  const startedAt = new Date();
+  const run = await prisma.directorRun.findUnique({
+    where: { id: runId },
+    select: { status: true, requestedById: true, projectId: true, project: { select: { request: true } } },
+  });
+  if (run === null || run.status !== RunStatus.QUEUED || run.projectId === null || run.project === null) {
+    log('info', {}, 'director run skipped (not queued)');
+    return;
+  }
+  const projectId = run.projectId;
+  const totalSteps = plannedTotalSteps(run.project.request, config.limits);
+  const timeoutMs = effectiveRunTimeoutMs(config, totalSteps);
+
   const claimed = await prisma.directorRun.updateMany({
     where: { id: runId, status: RunStatus.QUEUED },
     data: {
       status: RunStatus.RUNNING,
-      startedAt,
-      progress: { completedSteps: 0, totalSteps: 0, currentStage: null, message: 'Starting AI Director' },
+      startedAt: new Date(),
+      progress: { completedSteps: 0, totalSteps, currentStage: null, message: 'Starting AI Director' },
     },
   });
   if (claimed.count === 0) {
-    log('info', {}, 'director run skipped (not queued)');
+    log('info', {}, 'director run skipped (claimed or cancelled concurrently)');
     return;
   }
-
-  const run = await prisma.directorRun.findUnique({
-    where: { id: runId },
-    select: { projectId: true, project: { select: { request: true } } },
-  });
-  if (run === null) return; // deleted in between (project deleted)
-  const projectId = run.projectId;
 
   const controller = new AbortController();
   // Mutated from callbacks, so kept in an object (no stale control-flow narrowing).
@@ -110,7 +120,7 @@ export async function processDirectorRun(runId: string, deps: ProcessRunDeps): P
     return row !== null && row.status === RunStatus.RUNNING;
   };
 
-  const timeout = setTimeout(() => abort('timeout'), config.director.runTimeoutMs);
+  const timeout = setTimeout(() => abort('timeout'), timeoutMs);
   timeout.unref();
   let polling = false;
   const poll = setInterval(() => {
@@ -149,8 +159,9 @@ export async function processDirectorRun(runId: string, deps: ProcessRunDeps): P
   let failure: unknown = null;
   try {
     const request = VideoRequestSchema.parse(run.project.request);
-    const cache = config.director.cacheEnabled ? new PrismaDirectorCache(prisma) : null;
-    const director = deps.directorFactory.createDirector({ cache, logger });
+    // Cache entries are scoped to the requesting user (no cross-tenant hits).
+    const cache = config.director.cacheEnabled ? new PrismaDirectorCache(prisma, run.requestedById) : null;
+    const director = deps.directorFactory.createDirector({ cache, logger, logBindings: { runId } });
     result = await director.planProject({ request }, { signal: controller.signal, onProgress });
   } catch (err) {
     failure = err;
@@ -161,10 +172,10 @@ export async function processDirectorRun(runId: string, deps: ProcessRunDeps): P
 
   if (result !== null && state.abortReason === null) {
     try {
-      const totalSteps = state.lastProgress?.totalSteps ?? 0;
+      const steps = state.lastProgress?.totalSteps ?? totalSteps;
       await persistSuccess(prisma, runId, projectId, result, {
-        completedSteps: totalSteps,
-        totalSteps,
+        completedSteps: steps,
+        totalSteps: steps,
         currentStage: 'compile',
         message: 'Timeline ready',
       });
@@ -172,7 +183,7 @@ export async function processDirectorRun(runId: string, deps: ProcessRunDeps): P
       return;
     } catch (err) {
       if (err instanceof RunNoLongerActiveError) {
-        await finalizeStopped(prisma, runId, projectId, 'cancelled');
+        await finalizeStopped(prisma, runId, projectId, 'cancelled', result.usage, result.warnings);
         log('info', { projectId }, 'director run cancelled before its result was saved');
         return;
       }
@@ -181,10 +192,11 @@ export async function processDirectorRun(runId: string, deps: ProcessRunDeps): P
   }
 
   // Tokens spent before a failure/cancellation still count (quota + usage reporting).
-  const partialUsage = failure instanceof DirectorError ? failure.usage : null;
+  const partialUsage = result?.usage ?? (failure instanceof DirectorError ? (failure.usage ?? null) : null);
+  const warnings = result?.warnings ?? (failure instanceof DirectorError ? failure.warnings : undefined);
 
   if (state.abortReason === 'cancelled') {
-    await finalizeStopped(prisma, runId, projectId, 'cancelled', partialUsage);
+    await finalizeStopped(prisma, runId, projectId, 'cancelled', partialUsage, warnings);
     log('info', { projectId }, 'director run cancelled');
     return;
   }
@@ -193,7 +205,7 @@ export async function processDirectorRun(runId: string, deps: ProcessRunDeps): P
   let message: string;
   if (state.abortReason === 'timeout') {
     code = 'TIMEOUT';
-    message = `Director run exceeded the configured timeout of ${config.director.runTimeoutMs} ms`;
+    message = `Director run exceeded its timeout of ${timeoutMs} ms`;
   } else if (failure instanceof DirectorError && failure.code !== 'INTERNAL') {
     code = failure.code;
     message = sanitizeErrorMessage(failure.message);
@@ -203,7 +215,7 @@ export async function processDirectorRun(runId: string, deps: ProcessRunDeps): P
     message = 'Unexpected error while directing the video (see server logs)';
   }
   log(code === 'INTERNAL' ? 'error' : 'warn', { projectId, code, err: failure }, 'director run failed');
-  await markRunFailed(prisma, runId, code, message, partialUsage);
+  await markRunFailed(prisma, runId, code, message, partialUsage, warnings);
 }
 
 async function persistSuccess(
@@ -224,6 +236,7 @@ async function persistSuccess(
           status: RunStatus.SUCCEEDED,
           finishedAt,
           ...usageColumns(result.usage),
+          warnings: warningsJson(result.warnings),
           progress,
         },
       });
@@ -249,13 +262,14 @@ async function persistSuccess(
   );
 }
 
-/** Records FAILED on a still-active run and restores the project status. */
+/** Records FAILED (with any partial usage/warnings) on a still-active run and restores the project status. */
 export async function markRunFailed(
   prisma: PrismaClient,
   runId: string,
   code: string,
   message: string,
   usage: UsageReport | null = null,
+  warnings?: readonly string[],
 ): Promise<void> {
   await prisma.$transaction(async (tx) => {
     const row = await tx.directorRun.findUnique({ where: { id: runId }, select: { projectId: true } });
@@ -268,19 +282,24 @@ export async function markRunFailed(
         errorMessage: message,
         finishedAt: new Date(),
         ...(usage !== null ? usageColumns(usage) : {}),
+        ...(warnings !== undefined ? { warnings: warningsJson(warnings) } : {}),
       },
     });
-    if (res.count > 0) await restoreProjectStatus(tx, row.projectId, 'failed');
+    if (res.count > 0 && row.projectId !== null) await restoreProjectStatus(tx, row.projectId, 'failed');
   });
 }
 
-/** The run was stopped by the user: ensure finishedAt and restore the project status (idempotent). */
+/**
+ * The run was cancelled by the user (the cancel endpoint already set CANCELLED): ensure finishedAt, record
+ * the usage consumed so far, and restore the project status (idempotent).
+ */
 async function finalizeStopped(
   prisma: PrismaClient,
   runId: string,
   projectId: string,
   outcome: RunOutcome,
   usage: UsageReport | null = null,
+  warnings?: readonly string[],
 ): Promise<void> {
   await prisma.$transaction(async (tx) => {
     await tx.directorRun.updateMany({
@@ -290,7 +309,7 @@ async function finalizeStopped(
     if (usage !== null) {
       await tx.directorRun.updateMany({
         where: { id: runId, status: RunStatus.CANCELLED, usage: { equals: Prisma.DbNull } },
-        data: usageColumns(usage),
+        data: { ...usageColumns(usage), ...(warnings !== undefined ? { warnings: warningsJson(warnings) } : {}) },
       });
     }
     const project = await tx.project.findUnique({ where: { id: projectId }, select: { status: true } });

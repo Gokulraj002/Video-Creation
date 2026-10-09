@@ -33,7 +33,10 @@ export interface AppConfig {
   };
   director: {
     maxRepairAttempts: number;
+    /** Minimum overall run timeout; the effective timeout scales with the plan (see `effectiveRunTimeoutMs`). */
     runTimeoutMs: number;
+    /** Per-step budget used to scale the run timeout for long plans (0 disables scaling). */
+    stepTimeoutMs: number;
     cacheEnabled: boolean;
     pricingOverrides: Record<string, ModelPricingConfig> | null;
     workerConcurrency: number;
@@ -99,6 +102,7 @@ const EnvSchema = z
 
     DIRECTOR_MAX_REPAIR_ATTEMPTS: nonNegInt(2),
     DIRECTOR_RUN_TIMEOUT_MS: posInt(1_800_000),
+    DIRECTOR_STEP_TIMEOUT_MS: nonNegInt(120_000),
     DIRECTOR_CACHE: z.enum(['on', 'off']).default('on'),
     DIRECTOR_PRICING_JSON: z.string().min(1).optional(),
     DIRECTOR_WORKER_CONCURRENCY: posInt(2),
@@ -204,6 +208,7 @@ export function loadConfig(env: EnvInput = process.env): AppConfig {
     director: {
       maxRepairAttempts: e.DIRECTOR_MAX_REPAIR_ATTEMPTS,
       runTimeoutMs: e.DIRECTOR_RUN_TIMEOUT_MS,
+      stepTimeoutMs: e.DIRECTOR_STEP_TIMEOUT_MS,
       cacheEnabled: e.DIRECTOR_CACHE === 'on',
       pricingOverrides,
       workerConcurrency: e.DIRECTOR_WORKER_CONCURRENCY,
@@ -229,4 +234,13 @@ export function loadConfig(env: EnvInput = process.env): AppConfig {
       apiToken: e.STUDIO_DEV_API_TOKEN,
     },
   };
+}
+
+/**
+ * Effective wall-clock budget of one director run: the configured minimum, scaled up for long plans
+ * (`2 + 5 × chapters + 1` sequential steps) so multi-hour videos with a live provider are not cut off.
+ */
+export function effectiveRunTimeoutMs(config: Pick<AppConfig, 'director'>, totalSteps: number): number {
+  const scaled = Math.max(0, Math.floor(totalSteps)) * config.director.stepTimeoutMs;
+  return Math.max(config.director.runTimeoutMs, scaled);
 }

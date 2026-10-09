@@ -132,7 +132,7 @@ export const GENRE_PROFILES: Readonly<Record<VideoGenre, GenreProfile>> = {
     cameraMovements: ['static', 'push-in', 'tilt-down', 'static'],
     transitions: ['fade', 'cut', 'slide'],
     moods: ['focused', 'methodical', 'reassuring', 'attentive'],
-    beats: ['step', 'step', 'step', 'check'],
+    beats: ['step'],
     chapterThemes: ['Preparation & safety', 'Procedure', 'Verification & wrap-up'],
     defaultCallToAction: null,
     threeEnvironment: 'warehouse',

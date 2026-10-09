@@ -132,7 +132,8 @@ export async function cancelRun(prisma: PrismaClient, userId: string, runId: str
     where: { id: runId, project: { ownerId: userId } },
     select: { id: true, projectId: true, status: true },
   });
-  if (run === null) throw notFound('Director run');
+  if (run === null || run.projectId === null) throw notFound('Director run');
+  const projectIdOfRun = run.projectId;
   const notActive = () =>
     conflict('RUN_NOT_ACTIVE', `Director run is ${run.status.toLowerCase()} and can no longer be cancelled`);
   if (!ACTIVE_RUN_STATUSES.includes(run.status)) throw notActive();
@@ -143,7 +144,7 @@ export async function cancelRun(prisma: PrismaClient, userId: string, runId: str
       data: { status: RunStatus.CANCELLED, finishedAt: new Date() },
     });
     if (res.count === 0) throw notActive();
-    await restoreProjectStatus(tx, run.projectId, 'cancelled');
+    await restoreProjectStatus(tx, projectIdOfRun, 'cancelled');
     const updated = await tx.directorRun.findUniqueOrThrow({ where: { id: runId }, include: runInclude });
     return toDirectorRunDto(updated);
   });

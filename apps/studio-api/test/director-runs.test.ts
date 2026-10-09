@@ -1,16 +1,19 @@
 import {
   HeuristicMockProvider,
   ProviderRefusalError,
+  ProviderUnavailableError,
   ScriptedMockProvider,
   type StructuredGenerationRequest,
 } from '@vc/ai-director';
 import {
   ApiErrorSchema,
+  ChapterEngineSelectionSchema,
   DirectorRunDTOSchema,
   ProjectDetailDTOSchema,
   ProjectVersionDTOSchema,
   ProjectVersionSummaryDTOSchema,
   TimelineSchema,
+  UsageSummaryDTOSchema,
   type DirectorRunDTO,
 } from '@vc/schema';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -200,7 +203,9 @@ describe('director runs end-to-end (inline queue + heuristic mock)', () => {
       cacheWriteTokens: 0,
       estimatedCostUsd: 0,
     });
-    expect(run2.usage?.totals.cachedCalls).toBe(run2.usage?.totals.calls);
+    // `calls` = provider requests actually made; `cachedCalls` = stages served from the cache.
+    expect(run2.usage?.totals.calls).toBe(0);
+    expect(run2.usage?.totals.cachedCalls).toBe(firstDone.usage?.totals.calls);
     expect(run2.usage?.stages.every((s) => s.cached)).toBe(true);
     const hits = await prisma.directorCacheEntry.aggregate({ _sum: { hits: true } });
     expect(hits._sum.hits).toBe(run2.usage?.totals.cachedCalls);
@@ -219,11 +224,11 @@ describe('director runs end-to-end (inline queue + heuristic mock)', () => {
       .parse(json(await app.app.inject({ method: 'GET', url: `/v1/projects/${project.id}/director-runs`, headers: alice.auth })));
     expect(list.map((r) => r.id)).toEqual([second.id, first.id]);
 
-    // Deleting a directed project cascades to its versions and runs.
+    // Deleting a directed project cascades to its versions; runs are detached (kept for usage accounting).
     const del = await app.app.inject({ method: 'DELETE', url: `/v1/projects/${project.id}`, headers: alice.auth });
     expect(del.statusCode).toBe(204);
     expect(await prisma.projectVersion.count()).toBe(0);
-    expect(await prisma.directorRun.count()).toBe(0);
+    expect(await prisma.directorRun.count({ where: { projectId: null } })).toBe(2);
   });
 
   it('DIRECTOR_CACHE=off makes the provider do the work again', async () => {
@@ -410,6 +415,8 @@ describe('cancellation', () => {
     const final = await getRun(app, alice, run.id);
     expect(final.status).toBe('cancelled');
     expect(final.versionNumber).toBeNull();
+    // Tokens spent before the cancellation are recorded.
+    expect(final.usage?.totals.inputTokens).toBeGreaterThan(0);
     expect(provider.calls.length).toBeLessThanOrEqual(3);
     expect(await prisma.projectVersion.count()).toBe(0);
     const project2 = await prisma.project.findUniqueOrThrow({ where: { id: project.id } });
@@ -490,9 +497,10 @@ describe('failures', () => {
 
   it('DIRECTOR_RUN_TIMEOUT_MS aborts slow runs with TIMEOUT', async () => {
     const provider = heuristicScripted(async () => {
-      await new Promise((r) => setTimeout(r, 60));
+      await new Promise((r) => setTimeout(r, 100));
     });
-    const app = await setup({ provider, env: { DIRECTOR_RUN_TIMEOUT_MS: '30' } });
+    // Step scaling off so the 150 ms minimum is the effective budget (aborts during the 2nd call).
+    const app = await setup({ provider, env: { DIRECTOR_RUN_TIMEOUT_MS: '150', DIRECTOR_STEP_TIMEOUT_MS: '0' } });
     const project = await createProject(app, alice);
     const run = await startRun(app, alice, project.id);
     await app.queue.onIdle();
@@ -500,6 +508,10 @@ describe('failures', () => {
     expect(failed.status).toBe('failed');
     expect(failed.error?.code).toBe('TIMEOUT');
     expect(await prisma.projectVersion.count()).toBe(0);
+    // The call that finished before the timeout is still accounted for.
+    expect(failed.usage?.totals.inputTokens).toBeGreaterThan(0);
+    const row = await prisma.directorRun.findUniqueOrThrow({ where: { id: run.id } });
+    expect(row.inputTokens).toBe(failed.usage?.totals.inputTokens);
   });
 });
 
@@ -520,5 +532,110 @@ describe('run isolation', () => {
     }
     const missing = await app.app.inject({ method: 'GET', url: '/v1/director-runs/does-not-exist', headers: alice.auth });
     expect(missing.statusCode).toBe(404);
+  });
+});
+
+describe('usage accounting', () => {
+  it('a failed run records the usage consumed before the failure (counts toward /v1/usage)', async () => {
+    const heuristic = new HeuristicMockProvider();
+    const provider = new ScriptedMockProvider(async (req) => {
+      if (req.stage === 'outline') throw new ProviderUnavailableError('Overloaded, try later');
+      return (await heuristic.generateStructured(req)).output;
+    });
+    const app = await setup({ provider });
+    const project = await createProject(app, alice);
+    const run = await startRun(app, alice, project.id);
+    await app.queue.onIdle();
+    const failed = await getRun(app, alice, run.id);
+    expect(failed.status).toBe('failed');
+    expect(failed.error?.code).toBe('PROVIDER_UNAVAILABLE');
+    expect(failed.usage?.stages.map((st) => st.stage)).toContain('brief');
+    const spent = failed.usage?.totals.inputTokens ?? 0;
+    expect(spent).toBeGreaterThan(0);
+    const usage = UsageSummaryDTOSchema.parse(
+      json(await app.app.inject({ method: 'GET', url: '/v1/usage', headers: alice.auth })),
+    );
+    expect(usage.today.runs).toBe(1);
+    expect(usage.today.inputTokens).toBe(spent);
+  });
+
+  it('deleting a project does not reduce usage or the daily quota', async () => {
+    const app = await setup({ env: { LIMIT_DIRECTOR_RUNS_PER_DAY: '1' } });
+    const project = await createProject(app, alice);
+    const run = await startRun(app, alice, project.id);
+    await app.queue.onIdle();
+    const before = UsageSummaryDTOSchema.parse(
+      json(await app.app.inject({ method: 'GET', url: '/v1/usage', headers: alice.auth })),
+    );
+    expect(before.today.runs).toBe(1);
+
+    const del = await app.app.inject({ method: 'DELETE', url: `/v1/projects/${project.id}`, headers: alice.auth });
+    expect(del.statusCode).toBe(204);
+    // The run row survives (detached) for accounting but is no longer addressable.
+    const orphan = await prisma.directorRun.findUniqueOrThrow({ where: { id: run.id } });
+    expect(orphan.projectId).toBeNull();
+    const gone = await app.app.inject({ method: 'GET', url: `/v1/director-runs/${run.id}`, headers: alice.auth });
+    expect(gone.statusCode).toBe(404);
+
+    const after = UsageSummaryDTOSchema.parse(
+      json(await app.app.inject({ method: 'GET', url: '/v1/usage', headers: alice.auth })),
+    );
+    expect(after).toEqual(before);
+    const fresh = await createProject(app, alice);
+    const res = await app.app.inject({
+      method: 'POST',
+      url: `/v1/projects/${fresh.id}/director-runs`,
+      headers: alice.auth,
+      payload: {},
+    });
+    expect(res.statusCode).toBe(429);
+    expect(ApiErrorSchema.parse(json(res)).error.code).toBe('QUOTA_EXCEEDED');
+  });
+
+  it('director warnings (engine coercion) are stored on the run', async () => {
+    const heuristic = new HeuristicMockProvider();
+    const provider = new ScriptedMockProvider(async (req) => {
+      const output = (await heuristic.generateStructured(req)).output;
+      if (req.stage !== 'engineSelection') return output;
+      // Ask for an engine that is unavailable in M1 for the first scene.
+      const parsed = ChapterEngineSelectionSchema.parse(output);
+      const [first, ...rest] = parsed.choices;
+      if (first === undefined) return output;
+      return { ...parsed, choices: [{ ...first, engine: 'footage', template: null }, ...rest] };
+    });
+    const app = await setup({ provider });
+    const project = await createProject(app, alice);
+    const run = await startRun(app, alice, project.id);
+    await app.queue.onIdle();
+    const done = await getRun(app, alice, run.id);
+    expect(done.status, JSON.stringify(done.error)).toBe('succeeded');
+    const row = await prisma.directorRun.findUniqueOrThrow({ where: { id: run.id } });
+    const warnings = z.array(z.string()).parse(row.warnings);
+    expect(warnings.some((w) => w.includes('footage'))).toBe(true);
+  });
+});
+
+describe('cache isolation', () => {
+  it('cache entries are scoped per user: identical requests by another user are not served from cache', async () => {
+    const app = await setup();
+    const a = await createProject(app, alice);
+    const b = await createProject(app, bob);
+    const runA = await startRun(app, alice, a.id);
+    await app.queue.onIdle();
+    const runB = await startRun(app, bob, b.id);
+    await app.queue.onIdle();
+    const doneA = await getRun(app, alice, runA.id);
+    const doneB = await getRun(app, bob, runB.id);
+    expect(doneA.usage?.totals.cachedCalls).toBe(0);
+    expect(doneB.usage?.totals.cachedCalls).toBe(0);
+    expect(doneB.usage?.totals.inputTokens).toBe(doneA.usage?.totals.inputTokens);
+    expect(await prisma.directorCacheEntry.count()).toBe((doneA.usage?.totals.calls ?? 0) * 2);
+
+    // Alice's own re-run still hits her cache.
+    const rerun = await startRun(app, alice, a.id);
+    await app.queue.onIdle();
+    const doneRerun = await getRun(app, alice, rerun.id);
+    expect(doneRerun.usage?.totals.calls).toBe(0);
+    expect(doneRerun.usage?.totals.cachedCalls).toBe(doneA.usage?.totals.calls);
   });
 });

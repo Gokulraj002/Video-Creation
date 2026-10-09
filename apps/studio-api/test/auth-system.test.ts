@@ -85,10 +85,14 @@ describe('GET /v1/system/config', () => {
     expect(dto.queueDriver).toBe('inline');
     expect(dto.limits.maxDurationSeconds).toBe(7200);
     const engines = Object.fromEntries(dto.engines.map((e) => [e.engine, e]));
-    expect(engines['motion2d']).toEqual({ engine: 'motion2d', available: true, reason: null });
+    // M1 only PLANS motion2d/three scenes; nothing renders yet (M2 2D renderer, M5 3D engine).
+    expect(engines['motion2d']?.available).toBe(true);
+    expect(engines['motion2d']?.reason).toMatch(/Planned scenes only.*Milestone 2/);
     expect(engines['three']?.available).toBe(true);
+    expect(engines['three']?.reason).toMatch(/Planned scenes only.*Milestone 5/);
     for (const e of ['footage', 'image', 'screen'] as const) {
-      expect(engines[e]).toEqual({ engine: e, available: false, reason: 'requires uploaded assets (Milestone 3)' });
+      expect(engines[e]?.available).toBe(false);
+      expect(engines[e]?.reason).toMatch(/requires uploaded assets \(Milestone 3\).*Milestone 6/);
     }
     expect(engines['generated']).toEqual({
       engine: 'generated',

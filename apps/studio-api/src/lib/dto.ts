@@ -17,6 +17,7 @@ import {
   type ProjectVersionSummaryDTO,
 } from '@vc/schema';
 import type { Prisma, ProjectStatus, RunStatus } from '../db';
+import { notFound } from './errors';
 
 // ---------------------------------------------------------------------------------------------
 // Prisma include shapes used with the mappers
@@ -84,6 +85,8 @@ export const EMPTY_PROGRESS: DirectorRunProgress = {
 };
 
 export function toDirectorRunDto(run: RunRow): DirectorRunDTO {
+  // Runs of deleted projects are kept only for usage accounting and are not addressable.
+  if (run.projectId === null) throw notFound('Director run');
   const progress = DirectorRunProgressSchema.safeParse(run.progress);
   const usage = run.usage === null ? null : UsageReportSchema.safeParse(run.usage);
   return {

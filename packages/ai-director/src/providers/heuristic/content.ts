@@ -177,7 +177,7 @@ export function analyzeRequest(request: RequestDigest, profile: GenreProfile): T
   }
 
   const location = LOCATION.exec(text)?.[1] ?? null;
-  const price = PRICE.exec(text)?.[0]?.trim() ?? null;
+  const price = PRICE.exec(text)?.[0]?.trim().replace(/[.,]+$/, '') ?? null;
   const contact = CONTACT.exec(text)?.[0]?.trim() ?? null;
   const haystack = `${request.title} ${text}`;
 
@@ -344,7 +344,16 @@ export function comicLine(beat: string, title: string, index: number): string | 
   return fill(lines[index % lines.length] ?? lines[0], title);
 }
 
-/** Narration of roughly `targetWords` words for one beat. */
+/** True for the generic beat openers ("Next step.", "Picture this.") so templates can skip them. */
+export function isBeatOpener(text: string): boolean {
+  const t = text.trim();
+  return Object.values(BEAT_OPENERS).some((o) => !o.includes('{title}') && o === t);
+}
+
+/**
+ * Narration of roughly `targetWords` words for one beat, built from whole sentences
+ * (beat opener, lead, then supporting sentences); only an over-long lead is cut at word level.
+ */
 export function narration(options: {
   beat: string;
   title: string;
@@ -353,17 +362,38 @@ export function narration(options: {
   targetWords: number;
 }): string {
   const target = Math.max(3, Math.round(options.targetWords));
+  const ceiling = Math.max(target + 2, Math.round(target * 1.25));
+  // The lead may run a little long (narrators speed up); supporting sentences only fill remaining time.
+  const leadCeiling = Math.max(ceiling, Math.round(target * 1.6));
   const parts: string[] = [];
+  let count = 0;
+  const add = (text: string, limit: number): boolean => {
+    const s = sentence(text);
+    const n = words(s).length;
+    if (n === 0) return true;
+    if (parts.includes(s)) return true;
+    if (count + n > limit) return false;
+    parts.push(s);
+    count += n;
+    return true;
+  };
   const opener = beatOpener(options.beat, options.title);
-  if (opener) parts.push(opener);
-  parts.push(sentence(options.lead));
-  let i = 0;
-  while (words(parts.join(' ')).length < target && i < options.support.length) {
-    const s = options.support[i];
-    if (s && !parts.includes(sentence(s))) parts.push(sentence(s));
-    i++;
+  if (opener && target >= 8) add(opener, ceiling);
+  for (const s of sentences(options.lead)) {
+    if (!add(s, leadCeiling)) {
+      if (parts.length === 0 || count < target * 0.5) {
+        const remaining = Math.max(3, target - count);
+        parts.push(limitWords(sentence(s), remaining));
+        count += remaining;
+      }
+      break;
+    }
   }
-  return clip(limitWords(parts.join(' '), target), 5000);
+  for (const support of options.support) {
+    if (count >= target * 0.85) break;
+    for (const s of sentences(support)) add(s, ceiling);
+  }
+  return clip(parts.join(' '), 5000);
 }
 
 /** Short on-screen line (≤ `maxWords` words). */

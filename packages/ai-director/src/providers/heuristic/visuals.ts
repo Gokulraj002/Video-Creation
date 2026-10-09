@@ -10,7 +10,15 @@ import { InternalDirectorError } from '../../errors';
 import { cycle, genreProfile, type GenreProfile } from '../../genres';
 import type { ChapterSceneSpecsLlm, EngineSelectionStageInput, SceneSpecsSceneInput, SceneSpecsStageInput } from '../../stages';
 import { clip, clipOr, clipOrNull, round, sentences } from '../../util/text';
-import { analyzeRequest, fnv1a, shortLine, type CartoonCharacter, type CartoonSetting, type TopicAnalysis } from './content';
+import {
+  analyzeRequest,
+  fnv1a,
+  isBeatOpener,
+  shortLine,
+  type CartoonCharacter,
+  type CartoonSetting,
+  type TopicAnalysis,
+} from './content';
 
 // =============================================================================================
 // Engine selection
@@ -69,7 +77,7 @@ function chooseTemplate(
     const t: CatalogTemplateId = RECAP_HINT.test(text) ? 'bullet-list' : 'step-instruction';
     if (t !== input.previousChoice?.template) return { template: t, reason: 'one procedure step per scene' };
   }
-  if (p.genre === 'real-estate' && (/[$€£₹]/.test(text) || /\b(bed|bath|sq|acre|pool|garden)\w*/i.test(text))) {
+  if (p.genre === 'real-estate' && previous !== 'property-showcase' && (/[$€£₹]/.test(text) || /\b(bed|bath|sq|acre|pool|garden)\w*/i.test(text))) {
     if (input.previousChoice?.template !== 'property-showcase') return { template: 'property-showcase', reason: 'listing details' };
   }
   if (NUMBER_HINT.test(scene.onScreenText ?? '') && body.includes('stat-counter') && previous !== 'stat-counter') {
@@ -192,12 +200,13 @@ function buildPropsFor(
     }
     case 'step-instruction': {
       const caution = topic.cautions[stepInfo.stepNumber - 1] ?? (stepInfo.stepNumber === 1 ? 'Follow your site safety rules before you begin.' : null);
+      const spoken = s.scene.voiceOver ? sentences(s.scene.voiceOver).filter((x) => !isBeatOpener(x)) : [];
       return {
         ...base,
         stepNumber: stepInfo.stepNumber,
         totalSteps: stepInfo.totalSteps,
         title: clipOr(s.scene.onScreenText ?? s.scene.title, `Step ${stepInfo.stepNumber}`, 120),
-        instruction: clipOr(s.scene.voiceOver ?? s.scene.visualDescription, s.scene.title, 500),
+        instruction: clipOr(spoken.slice(0, 2).join(' ') || s.scene.title, s.scene.visualDescription, 500),
         caution: clipOrNull(caution, 200),
       };
     }
@@ -234,7 +243,10 @@ function buildPropsFor(
       };
     }
     case 'property-showcase': {
-      const features = topic.features.length > 0 ? topic.features.slice(0, 6) : bullets.length > 0 ? bullets.slice(0, 6) : [clip(s.scene.title, 120)];
+      const pool = topic.features.length > 0 ? topic.features : bullets.length > 0 ? bullets : [clip(s.scene.title, 120)];
+      // Lead with a different feature in every listing card.
+      const shift = g % pool.length;
+      const features = [...pool.slice(shift), ...pool.slice(0, shift)].slice(0, 6);
       return {
         ...base,
         propertyName: clipOr(input.brief.title, 'Featured property', 120),
@@ -244,7 +256,11 @@ function buildPropsFor(
       };
     }
     case 'lower-third':
-      return { ...base, name: clipOr(s.scene.onScreenText ?? s.scene.title, 'Speaker', 80), role: clipOrNull(brandName ?? input.chapter.title, 120) };
+      return {
+        ...base,
+        name: clipOr(s.scene.onScreenText ?? s.scene.title, 'Speaker', 80),
+        role: clipOrNull(topic.location ?? brandName ?? input.chapter.title, 120),
+      };
     case 'product-turntable': {
       const product = getTemplate('product-turntable')?.buildProps({ ...ctx, title: `${input.request.title} ${s.scene.title}`, text: input.request.prompt });
       return {

@@ -20,7 +20,7 @@ import type {
   StoryboardStageInput,
 } from '../../stages';
 import { uniqueHexColors } from '../../util/color';
-import { clip, clipOr, countWords, round, sentences, words } from '../../util/text';
+import { clip, clipOr, round, sentences, words } from '../../util/text';
 import { analyzeRequest, beatVisual, comicLine, fnv1a, narration, Rng, shortLine, type TopicAnalysis } from './content';
 
 type NonEmpty<T> = readonly [T, ...T[]];
@@ -101,7 +101,7 @@ export function mockBrief(input: BriefStageInput): CreativeBrief {
       : null;
   return {
     title: clip(request.title, 200),
-    logline: clip(`${request.title}: ${topic.messages[0]}`, 300),
+    logline: clip(topic.messages[0], 300),
     objective: clip(p.objective.replace('{title}', request.title), 1000),
     targetAudience: clip(p.audience, 500),
     tone: tone.length > 0 ? tone : [...p.tone],
@@ -187,17 +187,21 @@ export function mockChapterScript(input: ScriptStageInput): ChapterScript {
 
   const segments: ScriptSegment[] = durations.map((duration, k) => {
     const isOpening = chapter.isFirst && k === 0;
-    const isClosing = chapter.isLast && k === count - 1;
-    const beat = beatFor(p, isOpening, isClosing, offset + k);
-    const lead = segmentLead(p, topic, brief, beat, offset + k, isOpening, isClosing);
-    const support = [...messages.slice((offset + k) % messages.length), ...messages];
+    const isClosing = chapter.isLast && k === count - 1 && !isOpening;
+    const index = offset + k;
+    const beat = beatFor(p, isOpening, isClosing, index);
+    // SOP: sequential steps after the opening; extra segments double-check earlier steps.
+    const stepIndex = Math.max(0, index - (chapter.isFirst ? 1 : 0));
+    const ctx: LeadContext = { p, topic, brief, beat, index, stepIndex, isOpening, isClosing };
+    const lead = segmentLead(ctx);
+    const support = [...messages.slice(index % messages.length), ...messages];
     const voiceOver = request.voiceOver.enabled
       ? narration({ beat, title: brief.title, lead, support, targetWords: duration * p.wordsPerSecond })
       : null;
     return {
       id: `g${k + 1}`,
       voiceOver,
-      onScreenText: onScreenFor(p, topic, brief, beat, lead, offset + k, isOpening, isClosing),
+      onScreenText: onScreenFor(ctx, lead),
       visualIntent: clip(`${beatVisual(beat)}. ${p.visualDescription.split('.')[0] ?? ''}.`, 1000),
       targetDurationSeconds: duration,
     };
@@ -205,41 +209,64 @@ export function mockChapterScript(input: ScriptStageInput): ChapterScript {
   return { chapterId: chapter.id, segments };
 }
 
-function segmentLead(
-  p: GenreProfile,
-  topic: TopicAnalysis,
-  brief: CreativeBrief,
-  beat: string,
-  index: number,
-  isOpening: boolean,
-  isClosing: boolean,
-): string {
-  if (isOpening) return brief.logline;
-  if (isClosing) return brief.callToAction ?? cycle(nonEmptyOr(brief.keyMessages, topic.messages), index);
-  if (p.genre === 'sop-training' && (beat === 'step' || beat === 'check')) {
-    return beat === 'check' ? `Check that ${cycle(topic.steps, index).toLowerCase()} was completed correctly` : cycle(topic.steps, index);
+interface LeadContext {
+  p: GenreProfile;
+  topic: TopicAnalysis;
+  brief: CreativeBrief;
+  beat: string;
+  index: number;
+  stepIndex: number;
+  isOpening: boolean;
+  isClosing: boolean;
+}
+
+const CLOSING_LINES: Partial<Record<GenreProfile['genre'], (title: string) => { lead: string; onScreen: string }>> = {
+  'sop-training': (t) => ({ lead: `That completes the ${t} procedure. Follow every step in order, every time`, onScreen: `Recap: ${t}` }),
+  'corporate-training': (t) => ({ lead: `Those are the key takeaways from ${t}. Put them into practice this week`, onScreen: 'Key takeaways' }),
+  presentation: () => ({ lead: 'Here are the recommended next steps', onScreen: 'Next steps' }),
+  'long-form': (t) => ({ lead: `And that is the story of ${t}`, onScreen: 'Final thoughts' }),
+  cartoon: () => ({ lead: 'And they all lived happily ever after', onScreen: 'The End' }),
+};
+
+function sopStep(ctx: LeadContext): { text: string; isRepeat: boolean } {
+  const { steps } = ctx.topic;
+  const step = cycle(steps, ctx.stepIndex);
+  return { text: step, isRepeat: ctx.stepIndex >= steps.length };
+}
+
+function segmentLead(ctx: LeadContext): string {
+  const { p, topic, brief, index } = ctx;
+  const messages = nonEmptyOr(brief.keyMessages, topic.messages);
+  if (ctx.isOpening) return messages[0];
+  if (ctx.isClosing) {
+    if (brief.callToAction) return brief.callToAction;
+    return CLOSING_LINES[p.genre]?.(brief.title).lead ?? cycle(messages, index);
+  }
+  if (p.genre === 'sop-training') {
+    const step = sopStep(ctx);
+    return step.isRepeat ? `Double-check: ${step.text}` : step.text;
   }
   if (p.genre === 'real-estate' && topic.features.length > 0) {
     const [first, ...rest] = topic.features;
-    if (first !== undefined) return `${cycle([first, ...rest], index)} — ${cycle(nonEmptyOr(brief.keyMessages, topic.messages), index)}`;
+    if (first !== undefined) return `${cycle([first, ...rest], index)}. ${cycle(messages, index)}`;
   }
-  return cycle(nonEmptyOr(brief.keyMessages, topic.messages), index);
+  return cycle(messages, index);
 }
 
-function onScreenFor(
-  p: GenreProfile,
-  topic: TopicAnalysis,
-  brief: CreativeBrief,
-  beat: string,
-  lead: string,
-  index: number,
-  isOpening: boolean,
-  isClosing: boolean,
-): string | null {
-  if (isOpening) return clip(brief.title, 120);
-  if (isClosing && brief.callToAction) return shortLine(brief.callToAction, 8);
+function onScreenFor(ctx: LeadContext, lead: string): string | null {
+  const { p, topic, brief, beat, index } = ctx;
+  if (ctx.isOpening) return clip(brief.title, 120);
+  if (ctx.isClosing) {
+    if (brief.callToAction) return shortLine(brief.callToAction, 8);
+    const closing = CLOSING_LINES[p.genre]?.(brief.title).onScreen;
+    if (closing) return clip(closing, 120);
+  }
   if (p.genre === 'comedy' || p.genre === 'cartoon') return comicLine(beat, brief.title, index) ?? shortLine(lead, 8);
-  if (p.genre === 'sop-training' && beat === 'step') return shortLine(cycle(topic.steps, index), 8);
+  if (p.genre === 'sop-training') return shortLine(sopStep(ctx).text, 8);
+  if (p.genre === 'real-estate' && topic.features.length > 0) {
+    const [first, ...rest] = topic.features;
+    if (first !== undefined) return clip(cycle([first, ...rest], index), 120);
+  }
   if (beat === 'data' || beat === 'proof') {
     const fact = topic.numericFacts[index % Math.max(1, topic.numericFacts.length)];
     if (fact) return shortLine(fact, 8);
@@ -430,9 +457,4 @@ export function mockChapterShotList(input: ShotListStageInput): ChapterShotList 
       return { sceneId: scene.id, shots };
     }),
   };
-}
-
-/** Words of narration per second actually present in a scene (diagnostics). */
-export function narrationDensity(scene: StoryboardScene): number {
-  return scene.voiceOver ? countWords(scene.voiceOver) / scene.durationSeconds : 0;
 }

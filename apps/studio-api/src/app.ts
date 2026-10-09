@@ -50,7 +50,6 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
   const app = Fastify({
     bodyLimit: BODY_LIMIT_BYTES,
     logger: deps.logger ?? { level: config.logLevel, redact: { paths: LOG_REDACT_PATHS, censor: '[Redacted]' } },
-    disableRequestLogging: config.nodeEnv === 'test',
   });
   const directorFactory = deps.directorFactory ?? createDirectorFactory(config);
   const ctx: AppContext = { config, prisma, queue, directorFactory, logger: app.log };
