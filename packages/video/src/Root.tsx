@@ -1,5 +1,6 @@
 import { Composition } from 'remotion';
 import { defaultIntroProps, PersonalizedIntro } from './PersonalizedIntro';
+import { defaultTravelOfferProps, TravelOffer } from './TravelOffer';
 
 export const FPS = 30;
 
@@ -17,6 +18,18 @@ export const RemotionRoot: React.FC = () => (
       // The worker stretches the intro to fit the voice-over when one is generated
       calculateMetadata={({ props }) => ({
         durationInFrames: Math.round((props.durationInSeconds ?? 4) * FPS),
+      })}
+    />
+    <Composition
+      id="TravelOffer"
+      component={TravelOffer}
+      width={1080}
+      height={1920}
+      fps={FPS}
+      durationInFrames={14 * FPS}
+      defaultProps={defaultTravelOfferProps}
+      calculateMetadata={({ props }) => ({
+        durationInFrames: Math.round((props.durationInSeconds ?? 14) * FPS),
       })}
     />
   </>

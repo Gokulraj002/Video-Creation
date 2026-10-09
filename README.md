@@ -78,6 +78,7 @@ A template is a Remotion composition plus props. String props support `{var}` an
 | Prop | Effect |
 |---|---|
 | `voiceText` | Spoken with ElevenLabs when `ELEVENLABS_API_KEY` + `ELEVENLABS_VOICE_ID` are set. The intro stretches to fit the voice. |
+| `voiceUrl` | A ready-made voice-over file (e.g. `https://…/voices/{phone}.mp3`). Takes priority over `voiceText`. |
 | `musicUrl` / `musicVolume` | Background music under the intro, looped to length. When there's a voice, the music ducks (drops ~11 dB) while the voice speaks. |
 | `base_video_url` (column) | A shared video appended after the intro (product demo, offer explainer). |
 | `base_video_fit` (column) | `pad` letterboxes non-vertical footage (safe for slides and text). `crop` center-crops to fill 9:16 (better for people). |
@@ -85,6 +86,17 @@ A template is a Remotion composition plus props. String props support `{var}` an
 Campaigns can override any prop (`campaigns.props`), e.g. a different `brandColor` per client.
 
 **Why the base video is cheap:** every segment is encoded with identical settings, so intro and base are joined with `ffmpeg -c copy` (no re-encode). The base is normalized once per template and cached. Each contact only pays for a ~4 s intro, about 8–10 s of render time on a 4-core box at concurrency 1. Scale out by running more workers.
+
+Voice-overs are loudness-normalized to -16 LUFS so every video plays at a consistent volume on phones.
+
+### Included templates
+
+| Template | Composition | What it is |
+|---|---|---|
+| Personalized Intro (vertical) | `PersonalizedIntro` | 4 s greeting card ("Hi {name}!"). Pairs with a shared base video. |
+| Travel Offer (vertical) | `TravelOffer` | 4 scenes: greeting → trip + highlights → price reveal → "Reply YES on WhatsApp". CSV columns `destination`, `trip`, `price`, `old_price` fill it in. `sceneSplits` (e.g. `"0.2,0.49,0.735"`) lines the scenes up with the voice-over. |
+
+Demo output: [`demo/kerala-offer-asha.mp4`](demo/kerala-offer-asha.mp4), a 15.6 s render for one contact with an ElevenLabs voice-over (~35 s render time).
 
 New template: add a component in `packages/video/src`, register it in `Root.tsx`, then `POST /api/templates` with its `compositionId`.
 

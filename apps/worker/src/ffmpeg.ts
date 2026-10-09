@@ -16,6 +16,8 @@ const VIDEO_FILTERS: Record<Fit, string> = {
   // Center crop: fills the screen, cuts the sides (best for people / talking-head footage)
   crop: 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
 };
+// TTS output levels vary a lot; -16 LUFS is the usual target for phone/social playback
+const VOICE_LOUDNESS = 'loudnorm=I=-16:TP=-1.5:LRA=11';
 const ENCODE_ARGS = [
   '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-profile:v', 'high', '-pix_fmt', 'yuv420p',
   '-g', '60', '-c:a', 'aac', '-ar', '48000', '-ac', '2', '-b:a', '128k', '-movflags', '+faststart',
@@ -73,13 +75,13 @@ export async function normalize(input: string, output: string, opts: NormalizeOp
     // apad keeps the voice "running" silently so music continues after the voice ends;
     // normalize=0 stops amix from halving the voice volume.
     filters.push(
-      '[1:a]apad,asplit=2[sc][vo]',
+      `[1:a]${VOICE_LOUDNESS},apad,asplit=2[sc][vo]`,
       `[${musicIdx}:a]volume=${musicVolume}[m]`,
       '[m][sc]sidechaincompress=threshold=0.02:ratio=20:attack=20:release=300[duck]',
       '[duck][vo]amix=inputs=2:duration=first:normalize=0[a]',
     );
   } else if (voice) {
-    filters.push('[1:a]apad[a]');
+    filters.push(`[1:a]${VOICE_LOUDNESS},apad[a]`);
   } else if (music) {
     filters.push(`[${musicIdx}:a]volume=${musicVolume}[a]`);
   } else if (source.hasAudio) {

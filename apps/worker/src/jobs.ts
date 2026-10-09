@@ -62,17 +62,22 @@ export async function processRender(job: Job<RenderJobData>): Promise<void> {
 
   try {
     const vars: Vars = { ...ctx.vars, name: ctx.name ?? '' };
-    // voiceText / musicUrl / musicVolume drive the audio mix; the rest goes to the Remotion composition
-    const { voiceText, musicUrl, musicVolume, ...props } = fillProps(
+    // voiceUrl / voiceText / musicUrl / musicVolume drive the audio mix; the rest goes to the composition
+    const { voiceUrl, voiceText, musicUrl, musicVolume, ...props } = fillProps(
       { ...ctx.template_props, ...ctx.campaign_props },
       vars,
     );
     const music = typeof musicUrl === 'string' && musicUrl.trim() ? musicUrl.trim() : undefined;
 
+    // A ready-made voice-over (voiceUrl, e.g. "https://…/{phone}.mp3") wins over per-contact TTS
     let voice: string | undefined;
-    if (typeof voiceText === 'string' && voiceText.trim() && ttsConfigured()) {
+    if (typeof voiceUrl === 'string' && voiceUrl.trim()) {
+      voice = voiceUrl.trim();
+    } else if (typeof voiceText === 'string' && voiceText.trim() && ttsConfigured()) {
       voice = path.join(workDir, 'voice.mp3');
       await synthesize(voiceText, voice);
+    }
+    if (voice) {
       const { duration } = await probe(voice);
       props.durationInSeconds = Math.max(MIN_INTRO_SECONDS, Math.ceil((duration + 0.6) * 10) / 10);
     }
