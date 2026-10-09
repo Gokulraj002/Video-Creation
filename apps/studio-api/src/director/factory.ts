@@ -16,6 +16,7 @@ import {
   type StructurePlan,
 } from '@vc/ai-director';
 import { TokenUsageSchema, type AiProviderInfo, type TokenUsage } from '@vc/schema';
+import { z } from 'zod';
 import type { AppConfig } from '../config';
 import type { Logger } from '../lib/logger';
 import { STUDIO_ENGINE_AVAILABILITY } from './engines';
@@ -85,11 +86,20 @@ export function toDirectorLogger(logger: Logger, bindings: Record<string, unknow
   };
 }
 
-/** Token usage carried by a provider error (e.g. a truncated response), if it reports any. */
-function errorTokenUsage(err: unknown): TokenUsage | null {
-  if (!(err instanceof DirectorError) || !('tokenUsage' in err)) return null;
-  const parsed = TokenUsageSchema.safeParse(err.tokenUsage);
-  return parsed.success ? parsed.data : null;
+const ModelUsageListSchema = z.array(z.object({ model: z.string().min(1), usage: TokenUsageSchema }));
+
+/** Billed usage carried by a provider error (refused / truncated responses), per model when known. */
+function errorUsage(err: unknown, fallbackModel: string): ProviderCallUsage[] {
+  if (!(err instanceof DirectorError)) return [];
+  if ('usageByModel' in err) {
+    const parts = ModelUsageListSchema.safeParse(err.usageByModel);
+    if (parts.success && parts.data.length > 0) return parts.data;
+  }
+  if (!('tokenUsage' in err)) return [];
+  const usage = TokenUsageSchema.safeParse(err.tokenUsage);
+  if (!usage.success) return [];
+  const model = 'model' in err && typeof err.model === 'string' && err.model.length > 0 ? err.model : fallbackModel;
+  return [{ model, usage: usage.data }];
 }
 
 /** Delegating provider that reports the usage of every request (used to meter a run's spend while it runs). */
@@ -111,16 +121,26 @@ export class MeteredProvider implements AIProvider {
     return this.inner.mode;
   }
 
+  /** Forwarded: it is part of every director cache key. */
+  get configFingerprint(): string | undefined {
+    return this.inner.configFingerprint;
+  }
+
   async generateStructured<T>(req: StructuredGenerationRequest<T>): Promise<StructuredGenerationResult> {
     let result: StructuredGenerationResult;
     try {
       result = await this.inner.generateStructured(req);
     } catch (err) {
-      const usage = errorTokenUsage(err);
-      if (usage !== null) this.onCall({ model: this.inner.model, usage });
+      for (const part of errorUsage(err, this.inner.model)) this.onCall(part);
       throw err;
     }
-    this.onCall({ model: result.model, usage: result.usage });
+    const parts = result.usageByModel;
+    if (parts !== undefined && parts.length > 0) {
+      // Server-side fallbacks: every hop is billed at its own model's price.
+      for (const part of parts) this.onCall({ model: part.model, usage: part.usage });
+    } else {
+      this.onCall({ model: result.model, usage: result.usage });
+    }
     return result;
   }
 }

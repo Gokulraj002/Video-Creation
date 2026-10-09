@@ -4,7 +4,6 @@ import {
   type CreateProjectRequest,
   type ProjectDetailDTO,
   type ProjectSummaryPage,
-  type ProjectVersionDTO,
   type ProjectVersionSummaryDTO,
   type ResourceLimits,
 } from '@vc/schema';
@@ -219,16 +218,4 @@ export async function versionDtoJson(prisma: PrismaClient, cache: SizeBoundedLru
   const json = JSON.stringify(toVersionDto(row));
   cache?.set(versionId, json);
   return json;
-}
-
-export async function getVersion(
-  prisma: PrismaClient,
-  ownerId: string,
-  projectId: string,
-  version: number,
-): Promise<ProjectVersionDTO> {
-  const id = await findVersionId(prisma, ownerId, projectId, version);
-  const row = await prisma.projectVersion.findUnique({ where: { id } });
-  if (row === null) throw notFound('Project version');
-  return toVersionDto(row);
 }
