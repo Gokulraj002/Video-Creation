@@ -43,10 +43,16 @@ sed -i.bak "s/^STUDIO_API_TOKEN=.*/STUDIO_API_TOKEN=$TOKEN/" apps/studio-web/.en
 
 pnpm studio:db:migrate                    # prisma migrate deploy (reads DATABASE_URL from apps/studio-api/.env)
 pnpm studio:db:seed                       # dev user + the sha256 hash of STUDIO_DEV_API_TOKEN
+pnpm studio:db:seed:demo                  # optional: 4 sample projects with storyboards + previews (mock, no credits)
 pnpm studio:dev:api                       # http://localhost:4100  (GET /health, GET /ready)
 pnpm studio:dev:worker                    # director jobs + stale-run reaper
 pnpm studio:dev:web                       # http://127.0.0.1:3000
 ```
+
+Projects live in your local Postgres database, not in git, so a fresh clone starts with an empty dashboard.
+`pnpm studio:db:seed:demo` adds four sample projects (a Kerala travel reel, a real-estate promo, a SaaS explainer and a
+3-minute SOP training video) by running the real director pipeline on the mock provider. It is safe to re-run: existing
+titles are skipped. Milestone 1 previews each plan as an in-browser animatic; MP4 rendering arrives in Milestone 2.
 
 Without the token step the seed fails (`STUDIO_DEV_API_TOKEN: required by the seed script`) and every web page shows
 "not configured". You can also edit the two files by hand: `STUDIO_DEV_API_TOKEN` in `apps/studio-api/.env` and the same

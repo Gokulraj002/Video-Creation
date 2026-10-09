@@ -12,6 +12,7 @@
     "build": "pnpm -r --if-present build",
     "studio:db:migrate": "pnpm --filter @vc/studio-api db:migrate",
     "studio:db:seed": "pnpm --filter @vc/studio-api db:seed",
+    "studio:db:seed:demo": "pnpm --filter @vc/studio-api db:seed:demo",
     "studio:dev:api": "pnpm --filter @vc/studio-api dev",
     "studio:dev:worker": "pnpm --filter @vc/studio-api dev:worker",
     "studio:dev:web": "pnpm --filter @vc/studio-web dev",

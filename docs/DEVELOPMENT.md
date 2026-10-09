@@ -122,6 +122,17 @@ revoked (`revokedAt` set) stays revoked, and a token row that belongs to another
 `WARNING:` line on stderr; set a new `STUDIO_DEV_API_TOKEN` value to get a working token. See
 [DATABASE.md](DATABASE.md#7-migration-workflow) for schema changes, resets and the test database.
 
+Projects live in the database, not in git, so a fresh clone starts with an empty dashboard. To get sample data:
+
+```bash
+pnpm studio:db:seed:demo   # seeds the dev user (as above), then 4 demo projects with a succeeded run each
+```
+
+The demo seed creates its projects and runs the director through the same services as the API and the worker, so each project
+gets a real, validated Timeline v1 version (storyboard, shot list, animatic preview). It always uses the heuristic mock provider,
+whatever `AI_PROVIDER` says, so it never spends Claude credits; the runs still count toward the daily run quota. It skips any
+demo title the dev user already has, so it is safe to re-run; delete a demo project in the UI to have it re-created.
+
 `studio:db:migrate` runs the Prisma CLI. `apps/studio-api/prisma.config.ts` loads `apps/studio-api/.env` with
 `process.loadEnvFile` (only when the file exists, and without overriding variables already set in the shell), so the CLI uses
 the same `DATABASE_URL` as the API. Without either, it falls back to `postgres://postgres:postgres@localhost:5432/video_studio`.
@@ -745,6 +756,8 @@ psql postgres://postgres:postgres@localhost:5432/video_studio -c 'SELECT id, sta
 | 500 `DATA_INTEGRITY` | A stored row (project request, version timeline or artifacts) fails validation on read. The response is generic; the API log names the entity, id and issues. | Inspect the row named in the log. Usually it was edited by hand or written by incompatible code. |
 | 401 `UNAUTHORIZED` from the API, or the web app says its credentials were rejected | Missing header, a token that was never seeded, a token seeded into a different database than the API uses, or a revoked token (re-seeding never re-activates a revoked token; the seed prints a `WARNING:`) | Make `STUDIO_API_TOKEN` (web) equal `STUDIO_DEV_API_TOKEN` (API), run `pnpm studio:db:seed` again (with a new token value if it warned), and restart the web dev server. Test with `curl -s -o /dev/null -w '%{http_code}\n' "$API/v1/me" -H "Authorization: Bearer $TOKEN"`. |
 | `pnpm studio:db:seed` fails with `STUDIO_DEV_API_TOKEN: required by the seed script` | No token in `apps/studio-api/.env` | Generate one (section 2.3) and put the same value in `apps/studio-web/.env.local` |
+| The dashboard shows "No projects yet" after a fresh clone | Projects are rows in your local database; nothing is stored in git | Create one with **New project**, or run `pnpm studio:db:seed:demo` for 4 sample projects |
+| The Next.js dev badge shows "1 Issue": *attributes of the server rendered HTML didn't match* on `<html>` or `<body>` | A browser extension (Grammarly, ColorZilla, password managers, …) added attributes before React hydrated. `<html>` and `<body>` already ignore this; a mismatch reported deeper in the page is a real bug. | Check in a private window with extensions off. Dev-only: production builds don't show the badge. |
 | Web pages say the API is not configured | `STUDIO_API_TOKEN` is empty, or `STUDIO_API_URL` is not an http(s) URL | Fix `apps/studio-web/.env.local` and restart `pnpm studio:dev:web`. The Settings page shows whether a token is configured. |
 | Web pages say the API is unreachable | studio-api is not running, or `STUDIO_API_URL` points at the wrong port | Start `pnpm studio:dev:api`; check `curl -s http://localhost:4100/health` and `curl -s http://localhost:4100/ready` |
 | The web app cannot be opened from another machine | studio-web binds `127.0.0.1` (section 2.5) | Intended. Put an authenticating proxy in front of it rather than binding it publicly. |

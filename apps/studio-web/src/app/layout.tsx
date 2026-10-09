@@ -27,7 +27,9 @@ export default function RootLayout({ children }: { children: ReactNode }) {
       <head>
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
       </head>
-      <body>
+      {/* Browser extensions (Grammarly, ColorZilla, …) add attributes to <body> before React hydrates; this ignores
+          attribute differences on <body> itself only, so real mismatches inside the app are still reported. */}
+      <body suppressHydrationWarning>
         <AppShell>{children}</AppShell>
       </body>
     </html>
