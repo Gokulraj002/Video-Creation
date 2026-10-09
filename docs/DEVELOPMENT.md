@@ -152,10 +152,15 @@ who can reach studio-web acts as the user whose token it holds, so it is not rea
 ### 2.6 Open the studio
 
 Open <http://127.0.0.1:3000> (`http://localhost:3000` also works when `localhost` resolves to `127.0.0.1`). The dashboard
-lists projects and shows today's runs and estimated cost. **New project** creates a project and starts a director run right
-away. The project page shows the run's progress bar, then the tabs Storyboard, Preview (animatic), Brief, Script, Shot list,
-Timeline JSON, Usage and Request (the stored `VideoRequest`). **Settings** shows the AI provider, queue driver, limits, engine
-availability and the template catalog as reported by the API, plus whether the web app has a token configured.
+shows the project count (the API's `total`), today's runs and estimated cost, this month's tokens and cost, and the most
+recently updated projects; **Projects** pages through all of them. **New project** creates a project and starts a director run
+right away. The project page shows the run's progress bar with Cancel and Re-run (with a live provider, starting or re-running
+asks for confirmation first), a version switcher when the project has more than one version, and the tabs Storyboard, Preview
+(animatic), Brief, Script, Shot list, Timeline JSON, Usage and Request (the stored `VideoRequest`). Only the active tab is
+rendered on the server; the URL carries `?tab=`, `?version=` and, on paginated tabs, `?page=` (Script 150 segments, Shot list
+200 shots, Usage 100 stage calls per page). A missing project answers HTTP 404. **Settings** shows the AI provider, queue
+driver, limits, engine availability and the template catalog as reported by the API, plus whether the web app has a token
+configured.
 
 With the mock provider a 30-second video finishes in about a second (one chapter, 8 steps, 7 mock calls).
 
@@ -294,8 +299,20 @@ a limit below an existing project's request makes that project's next run fail w
 | `STUDIO_API_TOKEN` | none | **Yes** for every page except the health check | **Yes** | Bearer token the web server sends to the API; in development, the `STUDIO_DEV_API_TOKEN` value. Without it pages show a "not configured" state (`CONFIG_MISSING_TOKEN`). |
 
 Fixed in code, not configurable: the web app's API request timeout (15 s), its port (3000) and its bind address
-(`127.0.0.1`), both set in the `dev` and `start` scripts. Browsers poll run status through the same-origin route
-`/api/runs/:runId` (every 1.5 s, backing off to 10 s on errors), so the token never reaches the browser.
+(`127.0.0.1`), both set in the `dev` and `start` scripts. The browser never talks to studio-api; it only calls same-origin
+route handlers that proxy server-side, so the token never reaches it:
+
+| Route | Used by | Behaviour |
+|---|---|---|
+| `GET /api/runs/:runId` | Run panel polling | A slim run (usage totals only), generic error messages. 400 invalid id, 404 not found, 503 when the web app is not configured or its token is rejected, 502 when the API is unreachable. |
+| `GET /api/projects/:id/versions/:v/timeline` | Preview and Timeline JSON tabs (loaded lazily) | The version's timeline, validated against `TimelineSchema` on the server and again in the browser; gzipped above 16 KB when the browser accepts it. |
+| `GET /api/projects/:id/versions/:v/storyboard?chapter=&offset=&limit=` | Storyboard chapters (expanded lazily) | One page of a chapter's storyboard cards, `limit` at most 200 (default 60). |
+
+Polling (`src/lib/run-polling.ts`): every 1.5 s while a run is queued or running, every 5 s after 2 minutes, paused while the
+tab is hidden. 400, 401, 403, 404 and 503 stop polling at once with Reload / Try again; other failures back off 3, 6, 12, 24
+and 30 s and polling stops after 6 consecutive failures. When polling stops, the page re-syncs from the server. Parsed versions
+are cached in the web server (3 entries, 5-minute TTL, keyed by a fingerprint of the token, dropped when the project is
+deleted).
 
 M1 studio-web acts as the single user whose token it holds. Do not expose it publicly without an authenticating proxy in front of
 it ([PRD 7.3](PRD.md#73-security)).
@@ -371,7 +388,7 @@ illustrative cost arithmetic.
 
 | Where | What it shows |
 |---|---|
-| Project page, **Usage** tab | Totals (calls, cached calls, input, output, cache read and write tokens, estimated cost) and a per-stage table (stage, chunk, attempts, cached, tokens, cost) for the selected version's run, plus the latest 20 runs of the project |
+| Project page, **Usage** tab | Totals (calls, cached calls, input, output, cache read and write tokens, estimated cost) and a per-stage table (stage, chunk, attempts, cached, tokens, cost; 100 rows per page) for the selected version's run, plus the latest 20 runs of the project |
 | Dashboard | Runs and estimated cost today (UTC), tokens this month |
 | `GET /v1/usage` | `{today, month}`, each with `runs`, the four token counts and `estimatedCostUsd`, for the calling user |
 | `GET /v1/director-runs/:runId` | The run's `usage` report (`stages[]` and `totals`) |

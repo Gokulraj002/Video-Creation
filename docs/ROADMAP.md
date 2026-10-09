@@ -85,7 +85,10 @@ Why each edge exists:
 
 ## M1: Foundation
 
-**Status: In progress.**
+**Status: In progress.** Every deliverable below exists in the code and passed an adversarial review (2026-10-09); the review's
+fixes are recorded in the [M1 spec amendments](milestones/M1_IMPLEMENTATION_SPEC.md#amendments-after-review-2026-10-09). What
+keeps M1 open: the manual checks, the live check and CI on the final branch (exit criteria below), and the
+[known gaps](#known-gaps-carried-out-of-m1).
 
 ### Goal
 
@@ -116,9 +119,9 @@ package manifests touched by the pnpm migration.
 |---|---|---|
 | repo root | — | `pnpm-workspace.yaml`, `pnpm-lock.yaml`, root `studio:*` and `campaigns:*` scripts, `docker/postgres/init-databases.sql` (creates `video_studio` and `video_studio_test`), CI on pnpm with Postgres and Redis services and `AI_PROVIDER=mock`. |
 | `packages/schema` | `@vc/schema` | Isomorphic Zod v4 schemas and types: common primitives (ids, hex colours, frames, safe URIs), render settings and `resolveDimensions`, frame math (`secondsToFrames`, largest-remainder `allocateFrames`, `formatTimecode`), assets, camera tracks and `expandCameraPreset`, transitions, 2D layers, scene content for 6 engines, scenes, chapters, brand kit, tracks, **Timeline v1** with invariants, resource limits, migrations, `ReferenceProfile` v1, LLM-safe director artifacts, the template catalog (14 templates: 11 `motion2d`, 3 `three`), API DTOs. |
-| `packages/ai-director` | `@vc/ai-director` | `AIProvider` interface; `HeuristicMockProvider` (default), `ScriptedMockProvider` (tests), `AnthropicProvider` (structured outputs, refusal fallbacks, typed error mapping, prompt-mode retry); `toStructuredOutputSchema`; pricing and usage tracking; content-hash stage cache (`MemoryDirectorCache`); `planStructure`; `AIDirector.planProject` and `regenerateScene`; repair loop and semantic validators; deterministic timeline compiler; versioned prompts (`PROMPT_VERSION = 'm1.0'`). |
-| `apps/studio-api` | `@vc/studio-api` | Fastify 5 API on port 4100; Prisma 7 schema and initial migration (`User`, `ApiToken`, `Project`, `ProjectVersion`, `DirectorRun`, `DirectorCacheEntry`); hashed bearer-token auth; owner-scoped routes for health, me, system config, projects, director runs, versions and usage; resource limits, daily quotas, per-token rate limit; BullMQ worker and inline queue; Prisma-backed director cache; seed script. |
-| `apps/studio-web` | `@vc/studio-web` | Next.js 16 App Router on port 3000: dashboard, new-project form, project page (run progress, Cancel, Re-run; tabs Storyboard, Preview (Remotion Player animatic), Brief, Script, Shot list, Timeline JSON, Usage), settings page; server-only API client; run-polling route handler; loading, error and not-found states. |
+| `packages/ai-director` | `@vc/ai-director` | `AIProvider` interface (with a config fingerprint); `HeuristicMockProvider` (default), `ScriptedMockProvider` (tests), `AnthropicProvider` (structured outputs, refusal fallbacks, typed error mapping, prompt-mode retry remembered per schema, per-model usage); `toStructuredOutputSchema`; pricing, usage tracking and run cost ceilings (`estimateRunCostCeilingUsd`); content-hash stage cache (`MemoryDirectorCache`) keyed by prompt, input and provider settings; `planStructure`; `AIDirector.planProject` and `regenerateScene` (no cache, stored-duration checks); repair loop and semantic validators; deterministic timeline compiler; versioned prompts (`PROMPT_VERSION = 'm1.1'`). |
+| `apps/studio-api` | `@vc/studio-api` | Fastify 5 API on port 4100; Prisma 7 schema and three migrations (`User`, `ApiToken`, `Project`, `ProjectVersion`, `DirectorRun`, `DirectorCacheEntry`); hashed bearer-token auth; owner-scoped routes for health, readiness, me, system config, projects, director runs, versions and usage; resource limits; per-user quotas (active runs, runs per day, USD per day with cost-ceiling reservations and a live spend stop); per-IP failed-auth and per-user rate limits; BullMQ worker with heartbeats, a stale-run reaper and shutdown handling, and the inline queue; fail-fast enqueue; immutable version caching (summary columns, ETag); Prisma-backed per-user director cache; seed script. |
+| `apps/studio-web` | `@vc/studio-web` | Next.js 16 App Router on `127.0.0.1:3000`: dashboard, project list, new-project form, project page (run progress, Cancel, Re-run with a confirmation in live mode, version switcher; tabs Storyboard, Preview (Remotion Player animatic), Brief, Script, Shot list, Timeline JSON, Usage, Request, with only the active tab rendered and lazy timeline and storyboard loading), settings page; server-only API client; run-polling and lazy-loading route handlers; security headers; loading, error and not-found states. |
 | `docs/` | — | PRD, ARCHITECTURE, AI_DIRECTOR, TIMELINE_SCHEMA, DATABASE, ROADMAP, DECISIONS, DEVELOPMENT. |
 
 Build order inside M1 (arrows point from a package to the packages that consume it):
@@ -138,22 +141,25 @@ flowchart LR
 |---|---|
 | Rendering to MP4 or any other export | M2 |
 | Template render components. The M1 preview is an animatic of branded cards, not the templates themselves. | M2 (2D), M5 (3D) |
-| Editing scenes, text or colours; reordering scenes; a versions UI | M2 |
+| Editing scenes, text or colours; reordering scenes; comparing or restoring versions (M1 only switches between them) | M2 |
 | An HTTP endpoint or UI for regenerating one scene. The library function `regenerateScene` exists and is tested. | M2 |
 | Uploads, storage and reference analysis. The `ReferenceProfile` schema exists; nothing produces profiles. | M3 |
 | Text-to-speech, music and audio mixing. Voice-over text and a caption track derived from it are in the timeline. | M4 |
 | 3D rendering. 3D scenes can be planned and appear as animatic cards. | M5 |
 | Video-generation providers, and the footage, image and screen engines. They are reported unavailable, and the director coerces such choices to `motion2d` with a warning. | M6 |
+| Fetching asset URIs on the server, and the resolved-address (SSRF) check that goes with it | M3 |
 | Login UI, teams, billing | M8 |
 
 ### Exit criteria and verification
 
-Ticked at M1 close. Nothing is ticked yet because M1 is in progress.
+Ticked when verified. The automated checks were run locally on 2026-10-09, after the review fixes: `pnpm typecheck` passed
+for every package, and the test suites passed with 723 (`@vc/schema`), 184 (`@vc/ai-director`), 103 (`@vc/studio-api`),
+94 (`@vc/studio-web`) and 8 (`@vc/core`) tests. `pnpm build` and CI were not re-run for this revision.
 
-- [ ] `pnpm --filter @vc/schema typecheck` and `test` pass. Tests cover the `resolveDimensions` examples, `allocateFrames`
+- [x] `pnpm --filter @vc/schema typecheck` and `test` pass. Tests cover the `resolveDimensions` examples, `allocateFrames`
       (exact sums, minimums, tie-breaking, `RangeError`), every timeline invariant with a precise error path, `SafeUriSchema`
       rejections, limits, and migrations with an injected fake v0→v1 migration.
-- [ ] `pnpm --filter @vc/ai-director typecheck` and `test` pass with no network access. Tests cover: valid and invalid
+- [x] `pnpm --filter @vc/ai-director typecheck` and `test` pass with no network access. Tests cover: valid and invalid
       fixtures for every LLM-facing schema; `toStructuredOutputSchema` stripping unsupported keywords and closing objects;
       the full pipeline with `HeuristicMockProvider` for genres × {5 s, 30 s, 10 min, 25 min, 2 h} (valid timeline, exact
       frame sums, chunked chapters, scene counts in range); repair success and exhaustion (`VALIDATION_FAILED`); a second
@@ -162,16 +168,17 @@ Ticked at M1 close. Nothing is ticked yet because M1 is in progress.
       (model, `output_config.effort` and `format`, system `cache_control`, `betas` plus `fallbacks`, no `thinking` or
       `temperature`) and response handling (text extraction, usage mapping, refusal, `max_tokens`, BadRequest → prompt-mode
       retry) against an injected fake client.
-- [ ] `pnpm --filter @vc/studio-api typecheck` and `test` pass against `video_studio_test` (migrated with
+- [x] `pnpm --filter @vc/studio-api typecheck` and `test` pass against `video_studio_test` (migrated with
       `prisma migrate deploy`). Tests cover: health; 401 without a token and with a bad token; project create, list, get and
       delete; 400 validation; 422 limits; owner isolation (404); a director run end to end producing version 1, whose timeline
       re-parses with `TimelineSchema`, and usage; a second run producing version 2 with cache hits and 0 new tokens; 409 on a
       concurrent run; cancel; 429 quota; a provider failure recorded as run `FAILED` with a code; system config containing no
-      secrets.
-- [ ] The initial Prisma migration SQL is committed under `apps/studio-api/prisma/migrations`.
+      secrets. Since the review also: readiness, quota reservations and the live spend stop, rate limits, the reaper,
+      shutdown, fail-fast enqueue, version caching and `DATA_INTEGRITY`.
+- [x] The Prisma migration SQL is committed under `apps/studio-api/prisma/migrations` (three migrations).
 - [ ] `pnpm --filter @vc/studio-web typecheck`, `test` (pure helpers: duration formatting and parsing, form → `VideoRequest`
-      mapping) and `build` pass.
-- [ ] The campaigns MVP still typechecks and `pnpm --filter @vc/core test` passes under the pnpm workspace.
+      mapping) and `build` pass. Typecheck and test pass; `build` not re-run for this revision.
+- [x] The campaigns MVP still typechecks and `pnpm --filter @vc/core test` passes under the pnpm workspace.
 - [ ] CI passes on the M1 branch.
 - [ ] Manual check with `AI_PROVIDER=mock` and `QUEUE_DRIVER=bullmq`: start the API, the worker and the web app; create a
       project; watch progress; open every tab; play the animatic; cancel a run; re-run and see cached calls in the Usage tab.
@@ -190,8 +197,9 @@ Ticked at M1 close. Nothing is ticked yet because M1 is in progress.
 | Risk | Mitigation in M1 |
 |---|---|
 | Live Claude behaviour (validity rate, refusals, latency, cost) is not covered by CI. | Repair loop, prompt-mode fallback, server-side refusal fallbacks, the manual live check. An automated live evaluation is PRD Q15. |
-| Long live runs may exceed `DIRECTOR_RUN_TIMEOUT_MS` (default 30 min). A 2 h `long-form` plan makes 127 sequential LLM calls. If a call takes 30 s (not measured), the run needs over an hour. | Operators raise the timeout for long requests. Record real per-call latency in the live check. Parallel chapters may be revisited after measurement ([ADR-010](DECISIONS.md#adr-010-chapter-chunked-generation-for-long-videos)). |
-| The scene-specs output schema is a union over the whole template catalog and could be rejected by the structured-output endpoint as too complex. | The adapter retries once in prompt mode on a schema-related 400 ([ADR-006](DECISIONS.md#adr-006-claude-structured-outputs-instead-of-forced-tool-use)). |
+| Long live runs take hours. A 2 h `long-form` plan makes 127 sequential LLM calls; at 30 s per call (not measured) that is over an hour. | The run timeout scales with the plan (`max(DIRECTOR_RUN_TIMEOUT_MS, steps × DIRECTOR_STEP_TIMEOUT_MS)`, 4 h 16 min for that plan). Record real per-call latency in the live check. Parallel chapters may be revisited after measurement ([ADR-010](DECISIONS.md#adr-010-chapter-chunked-generation-for-long-videos)). |
+| Live spend on long videos. | Each run reserves its cost ceiling against the daily USD cap and is stopped when the cap is reached ([ADR-018](DECISIONS.md#adr-018-spend-caps-enforced-with-a-per-run-cost-ceiling-reservation-and-a-live-budget-check)). With the default $25 a 2 h `long-form` video on `claude-opus-5-5` cannot start; operators raise the cap deliberately. |
+| The scene-specs output schema could be rejected by the structured-output endpoint as too complex. | The schema contains only the templates selected for the chapter, and the adapter retries once in prompt mode on a schema-related 400 and remembers the rejection per schema ([ADR-006](DECISIONS.md#adr-006-claude-structured-outputs-instead-of-forced-tool-use)). |
 | Four packages are built at the same time against one contract, so they can drift apart. | All DTOs live in `@vc/schema`. studio-web validates every API response with those schemas, and the API tests re-parse stored timelines. |
 | The animatic could be mistaken for final output, and mock output for real AI output. | The UI labels the preview as an animatic and shows mock mode explicitly. |
 
@@ -232,7 +240,8 @@ endpoint and UI, a project versions UI.
 - Decisions on PRD open questions Q1 (is `three` reported available before M5), Q3 (burned-in captions and/or SRT/VTT),
   Q4 (first codecs), Q6 (bypassing the stage cache for a fresh take), Q12 (containerizing the studio apps) and Q15 (live
   evaluation).
-- A stale-run reaper for director runs (see [Known gaps](#known-gaps-carried-out-of-m1)).
+- Candidates carried from M1 ([Known gaps](#known-gaps-carried-out-of-m1)): response compression in studio-api, a paginated
+  version list, and the M1 live check if it has not been done.
 
 ### Exit criteria and verification
 
@@ -282,6 +291,10 @@ transcription adapter; camera-movement classification; `ReferenceProfile` genera
 - An S3-compatible storage driver (S3, MinIO, R2) behind the storage interface from M2, with MinIO added to local development.
 - Upload endpoints with configurable size limits, MIME sniffing from file content (not the extension or the client's header),
   persisted asset records, and `asset://` references in timelines.
+- A guarded fetcher for `https:` asset URIs (ingest, analysis, and later the renderers): it resolves the host and refuses
+  private, loopback, link-local, carrier-grade NAT and cloud-metadata addresses at fetch time, re-checks every redirect and
+  pins the checked address for the connection. `SafeUriSchema` only checks the URI's shape (no IP literals, no local names) and
+  does not resolve DNS ([TIMELINE_SCHEMA.md section 10.2](TIMELINE_SCHEMA.md#102-safeuri-rules)).
 - Analysis jobs on the queue, cancellable: ffprobe metadata, scene detection, keyframe sampling (downscaled stills), audio
   extraction, a transcription adapter (mock by default), palette extraction, typography, transition and camera-movement
   classification, and pacing (average shot length, cuts per minute).
@@ -294,6 +307,8 @@ transcription adapter; camera-movement classification; `ReferenceProfile` genera
 
 - An upload whose content does not match its declared type or extension is rejected. Oversize uploads are rejected before they
   are fully read.
+- A test fetch of an `https:` URI whose host resolves to a private, loopback or metadata address is refused, including through
+  a redirect.
 - A sample reference video yields a `ReferenceProfile` that passes the schema, and a `reference-based` run uses its
   `pacing.averageShotSeconds`.
 - Tests assert that provider requests contain only image blocks and text, with no video payload.
@@ -518,7 +533,7 @@ OIDC auth, teams, billing and quotas, observability, sandboxed workers, backups,
   ([ADR-015](DECISIONS.md#adr-015-m1-auth-is-hashed-per-user-bearer-tokens-oidc-in-m8)).
 - Organizations and teams with roles; project sharing.
 - Billing, plans and per-plan quotas, replacing the deployment-wide env limits as the main control (PRD Q14).
-- Director-cache scoping and eviction (PRD Q5).
+- Director-cache eviction and organization scope (PRD Q5; the cache is already per user).
 - Metrics, tracing, dashboards and alerting (queue depth, run and render failure rates, cost).
 - Render and analysis workers in sandboxes: isolated containers, no outbound network by default, restricted filesystem.
 - Postgres backups with tested restores; object-storage versioning; CDN for delivery.
@@ -549,18 +564,41 @@ OIDC auth, teams, billing and quotas, observability, sandboxed workers, backups,
 
 ## Known gaps carried out of M1
 
-Found while writing M1. They are not part of any milestone's scope above unless a milestone says so. Each needs an owner.
+Found while writing and reviewing M1. They are not part of any milestone's scope above unless a milestone says so. Each needs
+an owner.
 
 | Gap | Impact | Suggested handling |
 |---|---|---|
-| A worker crash can leave a director run `RUNNING`. BullMQ may redeliver the stalled job, but processing skips any run that is not `QUEUED`, so nothing resumes it. | The project stays blocked with 409 `RUN_ACTIVE` until the user cancels the run. | A stale-run reaper (heartbeat, or `startedAt` + `DIRECTOR_RUN_TIMEOUT_MS`). Listed in M2. |
-| Live 2 h runs probably exceed the default `DIRECTOR_RUN_TIMEOUT_MS` of 30 min (not measured). | Long live runs time out and fail; a rerun reuses the cached chapters. | Measure in the live check; document a recommended timeout per duration in DEVELOPMENT.md. |
-| `DirectorCacheEntry` has no eviction or TTL, and the cache is shared by all users of a deployment. | Unbounded table growth. A cache hit reveals that someone else submitted an identical request. | PRD Q5. M8 at the latest. |
-| The cache key covers the prompt text and schema name, not the schema body. | Changing an LLM-facing schema or template props schema without changing the prompt text could serve stale cached outputs. | Rule: bump `PROMPT_VERSION` on any change to a prompt, an LLM-facing schema or a template props schema. |
-| studio-web acts as one configured API user. | Anyone who can reach studio-web acts as that user. It must not be exposed publicly without an authenticating proxy. | Documented in PRD 7.3. Fixed by OIDC in M8. |
-| M1 has no endpoint to issue or revoke API tokens; the seed script creates the dev token. | Extra users or token rotation need manual database work. | An admin CLI if needed before M8; OIDC in M8. |
+| Live latency and cost have not been measured. Chapters run sequentially, so a live multi-hour plan takes hours (a 2 h `long-form` plan is 127 sequential calls). | Timeout scaling and cost ceilings are estimates; a live 2 h run may hit the scaled timeout (4 h 16 min by default) or need a higher `DIRECTOR_STEP_TIMEOUT_MS`. | The M1 live check; record per-call latency and cost, then tune the defaults in DEVELOPMENT.md. |
+| The default daily spend cap blocks long videos on large models. With `LIMIT_DIRECTOR_USD_PER_DAY=25` on `claude-opus-5-5`, the most chapters one run can have is 13 (about 1 h of `long-form`); a 2 h `long-form` run reserves $46.48 and is refused. | Deliberate (the ceiling assumes every call produces its full `max_tokens`), but surprising for a product that advertises 2 h videos. | Documented in DEVELOPMENT.md section 4.4. Revisit the ceiling's input budgets and the default cap after the live check. |
+| The reserved cost ceiling assumes one attempt per call; repairs are not reserved. | Spend can exceed the cap by what the stages in flight cost after it is reached (the live check stops the run before the next stage). | Accept for M1; a per-call usage ledger with billing (M8). |
+| `DirectorCacheEntry` has no eviction or TTL. Rows written before the M1 review (`PROMPT_VERSION` `m1.0`, older key composition) are orphans that no run can hit. | Unbounded table growth. (The cache is scoped per user, so a hit no longer reveals another user's request.) | Age-based cleanup (DATABASE.md section 9); PRD Q5, M8 at the latest. |
+| The cache key covers the prompt text, the stage input and the provider settings, but not the schema body. | Changing an LLM-facing schema or template props schema without changing the prompt text could reuse an output that still validates under the new schema. | Rule: bump `PROMPT_VERSION` on any change to a prompt, an LLM-facing schema or a template props schema. |
+| `@fastify/compress` is not installed: studio-api sends JSON uncompressed. | A multi-hour version (several MB of timeline JSON) crosses the API-to-web hop uncompressed. The web app gzips its own `/api/...` responses to the browser, and versions are cached on both sides (ETag and an in-process LRU in the API, a small TTL cache in the web server). | Add response compression in M2 when versions grow. |
+| The version list is capped at the latest 100 versions and not paginated (`GET /v1/projects/:id/versions` returns a plain array). | Older versions of a project with more than 100 runs cannot be listed, though each one is still reachable by number. | A paginated list with the M2 versions UI. |
+| The heuristic mock writes English whatever the request `language`. | Mock runs of non-English requests look wrong; only Claude follows the language tag. | Accept (the mock exercises code paths, not content); document in the UI if it confuses users. |
+| A run reaped as `WORKER_LOST` keeps only the usage written with its last progress update and has no per-stage report. | The spend of the stage in flight when the worker died is missing from usage and quotas. | Accept for M1; a per-call usage ledger (M8). |
+| `DirectorRun.warnings` is stored but not exposed by the API, so the UI does not show engine coercions or truncated captions. | Users cannot see why a scene uses another engine. | Add warnings to `DirectorRunDTO` with the M2 editor. |
+| studio-web acts as one configured API user. | Anyone who can reach studio-web acts as that user. It binds `127.0.0.1` by default and must not be exposed publicly without an authenticating proxy. | Documented in PRD 7.3. Fixed by OIDC in M8. |
+| M1 has no endpoint to issue or revoke API tokens; the seed script creates the dev token and never re-activates a revoked one. | Extra users or token rotation need manual database work. | An admin CLI if needed before M8; OIDC in M8. |
 | No automated live-provider evaluation. | Prompt or model regressions are invisible to CI, which only runs the mock. | PRD Q15, decided in M2. |
 | `three` is reported available for planning although nothing renders it until M5. footage, image and screen report "requires uploaded assets (Milestone 3)", but they render only from M6. | The settings page can suggest more than the product does. | PRD Q1 and Q2. Decide in M2 and M3, and adjust the reasons then. |
-| The Prisma client is generated into a gitignored folder and no install hook generates it. CI runs `db:generate` explicitly, but the README quick start has no such step. | A fresh clone that follows the README may fail to start studio-api. | Add `pnpm --filter @vc/studio-api db:generate` to the README quick start and DEVELOPMENT.md. |
+| `SafeUriSchema` checks URI shape only; it does not resolve DNS. | Harmless in M1, which fetches nothing. A fetcher that trusted it could be pointed at a private address through a public name. | The guarded fetcher in M3 scope. |
+| The Remotion Player is used without `acknowledgeRemotionLicense`. | The Player may log Remotion's license notice in the browser console. Companies with more than 3 employees need a Remotion company license. | Owner decision on licensing; set the prop only after it. |
 
-Resolved during M1: CI and the root README were moved from npm to pnpm together with the workspace migration.
+Resolved during M1:
+
+- CI and the root README were moved from npm to pnpm together with the workspace migration.
+- The Prisma client is generated by the `@vc/studio-api` `postinstall` script, and `prisma.config.ts` loads
+  `apps/studio-api/.env`; the README quick start covers install, the dev token, migrate and seed.
+- A worker crash no longer leaves a run `RUNNING`: runs heart-beat, and a stale-run reaper fails them with `WORKER_LOST`
+  (and lost queued runs with `QUEUE_LOST`); shutdowns record `SHUTDOWN`
+  ([ADR-019](DECISIONS.md#adr-019-run-heartbeat-and-stale-run-reaper-failed-runs-are-never-re-queued)).
+- Long runs no longer hit a fixed 30-minute timeout: it scales with the plan's step count.
+- The stage cache is scoped per user and keyed by the stage input and provider settings
+  ([ADR-020](DECISIONS.md#adr-020-stage-cache-scoped-per-user-and-keyed-by-stage-input-and-provider-configuration)).
+- The daily USD quota is no longer soft: active runs reserve their cost ceilings under a per-user lock, and running runs stop
+  at the cap ([ADR-018](DECISIONS.md#adr-018-spend-caps-enforced-with-a-per-run-cost-ceiling-reservation-and-a-live-budget-check)).
+- A versions switcher exists on the project page, and the Request tab shows the stored request.
+- Redis outages no longer hang a run start: the enqueue fails fast with 503 `QUEUE_UNAVAILABLE`, and `GET /ready` reports
+  the outage.

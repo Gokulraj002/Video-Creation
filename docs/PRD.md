@@ -142,7 +142,7 @@ to be met. M1 rows describe what M1 delivers; everything else is planned.
 | ID | Requirement | Milestone |
 |---|---|---|
 | DASH-1 | List the user's projects, most recently updated first, with cursor pagination. Show title, status (`draft`, `directing`, `ready`, `failed`), genre, duration, aspect ratio and current version. | M1 |
-| DASH-2 | Stat cards: number of projects, director runs today, tokens and estimated cost this month. | M1 |
+| DASH-2 | Stat cards: number of projects (the API's `total` over all pages), director runs today with today's estimated cost, tokens and estimated cost this month. | M1 |
 | DASH-3 | Empty state that leads to creating the first project. | M1 |
 | DASH-4 | Delete a project. Refused with 409 while a director run is queued or running. | M1 (API) |
 | DASH-5 | Render/export status and thumbnails per project. | M2 |
@@ -153,9 +153,9 @@ to be met. M1 rows describe what M1 delivers; everything else is planned.
 
 | ID | Requirement | Milestone |
 |---|---|---|
-| CREATE-1 | Form fields: title (1 to 200 chars), prompt (up to `LIMIT_MAX_PROMPT_CHARS`, default 20 000), genre (14 values), style notes (up to 2 000). | M1 |
-| CREATE-2 | Duration entered as a value plus unit (s, min, h). No hardcoded maximum. The form shows the configured limit from `GET /v1/system/config`, and the API rejects requests above it with 422 `LIMIT_EXCEEDED`. | M1 |
-| CREATE-3 | Aspect ratio (9:16, 16:9, 1:1, 4:5, custom W×H with even dimensions from 16 to 8192), resolution (480p to 2160p or custom), fps (schema 1 to 240, default 30, capped by `LIMIT_MAX_FPS` whose default is 60), language (BCP-47, default `en`). | M1 |
+| CREATE-1 | Form fields: title (1 to 200 chars), prompt (up to the lower of `LIMIT_MAX_PROMPT_CHARS` and the schema's 20 000), genre (14 values), style notes (up to 2 000). Title and prompt are trimmed and must contain a visible character. An invalid submit focuses the first invalid field and shows one summary alert. | M1 |
+| CREATE-2 | Duration entered as a value plus unit (s, min, h), with one decimal separator (`.` or `,`); ambiguous thousands forms such as `1,000` and absurdly large numbers are rejected. No hardcoded maximum. The form shows the configured limit from `GET /v1/system/config`, and the API rejects requests above it with 422 `LIMIT_EXCEEDED`. | M1 |
+| CREATE-3 | Aspect ratio (9:16, 16:9, 1:1, 4:5, custom W×H with even dimensions from 16 to 8192), resolution (480p to 2160p or custom), fps (schema 1 to 240, default 30, capped by `LIMIT_MAX_FPS` whose default is 60), language (BCP-47, default `en`). A custom resolution with a preset aspect ratio must match that ratio within ±1 px per side; a custom aspect ratio uses the custom W×H and ignores the resolution preset. | M1 |
 | CREATE-4 | Brand name and up to 5 colour inputs in the M1 form. The API contract additionally accepts up to 8 colours, heading and body fonts, and a logo asset id. | M1 |
 | CREATE-5 | Voice-over (toggle, style, gender) and music (toggle, mood). In M1 these set intent only: voice-over text is scripted and a caption track is derived from it. No audio is generated until M4. | M1 (intent) / M4 (audio) |
 | CREATE-6 | On submit: validate with `VideoRequestSchema` in a Server Action, create the project, start a director run, redirect to the project page. | M1 |
@@ -184,13 +184,13 @@ to be met. M1 rows describe what M1 delivers; everything else is planned.
 | DIR-3 | Long videos are generated chapter by chapter. Videos over 120 s get `max(ceil(duration / 300), ceil(expectedScenes / 24))` chapters, capped by `LIMIT_MAX_CHAPTERS`. Each chapter receives the previous chapter's title and summary for continuity. | M1 |
 | DIR-4 | Every LLM output is checked with Zod and then a stage-specific semantic validator. Failures are re-requested as fresh single-turn prompts with the validation errors, up to `DIRECTOR_MAX_REPAIR_ATTEMPTS` (default 2), and then fail with `VALIDATION_FAILED`. | M1 |
 | DIR-5 | Templates are selected from the fixed catalog; props are validated against the template's schema. | M1 |
-| DIR-6 | Engine selection per scene. A choice of an unavailable engine is coerced deterministically to `motion2d` with a genre-appropriate template, and a warning is recorded. | M1 |
+| DIR-6 | Engine selection per scene. A choice of an unavailable engine is coerced deterministically to `motion2d` with a genre-appropriate template (to `three` when `motion2d` is disabled), and a warning is recorded. | M1 |
 | DIR-7 | Brand consistency: a brand kit built from the request colours and the brief palette; the brief carries brand-consistency notes that later stages receive. | M1 |
-| DIR-8 | Token usage and estimated cost per stage and chunk, with run totals and cached-call counts. | M1 |
-| DIR-9 | Stage cache keyed by a content hash. Only validated outputs are cached. A rerun with identical inputs makes no provider calls. | M1 |
+| DIR-8 | Token usage and estimated cost per stage and chunk, with run totals and cached-call counts. Refused and truncated attempts are counted, and server-side fallback hops are priced per model. A deterministic cost ceiling per run is available before the run starts. | M1 |
+| DIR-9 | Stage cache keyed by a content hash of the rendered prompt, the structured stage input and the provider configuration, scoped per user. Only validated outputs are cached. A rerun with identical inputs makes no provider calls. | M1 |
 | DIR-10 | Run progress (completed and total steps, current stage, message) is persisted and shown. Runs can be cancelled while queued or running. | M1 |
-| DIR-11 | Regenerate one scene with optional instructions, keeping its id and duration and leaving every other scene unchanged. | M1 (library: `regenerateScene`); M2 (API endpoint and UI) |
-| DIR-12 | Prompt-injection hardening: the user prompt, style notes and reference data are wrapped in tags and the system prompt declares them untrusted data, never instructions. | M1 |
+| DIR-11 | Regenerate one scene with optional instructions, keeping its id and duration and leaving every other scene unchanged. A regeneration always makes fresh provider calls (no cache). | M1 (library: `regenerateScene`); M2 (API endpoint and UI) |
+| DIR-12 | Prompt-injection hardening: the user prompt, style notes, reference data and earlier stage outputs are wrapped in tags and the system prompt declares them untrusted data, never instructions. `<user_instructions>` (scene regeneration only) is the one directive tag, limited to creative direction. Model-written text never appears in the `<task>` line. | M1 |
 | DIR-13 | Never asks the model for code and never executes model output. | M1 |
 | DIR-14 | Provider is selected by env: `mock` (default) or `anthropic`. Model, effort, max output tokens, refusal fallbacks and structured-output mode are configurable. | M1 |
 | DIR-15 | Vision input (sampled reference frames) for reference-based planning. | M3 |
@@ -225,10 +225,10 @@ to be met. M1 rows describe what M1 delivers; everything else is planned.
 
 | ID | Requirement | Milestone |
 |---|---|---|
-| EDIT-1 | Project header with status badge and run progress bar. Cancel and Re-run buttons call real endpoints. Only actions that work are shown. | M1 |
-| EDIT-2 | Tabs: Storyboard (scene cards with timecodes, duration, engine and template badges, shot info, voice-over, on-screen text), Preview, Brief, Script, Shot list, Timeline JSON (copy button), Usage. | M1 |
+| EDIT-1 | Project header with status badge and run progress bar. Cancel and Re-run buttons call real endpoints; with a live (credit-spending) provider, starting or re-running asks for confirmation. Only actions that work are shown. | M1 |
+| EDIT-2 | Tabs: Storyboard (scene cards with timecodes, duration, engine and template badges, shot info, voice-over, on-screen text; chapters load lazily), Preview, Brief, Script, Shot list, Timeline JSON (copy button), Usage, Request (the stored request). Only the active tab is rendered; long tabs are paginated. A version switcher shows when a project has several versions. | M1 |
 | EDIT-3 | Preview is an **animatic** in the Remotion Player: each scene is a branded card showing the scene title, primary template text and an engine badge, with caption cues and fade/slide transitions, timed by the timeline's integer frames. It is not the final template rendering. | M1 |
-| EDIT-4 | Basic editor: scene list and reorder, text and colour edits validated against template props, regenerate scene, project versions UI. | M2 |
+| EDIT-4 | Basic editor: scene list and reorder, text and colour edits validated against template props, regenerate scene, a richer versions UI (compare, restore). M1 already has a version switcher. | M2 |
 | EDIT-5 | Editor v2: tracks, transitions, audio editing. | M7 |
 
 ### 6.8 Rendering and export (RND)
@@ -249,7 +249,7 @@ to be met. M1 rows describe what M1 delivers; everything else is planned.
 
 | ID | Requirement | Milestone |
 |---|---|---|
-| AUD-1 | One caption track per timeline when voice-over is enabled, with cues of up to 7 words, timed proportionally to word count within each scene. | M1 |
+| AUD-1 | One caption track per timeline when voice-over is enabled, with cues of up to 7 words and 80 characters, timed proportionally to word count within each scene. Languages written without spaces are word-segmented with `Intl.Segmenter`. | M1 |
 | AUD-2 | TTS and music provider adapters; voice-over and music generation. | M4 |
 | AUD-3 | Voice-over alignment and word-timed captions. | M4 |
 | AUD-4 | Music ducking under voice and loudness normalization. The campaigns worker already does sidechain ducking and normalizes voice to -16 LUFS; the export target is open. | M4 |
@@ -258,8 +258,9 @@ to be met. M1 rows describe what M1 delivers; everything else is planned.
 
 | ID | Requirement | Milestone |
 |---|---|---|
-| AST-1 | `AssetRef` schema. URIs accept only `asset://` (internal storage reference) and `https:`; `http:`, `file:`, `data:`, `javascript:`, embedded credentials and control characters are rejected. | M1 (schema) |
+| AST-1 | `AssetRef` schema. URIs accept only `asset://<assetId>` (internal storage reference) and `https://` with a fully-qualified DNS host; other schemes, credentials, IP literals, local host names, dot segments, control and invisible characters are rejected, and URIs are stored normalized. | M1 (schema) |
 | AST-2 | S3-compatible storage (S3, MinIO, R2). | M3 |
+| AST-5 | Server-side fetches of `https:` asset URIs resolve the host and refuse private, loopback, link-local and metadata addresses at fetch time (the schema checks shape only). | M3 |
 | AST-3 | Uploads with configurable size limits and MIME sniffing from file content, not only the extension or the client header. | M3 |
 | AST-4 | GLB model uploads for 3D scenes. | M5 |
 
@@ -269,8 +270,8 @@ to be met. M1 rows describe what M1 delivers; everything else is planned.
 |---|---|---|
 | USE-1 | Per-stage usage table: stage, chunk, attempts, cached, tokens, estimated cost. | M1 |
 | USE-2 | `GET /v1/usage`: today (UTC day) and this month, with runs, token counts and estimated USD. | M1 |
-| USE-3 | Daily per-user quotas: `LIMIT_DIRECTOR_RUNS_PER_DAY` (default 50) and `LIMIT_DIRECTOR_USD_PER_DAY` (default 25). Exceeding either returns 429 `QUOTA_EXCEEDED`. | M1 |
-| USE-4 | Rate limit per API token (`RATE_LIMIT_PER_MINUTE`, default 300). | M1 |
+| USE-3 | Per-user quotas, checked under a per-user lock: `LIMIT_ACTIVE_RUNS_PER_USER` (default 2 queued or running runs), `LIMIT_DIRECTOR_RUNS_PER_DAY` (default 50) and `LIMIT_DIRECTOR_USD_PER_DAY` (default 25). The USD quota reserves each active run's cost ceiling, so a run that could exceed the remaining budget does not start (on `claude-opus-5-5` at $25, about one hour of `long-form` video at most), and a running run is stopped once today's spend reaches the limit. Exceeding a quota at start returns 429 `QUOTA_EXCEEDED`. | M1 |
+| USE-4 | Rate limits: per authenticated user (`RATE_LIMIT_PER_MINUTE`, default 300), and per client IP for failed authentications, checked before any token lookup (`RATE_LIMIT_UNAUTH_PER_MINUTE`, default 60). | M1 |
 | USE-5 | Resource limits (duration, dimensions, fps, scenes, chapters, prompt length) configurable via env. | M1 |
 | USE-6 | Pricing table in code, overridable with `DIRECTOR_PRICING_JSON`. An unknown model records cost 0 with `pricingKnown = false` instead of guessing. | M1 |
 | USE-7 | Cost controls for generative video: estimate before a job, caps, explicit confirmation for expensive jobs. | M6 |
@@ -285,7 +286,7 @@ to be met. M1 rows describe what M1 delivers; everything else is planned.
 | SEC-3 | Every project and run query is scoped by owner. A foreign or missing id returns 404 `NOT_FOUND`. | M1 |
 | SEC-4 | Zod validation of env, request bodies, LLM outputs, and (in the web app) every API response. | M1 |
 | SEC-5 | 1 MB request body limit; CORS allowlist from env; errors return `{error: {code, message}}` with no stack traces. | M1 |
-| SEC-6 | Director run timeout (`DIRECTOR_RUN_TIMEOUT_MS`, default 30 min), cancellation, sanitized error messages. | M1 |
+| SEC-6 | Director run timeout that scales with the plan (`max(DIRECTOR_RUN_TIMEOUT_MS, steps × DIRECTOR_STEP_TIMEOUT_MS)`, defaults 30 min and 2 min per step), cancellation, sanitized error messages. | M1 |
 | SEC-7 | Upload size and MIME checks. | M3 |
 | SEC-8 | Render timeouts and temp cleanup. | M2 |
 | SEC-9 | Worker isolation. M1: with `QUEUE_DRIVER=bullmq`, the director worker is a separate process. Sandboxed render and analysis workers come in M8. | M1 / M8 |
@@ -298,7 +299,7 @@ to be met. M1 rows describe what M1 delivers; everything else is planned.
 | ID | Requirement | Milestone |
 |---|---|---|
 | SYS-1 | Settings page: AI provider (mode, model, configured), queue driver, limits, engine availability with reasons, template catalog. | M1 |
-| SYS-2 | Public `GET /health` returning `{ok, version}`. | M1 |
+| SYS-2 | Public `GET /health` returning `{ok, version}` (liveness) and `GET /ready` checking the database and Redis (503 when one fails). | M1 |
 
 ### 6.14 Campaigns module (CMP)
 
@@ -328,11 +329,15 @@ Numbers marked *target* have not been measured yet. M1 test runs and manual runs
 
 - **API.** CRUD endpoints answer without waiting on director work. Director runs are always asynchronous (202 plus polling).
   *Target:* p95 under 200 ms on a developer machine for list and get endpoints, excluding cold start.
-- **Progress.** Run progress is persisted at most every 500 ms (throttled) and polled by the web app through a server-side route
-  handler.
+- **Progress.** Run progress is persisted at once on every stage change and otherwise at most every 500 ms, and polled by the
+  web app through a server-side route handler (every 1.5 s, 5 s after two minutes, paused while the tab is hidden).
 - **Director latency.** Chapters run sequentially (continuity over parallelism). Live-run latency therefore grows with chapter
-  count: a 2 h `long-form` plan has 25 chapters and 128 steps. Each run is bounded by `DIRECTOR_RUN_TIMEOUT_MS` (default
-  1 800 000 ms). *Target:* a 60 s video reaches READY within 5 minutes at effort `medium`, to be confirmed by measurement.
+  count: a 2 h `long-form` plan has 25 chapters and 128 steps, so a live run takes hours. Each run is bounded by a timeout that
+  scales with the plan, `max(DIRECTOR_RUN_TIMEOUT_MS, steps × DIRECTOR_STEP_TIMEOUT_MS)` (defaults 30 min and 2 min per step:
+  4 h 16 min for that plan). *Target:* a 60 s video reaches READY within 5 minutes at effort `medium`, to be confirmed by
+  measurement.
+- **Page weight.** The project page renders only the active tab and loads the timeline and storyboard lazily. Measured on a
+  2 000-scene project: the HTML went from 35.6 MB to 0.59 MB (28.7 KB gzipped) and the DOM from 100 789 to 4 305 nodes.
 - **Mock runs** must be fast enough to run the genre × duration matrix (5 s, 30 s, 10 min, 25 min, 2 h) inside the unit test suite.
 - **Rendering (M2+).** Memory must not grow with video length (segment rendering). Throughput scales by adding workers (M7).
 
@@ -344,29 +349,39 @@ Numbers marked *target* have not been measured yet. M1 test runs and manual runs
   current version.
 - On failure, the project returns to `READY` if it already has a version, and becomes `FAILED` otherwise. On cancellation, it
   returns to `READY` if it already has a version, and to `DRAFT` otherwise. A failed run records an error code (a
-  `DirectorError` code, or `TIMEOUT`, `QUEUE_UNAVAILABLE` or `INTERNAL` set by studio-api) and a sanitized message.
+  `DirectorError` code, or one set by studio-api: `TIMEOUT`, `QUOTA_EXCEEDED`, `SHUTDOWN`, `WORKER_LOST`, `QUEUE_LOST`,
+  `QUEUE_UNAVAILABLE` or `INTERNAL`) and a sanitized message.
 - BullMQ jobs use `attempts: 1`. Retries happen inside the run (SDK retries for 408/409/429/5xx, the director's repair loop).
   Rerunning a whole run is an explicit user action, and the stage cache makes it cheap.
-- **Known M1 gap:** if a worker process dies mid-run, the run can stay `RUNNING`. The user can cancel it, but there is no
-  automatic reaper yet. See [ROADMAP.md](ROADMAP.md#known-gaps-carried-out-of-m1).
-- Graceful worker shutdown on SIGTERM/SIGINT.
+- A running run writes a heartbeat about every 2 s. If its worker dies, a stale-run reaper fails it with `WORKER_LOST` about a
+  minute later (usage written with progress is kept) and the project is unblocked; an old queued run whose job was lost fails
+  with `QUEUE_LOST`. Runs are never re-queued automatically.
+- On SIGTERM/SIGINT the worker stops its in-flight runs and records them `FAILED` with `SHUTDOWN`. A failed enqueue (Redis down)
+  fails fast with 503 `QUEUE_UNAVAILABLE`. The final run writes are retried through short database outages.
+- `GET /ready` reports whether the database and Redis answer.
 
 ### 7.3 Security
 
-- Bearer token on every `/v1/*` route. Tokens are hashed at rest. Rate limiting is per token.
+- Bearer token on every `/v1/*` route. Tokens are hashed at rest. Rate limiting is per user, plus a per-IP limit on failed
+  authentications that is checked before any token lookup.
 - The web app calls the API **server-side only**. The token is never sent to the browser
   ([ADR-017](DECISIONS.md#adr-017-nextjs-accesses-the-api-server-side-only)). Because M1 studio-web acts as a single
   configured user, **an M1 studio-web deployment must not be exposed publicly without an authenticating proxy in front of it.**
 - LLM output is untrusted data. It is validated by Zod and mapped onto the template catalog, and it is never executed.
 - User and reference content in prompts is tagged as untrusted data.
 - Secrets are redacted from logs (pino `redact` for authorization headers and API keys).
-- Asset URIs are restricted to `asset://` and `https:`.
+- Asset URIs are restricted to `asset://` and `https://` with a fully-qualified DNS host (no IP literals or local names). The
+  check is on the shape only; resolving and blocking private addresses at fetch time is M3 (AST-5).
+- studio-web binds `127.0.0.1` by default and sends strict security headers (CSP without `unsafe-eval` in production,
+  `frame-ancestors 'none'`, `nosniff`, Referrer-Policy, Permissions-Policy, COOP).
 - Planned: upload validation (M3), sandboxed workers and OIDC (M8).
 
 ### 7.4 Cost controls
 
 - Mock provider by default; tests never call the network.
-- Daily per-user run and USD quotas; per-token rate limit; configurable resource limits checked before any provider call.
+- Per-user active-run, daily run and daily USD quotas; the USD quota reserves each run's cost ceiling before it starts and stops
+  a running run that reaches the limit. Per-user and per-IP rate limits; configurable resource limits checked before any
+  provider call. In live mode the web app asks for confirmation before starting a run.
 - Default model `claude-opus-5-5` at effort `medium` with `max_tokens` 16 000 per call. Chunking keeps each output small.
 - System prompts are stable and sent with `cache_control` so Anthropic prompt caching applies. A stage-level content-hash cache
   skips repeat calls entirely.
@@ -376,11 +391,17 @@ Numbers marked *target* have not been measured yet. M1 test runs and manual runs
 - *Illustrative arithmetic, not a measurement:* a call with 6 000 input and 4 000 output tokens costs about
   0.024 + 0.080 = $0.10. A 25-minute explainer (9 chapters, 47 LLM calls before repairs) would then cost on the order of $5 to
   plan. Real figures come from the Usage tab once live runs are measured.
+- *Reserved ceiling, computed by the code:* before a run starts, studio-api reserves its worst case,
+  $0.48 + $1.84 × chapters on `claude-opus-5-5` (every call at its full `max_tokens`). That is $17.04 for the 25-minute
+  explainer and $46.48 for a 2 h `long-form` video, so with the default `LIMIT_DIRECTOR_USD_PER_DAY=25` a 2 h video cannot start
+  until the limit is raised ([DEVELOPMENT.md section 4.4](DEVELOPMENT.md#44-quotas)).
 
 ### 7.5 Accessibility
 
 - *Target:* studio-web meets WCAG 2.2 AA. M1 builds on Radix primitives (keyboard-operable select, tabs, switch, progress),
-  labelled form controls, visible focus and theme tokens with light and dark modes. No formal audit has been done.
+  labelled form controls, visible focus and theme tokens with light and dark modes. Navigation links keep an accessible name
+  at phone width, the animatic player does not take focus away from the tab list, and an invalid form submit moves focus to
+  the first invalid field. No formal audit has been done.
 - Generated videos: a caption track is produced in M1 when voice-over is enabled; word-timed captions follow in M4. Template
   components (M2) should keep text-to-background contrast at AA levels and respect safe zones for 9:16 social formats.
 - Status is never conveyed by colour alone; badges carry text.
@@ -430,7 +451,8 @@ Numbers marked *target* have not been measured yet. M1 test runs and manual runs
 - **Campaigns stays as-is:** Express 5, Zod 3, React + Vite, raw SQL migrations. No schema or code sharing with the studio
   before M7.
 - **Remotion licensing:** Remotion is free for individuals and companies with up to 3 employees. Larger companies need a company
-  license. This applies to the studio (Player now, renderer from M2) as it does to campaigns.
+  license. This applies to the studio (Player now, renderer from M2) as it does to campaigns. The studio's `<Player>` does
+  **not** set `acknowledgeRemotionLicense`: that is left unset on purpose until the owner decides how the project is licensed.
 - **Claude API behaviour as of 2026-10** for `claude-opus-5-5`: thinking cannot be disabled (adaptive); `temperature`, `top_p`,
   `top_k`, `budget_tokens` and assistant prefill return 400; forced `tool_choice` returns 400; effort defaults to `medium`;
   refusals arrive as `stop_reason: "refusal"`. The server-side `fallbacks` parameter is a first-party Claude API feature and is
@@ -457,8 +479,8 @@ Numbers marked *target* have not been measured yet. M1 test runs and manual runs
 | Q2 | M1 reports footage/image/screen as "requires uploaded assets (Milestone 3)", but those engines are scheduled to render in M6. Should the simple image engine (Ken Burns over a photo) move earlier, for example to M3, to serve real-estate users? | M3 planning |
 | Q3 | Do M2 renders include the caption track (burned in) and/or sidecar SRT/VTT export? | M2 |
 | Q4 | Which codecs ship first (H.264/AAC only, or also VP9/ProRes)? | M2 |
-| Q5 | Should the stage cache be scoped per owner or organization? It is currently global per deployment, so a cache hit reveals that someone else submitted an identical request. What eviction or TTL policy should apply to `DirectorCacheEntry`? | M8 at the latest |
-| Q6 | How does a user ask for a fresh creative take of an unchanged request when the cache would return the same plan (a per-run "bypass cache" option)? | M2 |
+| Q5 | The stage cache is scoped per user since the M1 review, so a hit can no longer reveal another user's request. Open: should it be scoped per organization once organizations exist, and what eviction or TTL policy should apply to `DirectorCacheEntry` (including entries orphaned by a `PROMPT_VERSION` bump)? | M8 at the latest |
+| Q6 | How does a user ask for a fresh creative take of an unchanged request when the cache would return the same plan (a per-run "bypass cache" option)? `regenerateScene` already bypasses the cache for one scene. | M2 |
 | Q7 | Voice-over timing policy: re-time scenes to the synthesized voice-over, time-stretch the voice, or constrain the script length? | M4 |
 | Q8 | Which TTS, music and transcription providers? Campaigns already uses ElevenLabs. | M3 / M4 |
 | Q9 | Which object storage for deployments (S3, R2, MinIO), and are asset URLs signed and expiring? | M3 |

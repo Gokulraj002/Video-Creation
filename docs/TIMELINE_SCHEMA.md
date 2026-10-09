@@ -11,7 +11,7 @@
 | Related | [ARCHITECTURE.md](ARCHITECTURE.md) · [AI_DIRECTOR.md](AI_DIRECTOR.md) · [DATABASE.md](DATABASE.md) · [DECISIONS.md](DECISIONS.md) ([ADR-005](DECISIONS.md#adr-005-zod-v4-as-the-single-source-of-truth-json-schema-derived-for-llm-outputs), [ADR-008](DECISIONS.md#adr-008-deterministic-compilation-the-llm-plans-in-seconds-code-allocates-frames), [ADR-009](DECISIONS.md#adr-009-fixed-template-catalog-with-per-template-zod-props-never-llm-generated-code), [ADR-011](DECISIONS.md#adr-011-integer-frames-and-a-versioned-timeline-with-migrations), [ADR-016](DECISIONS.md#adr-016-configurable-resource-limits-instead-of-hardcoded-duration-caps)) |
 
 > **The Zod schemas in `packages/schema/src/` are the source of truth.** This document describes Timeline v1 as it is
-> implemented in that code and its 620 passing tests. If the code and this document disagree, the code is right and this
+> implemented in that code and its 723 passing tests (revised after the M1 review, 2026-10-09). If the code and this document disagree, the code is right and this
 > document has a bug. Every rule, bound and error message below was read from the source. The behaviour that is not obvious
 > from reading the source (which errors suppress the invariant pass, preset keyframes, allocation results, both examples) was
 > also checked by running the code against Zod 4.6.5.
@@ -26,7 +26,7 @@ a video file are **planned (M2 for 2D, M5 for 3D, M6 for footage and generated v
 2. [Design goals](#2-design-goals)
 3. [Structure at a glance](#3-structure-at-a-glance)
 4. [Field reference](#4-field-reference)
-5. [Validation and the nine invariants](#5-validation-and-the-nine-invariants)
+5. [Validation and the ten invariants](#5-validation-and-the-ten-invariants)
 6. [Frame math](#6-frame-math)
 7. [Camera tracks and presets](#7-camera-tracks-and-presets)
 8. [Transitions](#8-transitions)
@@ -63,9 +63,10 @@ flowchart LR
 - The AI Director never asks the model for a timeline. The model produces artifacts measured in seconds (brief, outline,
   script, storyboard, shot list, engine selection, scene specs). The compiler in `packages/ai-director/src/compiler.ts` turns
   them into a timeline and then calls `TimelineSchema.safeParse` and `checkTimelineLimits`.
-- `apps/studio-api` stores the timeline in `ProjectVersion.timeline` together with its `schemaVersion`. On every read it goes
-  through `parseTimeline`, so older stored versions are migrated before they are served (`apps/studio-api/src/lib/dto.ts`,
-  `toVersionDto`).
+- `apps/studio-api` stores the timeline in `ProjectVersion.timeline` together with its `schemaVersion`. When a version is
+  first served it goes through `safeParseTimeline`, so older stored versions are migrated before they are served
+  (`apps/studio-api/src/lib/dto.ts`, `toVersionDto`); the serialized result is then cached per process, because versions are
+  immutable.
 - `apps/studio-web` receives the timeline inside `ProjectVersionDTO` and validates it with the same `@vc/schema` package.
 
 ## 2. Design goals
@@ -282,7 +283,7 @@ classDiagram
 ```
 
 The diagram omits most asset references. [Invariant 4](#invariant-4-asset-references-exist-and-have-a-compatible-kind)
-lists all eleven of them.
+lists all of them: eleven fields, plus the asset-reference props of catalog templates.
 
 ### Conventions
 
@@ -290,7 +291,8 @@ lists all eleven of them.
 |---|---|
 | Absolute frames | `chapters[].startFrame`, `scenes[].startFrame` and every track item's `startFrame` are timeline frames counted from 0. |
 | Relative frames | Layer `startFrame`, camera keyframe `frame` and `zoomRegions[].startFrame` are relative to the start of their container: the scene, or the overlay item for layers inside overlay content. |
-| Source offsets | `trimStartFrame` (footage, screen, audio and video items) is a frame offset into the source media. v1 does not check it against the asset's length. |
+| Source offsets | `trimStartFrame` (footage, screen, audio and video items) is a frame offset into the source media. When the referenced asset declares `durationInFrames`, the offset must be smaller than it ([invariant 5](#invariant-5-track-items-are-in-bounds-sorted-and-non-overlapping)). |
+| Text | Every string in the document must be well-formed UTF-16, with no lone surrogates ([invariant 10](#invariant-10-every-string-is-well-formed-utf-16)). PostgreSQL `jsonb` rejects them. |
 | Normalized coordinates | 2D positions and sizes (`x`, `y`, `width`, `height`, `maxWidth`, `focalPoint`) are in `[0, 1]` of the frame. The code documents text-layer `x`/`y` as the center. |
 | Colors | `#RRGGBB` or `#RRGGBBAA`. |
 | Numbers | Zod 4 rejects `NaN` and `±Infinity` for every number field. |
@@ -317,12 +319,17 @@ inclusive unless written as `(a, b]`.
 | `FontFamilySchema` | string | `/^[A-Za-z0-9 \-]{1,64}$/`: letters, digits, spaces and hyphens only, so no quotes, semicolons or `url(`. Rejects `Inter;` and `Inter'`. |
 | `LanguageTagSchema` | string | `/^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$/`. Accepts `en`, `en-US`, `pt-BR`, `zh-Hant`, `es-419` and `yue`. Rejects `EN`, `en_US` and `english`. |
 | `IsoDateTimeSchema` | string | `z.iso.datetime({ offset: true })`. Seconds are required and fractions are allowed. A `Z` or `±hh:mm` offset is required: `2026-10-09T08:00:00Z` and `2026-10-09T08:00:00.123+02:00` pass, `2026-10-09T08:00:00` and `2026-10-09T08:00Z` fail. |
-| `JsonValueSchema` | JSON | Strings ≤ 10 000 characters, finite numbers, booleans, `null`, arrays ≤ 500 items, objects ≤ 200 keys, at most 8 nested containers (`JSON_LIMITS`). Built level by level without `z.lazy`, so it converts to JSON Schema. |
-| `JsonObjectSchema` | object | Record of JSON values with ≤ 200 keys. The object counts as one level, so its values may nest at most 7 more containers. Used for template `props`. |
-| `SafeUriSchema` | string | See [section 10.2](#102-safeuri-rules). |
+| `JsonValueSchema` | JSON | Strings ≤ 10 000 characters, finite numbers, booleans, `null`, arrays ≤ 500 items, objects ≤ 200 keys, at most 8 nested containers, and at most 10 000 nodes in total, every container and primitive counted (`JSON_LIMITS`). Object keys `__proto__`, `constructor` and `prototype` are rejected (`RESERVED_JSON_KEYS`), and every string must be well-formed UTF-16. A pre-pass enforces the node budget, reserved keys and well-formed text first, each with a precise path, so an oversized value is rejected in bounded time without validating it; the structural schema runs only when the pre-pass found nothing. Built level by level without `z.lazy`, so it converts to JSON Schema. |
+| `JsonObjectSchema` | object | Record of JSON values with ≤ 200 keys and the same pre-pass. The object counts as one level (and one node), so its values may nest at most 7 more containers. Used for template `props`. |
+| `SafeUriSchema` | string | See [section 10.2](#102-safeuri-rules). The parsed value is the **normalized** URI. |
 
 `formatZodIssues(error, maxIssues = 50)` formats issues as `path: message`. Paths are joined with `.`, and a top-level issue
 uses `(root)`.
+
+Text helpers: `isWellFormedText(value)` and `toWellFormedText(value)` (lone surrogates replaced with U+FFFD; regex-based, so
+they need no ES2024 runtime), `findIllFormedStrings(value, report, skipKeys)` and `ILL_FORMED_TEXT_MESSAGE` (`Text must be
+well-formed UTF-16 (it contains a lone surrogate, e.g. half of an emoji cut by truncation)`). The template helper `clip` cuts
+on code-point boundaries and never produces ill-formed text.
 
 ### 4.2 `TimelineSchema` (top level, `timeline.ts`)
 
@@ -357,7 +364,7 @@ invariants. It is exported for tooling that needs a structural check only.
 |---|---|---|---|
 | `name` | string 1..120 | yes | `vc-ai-director` for director output. |
 | `version` | string 1..64 | yes | Generator version, for example `0.1.0`. |
-| `promptVersion` | string 1..64 | no | Director prompt version, for example `m1.0`. |
+| `promptVersion` | string 1..64 | no | Director prompt version, for example `m1.1`. |
 
 ### 4.3 `RenderSettings` (`render-settings.ts`)
 
@@ -443,7 +450,7 @@ specified and validated, so their renderers (**planned, M6**) do not need a sche
 |---|---|---|---|
 | `engine` | `"footage"` | yes | |
 | `assetId` | `Id` | yes | Must reference a `video` asset. |
-| `trimStartFrame` | `Frame` | yes | Offset into the source. |
+| `trimStartFrame` | `Frame` | yes | Offset into the source; `<` the asset's `durationInFrames` when declared. |
 | `playbackRate` | 0.25..4 | yes | `PlaybackRateSchema`. |
 | `fit` | `cover`, `contain` | yes | |
 | `volume` | 0..1 | yes | |
@@ -479,13 +486,13 @@ engine in M1.
 |---|---|---|---|
 | `engine` | `"screen"` | yes | |
 | `assetId` | `Id` | yes | Must reference a `video` asset. |
-| `trimStartFrame` | `Frame` | yes | |
+| `trimStartFrame` | `Frame` | yes | `<` the asset's `durationInFrames` when declared. |
 | `playbackRate` | 0.25..4 | yes | |
 | `zoomRegions` | `ZoomRegion[]` ≤ 200 | yes | May be `[]`. |
 | `highlightCursor` | boolean | yes | |
 
 **`ZoomRegionSchema`**: `startFrame` (`Frame`, relative to the scene), `durationInFrames` (`DurationFrames`), and `x`, `y`,
-`width`, `height` (all normalized). Zoom regions are **not** checked against the scene duration in v1.
+`width`, `height` (all normalized). Each region must lie within the scene ([invariant 8](#invariant-8-audio-fades-layers-and-zoom-regions-fit-their-container)).
 
 `OverlayContentSchema` is the subset allowed on overlay track items: `motion2d` or `image` only.
 
@@ -498,7 +505,7 @@ engine in M1.
 | `id` | `Id` | yes | Global namespace. |
 | `type` | `text`, `shape`, `image` | yes | Discriminator. |
 | `startFrame` | `Frame` | yes | Relative to the container start. |
-| `durationInFrames` | `DurationFrames` | yes | `startFrame + durationInFrames` must not exceed the container ([invariant 8](#invariant-8-audio-fades-and-layers-fit-their-container)). |
+| `durationInFrames` | `DurationFrames` | yes | `startFrame + durationInFrames` must not exceed the container ([invariant 8](#invariant-8-audio-fades-layers-and-zoom-regions-fit-their-container)). |
 | `enter` | `AnimationPreset` | yes | `none`, `fade`, `slide-up`, `slide-down`, `slide-left`, `slide-right`, `scale`, `pop`, `typewriter`, `blur-in`. |
 | `exit` | `AnimationPreset` | yes | Same values. |
 | `opacity` | 0..1 | yes | |
@@ -591,7 +598,7 @@ engine in M1.
 | `assetId` | `Id` | yes | Must reference an `audio` asset. |
 | `startFrame` | `Frame` | yes | Absolute. |
 | `durationInFrames` | `DurationFrames` | yes | |
-| `trimStartFrame` | `Frame` | yes | Offset into the source. |
+| `trimStartFrame` | `Frame` | yes | Offset into the source; `<` the asset's `durationInFrames` when declared. |
 | `volume` | 0..2 | yes | `1` = unity gain. |
 | `fadeInFrames` | `Frame` | yes | `fadeInFrames + fadeOutFrames ≤ durationInFrames`. |
 | `fadeOutFrames` | `Frame` | yes | |
@@ -635,7 +642,7 @@ engine in M1.
 | `assetId` | `Id` | yes | Must reference a `video` asset. |
 | `startFrame` | `Frame` | yes | Absolute. |
 | `durationInFrames` | `DurationFrames` | yes | |
-| `trimStartFrame` | `Frame` | yes | |
+| `trimStartFrame` | `Frame` | yes | `<` the asset's `durationInFrames` when declared. |
 | `playbackRate` | 0.25..4 | yes | |
 | `opacity` | 0..1 | yes | |
 | `volume` | 0..2 | yes | |
@@ -659,12 +666,12 @@ engine in M1.
 | `name` | string 1..255 | no | Display name. |
 | `sizeBytes` | int ≥ 0 | no | |
 | `width`, `height` | int ≥ 1 | no | Pixels. |
-| `durationInFrames` | `DurationFrames` | no | Informational. Not cross-checked against trims. |
+| `durationInFrames` | `DurationFrames` | no | When present, every `trimStartFrame` that reads this asset must be smaller than it ([invariant 5](#invariant-5-track-items-are-in-bounds-sorted-and-non-overlapping)). |
 | `source` | `AssetSource` | yes | |
 | `provider` | string 1..120 | no | For example a stock or generation provider. |
 | `license` | string 1..500 | no | For example `CC-BY-4.0`. |
 
-## 5. Validation and the nine invariants
+## 5. Validation and the ten invariants
 
 ### 5.1 How validation runs
 
@@ -758,9 +765,14 @@ Every reference must name an entry in `assets` whose `kind` matches the table.
 | Overlay item with `image` content | `image` | `tracks.{t}.items.{j}.content.assetId` |
 | Image layer in an overlay's `motion2d` content | `image` | `tracks.{t}.items.{j}.content.layers.{k}.assetId` |
 
+| An asset-reference prop of a catalog template in `motion2d` or `three` content (scenes and overlay items), when it is a string | the kind the template declares (`split-feature.imageAssetId` → `image`) | `….content.props.{prop}` |
+
 Messages: `Unknown asset "missing-asset" (not listed in timeline.assets)` and
-`Asset "img-1" must be of kind "video" (got "image")`. Asset ids inside template `props` are opaque to the timeline and are
-not checked. No v1 field references the kinds `font`, `document` or `subtitle`, but such assets may still be listed.
+`Asset "img-1" must be of kind "video" (got "image")`. Template props are otherwise opaque to the timeline: only props a
+catalog template lists in `assetRefProps` are checked (`getTemplateAssetRefProps(templateId)`; `null` values and the props of
+unknown templates are not inspected, so a future template never fails an old reader). In M1 the only such prop is
+`split-feature.imageAssetId`. No v1 field references the kinds `font`, `document` or `subtitle`, but such assets may still be
+listed.
 
 ### Invariant 5: track items are in bounds, sorted and non-overlapping
 
@@ -775,6 +787,17 @@ This applies to every track kind. Items are checked in array order. `previousEnd
 
 Items may touch: an item may start on the frame where the previous one ends. Items in **different** tracks may overlap
 freely. One item can be reported by both a bounds rule and an ordering rule.
+
+**Source offsets (5b).** A `trimStartFrame` must be smaller than the source's length when the referenced asset declares
+`durationInFrames` (and has the expected kind; a wrong kind is reported by invariant 4 instead). This applies to `footage` and
+`screen` scene content (`video` assets) and to audio and video track items:
+
+| Rule | Path | Message (example) |
+|---|---|---|
+| `trimStartFrame < asset.durationInFrames` | `scenes.{i}.content.trimStartFrame`, `tracks.{t}.items.{j}.trimStartFrame` | `trimStartFrame 300 must be < the duration of asset "clip-1" (300 frames)` |
+
+Only the start offset is checked, not whether `trimStartFrame` plus the played length (which depends on `playbackRate`) stays
+inside the source.
 
 ### Invariant 6: transitions
 
@@ -797,12 +820,14 @@ The structural `TransitionSchema` refinement also applies, at `….transitionIn.
 
 The first keyframe does not have to be at frame 0. Every preset expansion does start at 0.
 
-### Invariant 8: audio fades and layers fit their container
+### Invariant 8: audio fades, layers and zoom regions fit their container
 
 | Rule | Path | Message (example) |
 |---|---|---|
 | Audio item `fadeInFrames + fadeOutFrames ≤ durationInFrames` (equality allowed) | `tracks.{t}.items.{j}.fadeOutFrames` | `fadeInFrames + fadeOutFrames (151) exceeds durationInFrames 150` |
 | Layer `startFrame + durationInFrames ≤` the container duration (the scene, or the overlay item for overlay layers) | `….layers.{k}.durationInFrames` | `Layer "layer-shape" ends at 61, beyond its container duration 60` |
+| `screen` zoom region `startFrame < scene.durationInFrames` | `scenes.{i}.content.zoomRegions.{k}.startFrame` | `Zoom region starts at 90, outside the scene [0, 90)` |
+| Otherwise `startFrame + durationInFrames ≤ scene.durationInFrames` | `scenes.{i}.content.zoomRegions.{k}.durationInFrames` | `Zoom region ends at 91, beyond the scene duration 90` |
 
 ### Invariant 9: `ready` generated scenes have an asset
 
@@ -812,13 +837,24 @@ The first keyframe does not have to be at frame 0. Every preset expansion does s
 
 `pending`, `queued` and `failed` generations may omit `assetId`.
 
+### Invariant 10: every string is well-formed UTF-16
+
+| Rule | Path | Message |
+|---|---|---|
+| No lone (unpaired) surrogate in any string of the document | the string's path, for example `scenes.0.title` | `Text must be well-formed UTF-16 (it contains a lone surrogate, e.g. half of an emoji cut by truncation)` |
+
+Template `props` are checked by `JsonObjectSchema` itself (same message, path under `props`), so the timeline-wide walk skips
+them. Lone surrogates usually come from truncating text in the middle of an emoji; PostgreSQL `jsonb` rejects them, so a
+timeline that passes the schema can always be stored. `VideoRequestSchema` and `DirectorArtifactsSchema` apply the same rule
+to every string they hold.
+
 ### 5.2 What v1 does not check
 
 The following are not validated in v1, so consumers must not assume them:
 
-- Zoom regions against the scene duration.
-- `trimStartFrame` against the asset's length.
-- Template `props` against the catalog, including a template's `minDurationSeconds`.
+- Whether `trimStartFrame` plus the played length stays inside the source (only the start offset is checked).
+- Template `props` against the catalog, including a template's `minDurationSeconds`, apart from the asset-reference props of
+  invariant 4.
 - Caption text against narration.
 - `narration.language` against `metadata.language`.
 - Uniqueness of `zIndex`.
@@ -830,9 +866,11 @@ The helpers in `frames.ts` and `render-settings.ts` are shared by the compiler, 
 
 ### 6.1 `secondsToFrames(seconds, fps)` and `framesToSeconds(frames, fps)`
 
-- `secondsToFrames` returns `Math.round(seconds × fps)`. It does not validate and can return `0` (`secondsToFrames(0.01, 30)
-  === 0`). The compiler clamps the total with `Math.max(1, …)`. Examples: `(1, 30) → 30`, `(2.5, 24) → 60`, `(16, 25) → 400`,
-  `(7200, 60) → 432000`.
+- `secondsToFrames` returns `Math.round(seconds × fps + 1e-9)` (`SECONDS_TO_FRAMES_EPSILON`): the nearest frame, with exact
+  halves rounding up. The tiny nudge corrects binary floating-point products that land just below `.5`: `0.29 × 50` is
+  `14.499999999999998`, and `secondsToFrames(0.29, 50)` is `15`, not `14`. It does not validate and can return `0`
+  (`secondsToFrames(0.01, 30) === 0`). The compiler clamps the total with `Math.max(1, …)`. Examples: `(1, 30) → 30`,
+  `(2.5, 24) → 60`, `(16, 25) → 400`, `(7200, 60) → 432000`.
 - `framesToSeconds` returns `frames / fps` and throws `RangeError` if `fps ≤ 0`.
 
 ### 6.2 `allocateFrames(weights, totalFrames, minFrames = 1)`
@@ -841,15 +879,20 @@ The helpers in `frames.ts` and `render-settings.ts` are shared by the compiler, 
 its own would drift: three equal scenes in 100 frames round to 33 + 33 + 33 = 99. Largest-remainder apportionment fixes
 that:
 
-1. **Validate.** `totalFrames` and `minFrames` must be non-negative integers. `weights` must be non-empty, finite and > 0.
-   `weights.length × minFrames ≤ totalFrames`. Any failure throws `RangeError`.
-2. **Pin small entries.** Quotas are `freeTotal × wᵢ / freeWeight` over the unpinned entries. Any entry whose quota is below
+1. **Validate.** `totalFrames` and `minFrames` must be non-negative **safe** integers. `weights` must be non-empty, finite and
+   > 0. `weights.length × minFrames ≤ totalFrames`. Any failure throws `RangeError`.
+2. **Normalize.** Every weight is divided by the largest one, so any finite positive weights work (for example
+   `[1e308, 1e308]`) without overflowing sums or products. A weight many orders of magnitude below the largest may underflow to
+   0; it then simply gets the minimum.
+3. **Pin small entries.** Quotas are `freeTotal × wᵢ / freeWeight` over the unpinned entries. Any entry whose quota is below
    `minFrames` (tolerance 1e-9) is pinned to `minFrames`, and the rest is re-apportioned. This repeats until nothing new is
-   pinned.
-3. **Floor.** Each unpinned entry gets `max(minFrames, floor(quota))`.
-4. **Distribute the leftover.** `totalFrames − Σ` frames go one each to the entries with the largest fractional remainder.
-   **Ties go to the lower index first.**
-5. The result has one entry per weight, every entry is ≥ `minFrames`, and the entries **sum exactly to `totalFrames`**. The
+   pinned; each pass pins at least one more entry, so there are at most n + 1 passes.
+4. **Floor.** Each unpinned entry gets `max(minFrames, floor(quota))`.
+5. **Distribute the leftover.** `totalFrames − Σ` frames go one each to the entries with the largest fractional remainder
+   (whole rounds first if float drift left more than one frame per entry). **Ties go to the lower index first.** Every loop is
+   bounded.
+6. **Check.** The result has one entry per weight, every entry is a safe integer ≥ `minFrames`, and the entries **sum exactly
+   to `totalFrames`**; a violated postcondition throws `RangeError` (internal error) instead of returning a bad allocation. The
    same input always gives the same output.
 
 **Worked example.** A 16 s request at 25 fps gives `totalFrames = secondsToFrames(16, 25) = 400`. The storyboard has three
@@ -873,6 +916,7 @@ the request, not the storyboard total).
 - Result: `[30, 165, 105]`.
 
 **Ties.** `allocateFrames([1, 1, 1], 100)` returns `[34, 33, 33]`. `allocateFrames([1, 1, 1], 10)` returns `[4, 3, 3]`.
+**Extreme weights.** `allocateFrames([1e308, 1e308], 10)` returns `[5, 5]`.
 
 The compiler calls `allocateFrames(storyboardSeconds, totalFrames, max(1, min(fps, floor(totalFrames / sceneCount))))`. So
 every scene gets at least one second when the total allows it. The function is exact for 2000 scenes over 2 h at 60 fps
@@ -900,9 +944,15 @@ The format is `HH:MM:SS:FF`, non-drop-frame. `fps` is rounded to an integer base
 - For preset sizes, the resolution names the **short side** in pixels: 480, 720, 1080, 1440 or 2160.
 - The long side is `round(short × ratio)`, rounded to the nearest even integer. The result is always even.
 - If either `aspectRatio` or `resolution` is `custom`, both `customWidth` and `customHeight` are required (positive and
-  finite). Otherwise it throws `RangeError`. Custom values are rounded to the nearest even integer, with a minimum of 2:
-  `641 × 361` becomes `642 × 362`.
-- The 16..8192 range is enforced by `VideoRequestSchema` and `RenderSettingsSchema`, not by this function.
+  finite). Otherwise it throws `RangeError`. Custom values are used as given, rounded to the nearest even integer:
+  `641 × 361` becomes `642 × 362`. With `aspectRatio: 'custom'` the resolution preset is **ignored**.
+- Every resolved side must be in 16..8192 after rounding, otherwise it throws `RangeError`
+  (`Resolved width 10 px is outside [16, 8192] (after rounding to an even integer)`). `VideoRequestSchema` and
+  `RenderSettingsSchema` enforce the same range on their own fields.
+- `VideoRequestSchema` adds one rule: with `resolution: 'custom'` and a **preset** aspect ratio, the custom size must match
+  that ratio within ±1 px per side (`dimensionsMatchAspectRatio(width, height, aspectRatio)`). `1920 × 1080` passes for `16:9`;
+  `1920 × 1000` fails at `customWidth` with `Custom size 1920×1000 does not match aspect ratio 16:9 (e.g. 1920×1080; ±1 px per
+  side allowed). Use aspectRatio "custom" for a free size.`
 
 | Resolution | 9:16 | 16:9 | 1:1 | 4:5 |
 |---|---|---|---|---|
@@ -1004,7 +1054,7 @@ Use several tracks for simultaneous items. Track order in the array carries no m
 
 | Kind | Purpose | Item references | Rules beyond invariant 5 | Produced in M1? |
 |---|---|---|---|---|
-| `audio` | Voice-over (`role: voiceover`), music bed (`music`), sound effects (`sfx`). Track-level `muted` and `volume` (0..2), and per-item `volume`, `trimStartFrame` and fades. | `audio` asset | Fades fit the item ([invariant 8](#invariant-8-audio-fades-and-layers-fit-their-container)) | No. Voice and music providers are **planned (M4)**. |
+| `audio` | Voice-over (`role: voiceover`), music bed (`music`), sound effects (`sfx`). Track-level `muted` and `volume` (0..2), and per-item `volume`, `trimStartFrame` and fades. | `audio` asset | Fades fit the item ([invariant 8](#invariant-8-audio-fades-layers-and-zoom-regions-fit-their-container)) | No. Voice and music providers are **planned (M4)**. |
 | `caption` | Timed caption cues with a `language`, a style preset (`bold-center`, `lower`, `karaoke`, `minimal`) and a position. Cues may carry a `speaker`. | none | — | **Yes.** The compiler emits one caption track (id `captions`) built from storyboard voice-over: cues of at most 7 words, frames proportional to word count, contiguous within each scene. Word-timed captions are **planned (M4)**. |
 | `overlay` | Graphics drawn over scenes: `motion2d` template content (for example `lower-third`) or an image, with `opacity` and `zIndex`. | `image` asset (image content or image layers) | Layers fit the overlay item | No. The schema and its tests support overlays, but no M1 code produces or draws them. |
 | `video` | B-roll or picture-in-picture clips with `trimStartFrame`, `playbackRate` 0.25..4, `opacity`, `volume` and `muted`. | `video` asset | — | No. Footage is **planned (M6)**. |
@@ -1021,28 +1071,47 @@ Uploads and object storage are **planned (M3)**. v1 does not require `uri` to eq
 
 ### 10.2 `SafeUri` rules
 
-`SafeUriSchema` is an allow-list. A URI must pass every check, in this order:
+`SafeUriSchema` is an allow-list (`checkSafeUri` in `common.ts`). A URI must pass every check, in this order; the first failure
+is reported:
 
 1. A string of 1 to 2048 characters.
-2. No control characters (U+0000–U+001F, U+007F–U+009F) and no whitespace of any kind, including spaces, tabs and newlines.
-3. Parses as an **absolute** URL with `new URL(value)`.
-4. The protocol is **`asset:`** or **`https:`**. Matching is case-insensitive through URL parsing, so `HTTPS://EXAMPLE.COM/x`
-   passes and `JavaScript:alert(1)` fails.
-5. No username or password.
-6. A non-empty host. `asset://img-1` passes. `asset:img-1` fails with
-   `URI must have a host (asset://<assetId> or https://host/...)`.
+2. No control characters (U+0000–U+001F, U+007F–U+009F), no whitespace of any kind, and no invisible Unicode format
+   characters (`\p{Cf}`: zero-width spaces and joiners, bidi overrides such as U+202E, BOM, soft hyphen).
+3. No backslash anywhere.
+4. No `@` anywhere, so no credentials or user-info in any form.
+5. The **literal** prefix `https://` or `asset://` (scheme case-insensitive). Every other scheme, relative URIs, and the
+   prefix-less forms `https:host` and `https:/host` are rejected.
+6. No percent-encoded control characters (`%00`–`%1F`, `%7F`).
+7. No dot segments (`.` or `..`) in the path, including percent-encoded ones (`%2e`) and ones hidden behind an encoded
+   slash or backslash (`%2f`, `%5c`).
+8. `asset://` only: the host must be a valid `Id` (letters, digits, `_` and `-`, at most 64), each path segment 1 to 255
+   characters of `[A-Za-z0-9._-]` not starting with a dot, and no query or fragment.
+9. Parses as an absolute URL with `new URL(value)`, with the same scheme, no username or password, and a non-empty host.
+10. `https://` only: the host must be a fully-qualified DNS name (at least two labels, at most 253 characters, no trailing dot).
+    IP literals in any notation (`127.0.0.1`, `[::1]`, `2130706433`, `0x7f.1`) and local or internal names (`localhost`,
+    `*.localhost`, `*.local`, `*.internal`, `*.localdomain`, `*.home.arpa`) are rejected.
+11. The normalized form (`URL.href`) is at most 2048 characters.
 
-| Accepted | Rejected |
+**Normalized output.** The parsed value is `URL.href`: lower-case scheme and host, punycode host, percent-encoded path. For
+example `HTTPS://EXAMPLE.COM/upper` is stored as `https://example.com/upper` and `https://bücher.example/x` as
+`https://xn--bcher-kva.example/x`. A document that contains a non-normalized URI therefore does not deep-equal its parsed
+result.
+
+| Accepted (parsed value) | Rejected |
 |---|---|
-| `asset://img-1` | `http://example.com/a.mp4` (plain http) |
-| `asset://abc123/variant.png` | `file:///etc/passwd`, `data:image/png;base64,…`, `javascript:alert(1)`, `ftp://…`, `blob:https://…` |
-| `https://cdn.example.com/a.mp4` | `https://user:pass@example.com/a`, `asset://user:pass@img-1` (credentials) |
-| `https://example.com/path?query=1#frag` | `/assets/a.png`, `example.com/a.png` (not absolute) |
-| `https://example.com:8443/x` | `https://example.com/a b`, `https://exa\tmple.com/`, `…\u0000…`, `…\u0085…` |
-| `HTTPS://EXAMPLE.COM/upper` | `asset:img-1` (no host), any URI over 2048 characters |
+| `asset://img-1` | `http://example.com/a.mp4`, `file:///etc/passwd`, `data:…`, `javascript:alert(1)`, `ftp://…`, `blob:https://…` (scheme) |
+| `asset://abc123/variant.png` | `https:example.com/a`, `https:/example.com/a`, `asset:img-1`, `/assets/a.png`, `example.com/a.png` (no literal `https://` or `asset://` prefix) |
+| `https://cdn.example.com/a.mp4` | `https://user:pass@example.com/a`, `asset://user:pass@img-1` (`@`) |
+| `https://example.com/path?query=1#frag` | `https://127.0.0.1/a`, `https://[::1]/a`, `https://2130706433/a` (IP literals) |
+| `https://example.com:8443/x` | `https://localhost/a`, `https://example/a`, `https://example.com./a` (not a fully-qualified name), `https://foo.local/a` (local name) |
+| `HTTPS://EXAMPLE.COM/upper` → `https://example.com/upper` | `https://example.com/../a`, `https://example.com/%2e%2e/a` (dot segments), `https://example.com/a%00b` (encoded control) |
+| `https://bücher.example/x` → `https://xn--bcher-kva.example/x` | `https://example.com/a b`, `https://exa​mple.com/`, `…‮…`, `https://example.com/a\b` (whitespace, format characters, backslash) |
+| `https://cdn.example.com/a%20b.mp4` | `asset://img-1?x=1`, `asset://img-1/.hidden`, `asset://img.1` (asset rules), any URI over 2048 characters |
 
-`SafeUri` checks the *shape* of a URI only. It does not resolve DNS or block private address ranges. Anything that fetches
-`https:` URIs on the server (the M2+ renderers, the M3 ingest) must apply its own egress policy.
+`SafeUri` checks the *shape* of a URI only. **It does not resolve DNS**, so a public host name can still resolve to a private,
+loopback, link-local or cloud-metadata address. M1 never fetches asset URIs. Every server-side fetcher must re-check the
+resolved address at fetch time; that check is scheduled with the first fetcher, the M3 ingest
+([ROADMAP M3](ROADMAP.md#m3-assets-and-reference-analysis), [ARCHITECTURE section 11](ARCHITECTURE.md#11-security-model)).
 
 ## 11. Template catalog
 
@@ -1058,14 +1127,19 @@ Each `TemplateDefinition` has these fields:
 - `description`: shown to the model
 - `genres`
 - `propsSchema`: an LLM-safe Zod object
+- `assetRefProps` (optional): props whose string value is an asset id, with the asset kind they must reference. `TimelineSchema`
+  checks them ([invariant 4](#invariant-4-asset-references-exist-and-have-a-compatible-kind)). In M1 only `split-feature`
+  declares one: `{ imageAssetId: 'image' }`.
 - `minDurationSeconds`: advisory; not enforced by any schema
 - `buildProps(ctx)`: deterministically builds valid props from a `TemplatePropsContext` `{ title, text, bullets, palette,
-  brandName }`. The heuristic mock provider and engine-fallback coercion use it.
+  brandName }`. In M1 only the heuristic mock provider uses it (engine coercion swaps the template; the scene-specs stage writes
+  the props).
 
 | Export | Purpose |
 |---|---|
 | `TEMPLATE_CATALOG`, `TEMPLATE_IDS` | All definitions and ids, in catalog order. |
 | `getTemplate(id)`, `isCatalogTemplateId(id)` | Look up by id. |
+| `getTemplateAssetRefProps(id)` | `{ prop, kind }[]` from `assetRefProps`; `[]` for unknown templates. |
 | `listTemplates({ engine?, genre? })` | Filter. Every genre has at least one `motion2d` template, and that is tested. |
 | `validateTemplateProps(id, props)` | `{ success: true, data }` or `{ success: false, issues: string[] }`. Unknown ids fail with `Unknown template "x"`. Issues look like `headline: Too small: …`. Valid props are also re-checked as `JsonObject`. |
 | `templateCatalogSummary()` | A serializable list of `{ id, engine, name, description, genres, minDurationSeconds }` with no Zod objects. Validated by `TemplateSummarySchema` and served by `GET /v1/system/config`. |
@@ -1101,10 +1175,11 @@ props validity are checked **by the director**, when the plan is generated:
   `choices.{i}.template: unknown template "x"` or
   `template "x" is a "three" template, not "motion2d"`.
 - The scene-spec validator runs `validateTemplateProps` and reports issues as `scenes.{i}.props.<issue>`.
-- The model's scene-spec output schema is itself a discriminated union over the catalog, so each template's `props` schema is
-  attached to its id.
+- The model's scene-spec output schema is itself a discriminated union over the templates selected for that chapter, so each
+  template's `props` schema is attached to its id.
 
-The timeline schema deliberately does not repeat these checks:
+The timeline schema deliberately does not repeat these checks (the one exception is invariant 4 for the asset-reference props a
+catalog template declares, which never fails for an unknown template):
 
 1. **Old timelines must stay readable.** Stored versions go through `parseTimeline` on every read. If the timeline checked the
    catalog, removing, renaming or tightening a template would make existing projects fail to load.
@@ -1173,8 +1248,10 @@ The model plans in seconds and enums, and code produces every frame number:
 
 ## 13. Resource limits
 
-Limits are **configuration, not schema**. `ResourceLimitsSchema` holds nine positive integers.
-`DEFAULT_RESOURCE_LIMITS` is only a default: `apps/studio-api/src/config.ts` reads each value from the environment
+Limits are **configuration, not schema**. `ResourceLimitsSchema` holds nine required positive integers (the core limits,
+`CoreResourceLimitsSchema`, type `ResourceLimits`) and three optional timeline-size limits (`TimelineSizeLimitsSchema`; the
+combined type is `FullResourceLimits`). `DEFAULT_RESOURCE_LIMITS` is only a default: `apps/studio-api/src/config.ts` reads the
+nine core values from the environment; the size limits have no env variables in M1, so their defaults apply
 ([ADR-016](DECISIONS.md#adr-016-configurable-resource-limits-instead-of-hardcoded-duration-caps)). `VideoRequestSchema`
 deliberately has **no maximum duration**.
 
@@ -1189,18 +1266,23 @@ deliberately has **no maximum duration**.
 | `maxTracks` | 50 | `LIMIT_MAX_TRACKS` | `tracks.length` | — |
 | `maxAssets` | 500 | `LIMIT_MAX_ASSETS` | `assets.length` | `referenceAssetIds.length` |
 | `maxPromptChars` | 20000 | `LIMIT_MAX_PROMPT_CHARS` | each `generated` scene's `prompt.length` | `prompt.length` |
+| `maxTrackItems` (optional) | 20 000 | none | items over **all** tracks (`countTimelineTrackItems`) | — |
+| `maxLayers` (optional) | 5 000 | none | 2D layers over all scenes and overlay items (`countTimelineLayers`) | — |
+| `maxTimelineBytes` (optional) | 20 971 520 (20 MiB) | none | UTF-8 size of `JSON.stringify(timeline)` (`utf8ByteLength`) | — |
 
 - Both functions return `LimitViolation[]`, and an empty array means the input is within limits. A violation is
   `{ code, message, limit, actual }` (`LimitViolationSchema`), for example
   `{ code: "MAX_DURATION_SECONDS", message: "Duration (seconds) 10 exceeds the configured limit of 5", limit: 5, actual: 10 }`.
-- Limits are **inclusive**: a value equal to the limit passes.
+- Limits are **inclusive**: a value equal to the limit passes. An optional size limit missing from the `limits` argument falls
+  back to its default, so `checkTimelineLimits` always checks all three.
 - The codes are `MAX_DURATION_SECONDS`, `MAX_WIDTH`, `MAX_HEIGHT`, `MAX_FPS`, `MAX_SCENES`, `MAX_CHAPTERS`, `MAX_TRACKS`,
-  `MAX_ASSETS`, `MAX_PROMPT_CHARS` and `INVALID_DIMENSIONS`. `INVALID_DIMENSIONS` is returned by `checkVideoRequestLimits`
+  `MAX_ASSETS`, `MAX_PROMPT_CHARS`, `MAX_TRACK_ITEMS`, `MAX_LAYERS`, `MAX_TIMELINE_BYTES` and `INVALID_DIMENSIONS`. `INVALID_DIMENSIONS` is returned by `checkVideoRequestLimits`
   when `resolveDimensions` throws, for example when custom dimensions are missing. Its `limit` and `actual` are `0`.
 - The API rejects over-limit requests with `422 LIMIT_EXCEEDED`. The director checks limits before any provider call, and
   checks the compiled timeline again ([AI_DIRECTOR.md](AI_DIRECTOR.md)).
 - The schema still keeps fixed *sanity* bounds that limits cannot raise: dimensions 16..8192, fps 1..240, 500 camera keyframes,
-  500 layers per content, 200 zoom regions, the JSON limits, and the text lengths.
+  500 layers per content, 200 zoom regions, the JSON limits (including the 10 000-node budget per JSON value), and the text
+  lengths.
 
 ## 14. Versioning and migrations
 
@@ -1235,9 +1317,12 @@ function.
 
 - Each `ProjectVersion` row stores `timeline` (JSON) and `schemaVersion` (the version at write time). See
   [DATABASE.md](DATABASE.md).
-- Rows are **migrated on read** and never rewritten. `toVersionDto` runs `parseTimeline(row.timeline)` and reports the
-  migrated `timeline.schemaVersion`. The version list (`toVersionSummaryDto`) reports the stored `row.schemaVersion`. After a
-  bump the two can differ for old rows, and that is expected.
+- Rows are **migrated on read** and never rewritten. `toVersionDto` runs `safeParseTimeline(row.timeline)` and reports the
+  migrated `timeline.schemaVersion`; a row that fails is answered as 500 `DATA_INTEGRITY`. The serialized result is cached per
+  process (versions are immutable), so a row is validated once per process, not on every view. The version list
+  (`toVersionSummaryDto`) reports the stored `row.schemaVersion` and the summary columns `sceneCount`, `durationInFrames` and
+  `fps` written with the row; it never reads the timeline JSON. After a bump the two schema versions can differ for old rows,
+  and that is expected.
 - A reader on old code that meets a newer document fails with `UNSUPPORTED_VERSION`. It never mis-parses the document.
 
 ### 14.4 How to add v2, step by step
@@ -1278,9 +1363,9 @@ reader would silently drop the field when it re-saves the document.
      invalid version (`timeline.test.ts`);
    - "TIMELINE_MIGRATIONS is empty in v1" and "errors on versions newer than current", which uses version 2
      (`migrations-limits.test.ts`).
-6. **Update the producers.** Fixtures use `CURRENT_TIMELINE_VERSION`. At the time of writing,
-   `packages/ai-director/src/compiler.ts` writes `schemaVersion: 1 as const`: switch it to the constant. Re-run the director
-   tests. `ReferenceProfile` has its own, independent `schemaVersion` ([section 16](#16-referenceprofile-schema)); do not bump
+6. **Update the producers.** Fixtures and `packages/ai-director/src/compiler.ts` already write `CURRENT_TIMELINE_VERSION`
+   (the director has a test for it). Re-run the director tests. The version ETag of studio-api includes the timeline version,
+   so cached version responses are invalidated by the bump. `ReferenceProfile` has its own, independent `schemaVersion` ([section 16](#16-referenceprofile-schema)); do not bump
    it.
 7. **Deploy together.** `@vc/schema` is compiled into studio-api, the director worker and studio-web, and the web app validates
    API responses with `ProjectVersionDTOSchema`. Deploy all three from the same commit. A web build that only knows v1 would
@@ -1294,7 +1379,8 @@ reader would silently drop the field when it re-saves the document.
 ## 15. Examples
 
 Both examples below were written to temporary files and checked with a `tsx` script run through
-`pnpm --filter @vc/schema exec tsx …`. The script ran these checks:
+`pnpm --filter @vc/schema exec tsx …`, and checked again against the schema after the M1 review (2026-10-09). The script ran
+these checks:
 
 - `parseTimeline` succeeded.
 - The parsed result deep-equals the input, so nothing was stripped or defaulted.
@@ -1627,7 +1713,7 @@ The tracks are:
     }
   ],
   "metadata": {
-    "generator": { "name": "vc-ai-director", "version": "0.1.0", "promptVersion": "m1.0" },
+    "generator": { "name": "vc-ai-director", "version": "0.1.0", "promptVersion": "m1.1" },
     "language": "en",
     "createdAt": "2026-10-09T08:00:00.000Z"
   }
@@ -1645,6 +1731,8 @@ How the example satisfies each invariant:
 7. Keyframes are `< 90` and `< 60`. The `3d` camera is on the `three` scene.
 8. The fades total 45 ≤ 360. The layers end at 110 ≤ 120 and 90 ≤ 90.
 9. There is no `generated` scene, so invariant 9 does not apply.
+10. Every string is plain well-formed text, and the asset URIs are already in normalized form, so the parsed result equals the
+    input.
 
 ### 15.3 Validating your own timeline
 
@@ -1713,30 +1801,35 @@ The table lists where it is stricter, more specific or broader. None of these di
 
 | Area | Spec | Implementation |
 |---|---|---|
-| `SafeUriSchema` | `asset:` or `https:`; reject `http`, `file`, `data`, `javascript`, credentials, control characters | It is an allow-list, so every other scheme (`ftp:`, `blob:`, …) is rejected too. It also rejects **any whitespace**, requires a **non-empty host** (`asset:img-1` fails), and requires at least 1 character. |
-| JSON props | `props: Record<string, JsonValue>`, max depth 8 | `props` uses `JsonObjectSchema`. Depth counts nested containers, and the props object itself is level 1. The schema is built without recursion, so it converts to JSON Schema. |
+| `SafeUriSchema` | `asset:` or `https:`; reject `http`, `file`, `data`, `javascript`, credentials, control characters | It is an allow-list, so every other scheme (`ftp:`, `blob:`, …) is rejected too. It requires the literal `https://` or `asset://` prefix, a valid `Id` as the `asset://` host and a fully-qualified DNS name as the `https://` host (no IP literals, no local names), and rejects whitespace, invisible format characters, backslashes, `@`, percent-encoded controls and dot segments ([section 10.2](#102-safeuri-rules)). It returns the normalized `URL.href`. |
+| JSON props | `props: Record<string, JsonValue>`, max depth 8 | `props` uses `JsonObjectSchema`. Depth counts nested containers, and the props object itself is level 1. Also a 10 000-node budget per value, reserved keys (`__proto__`, `constructor`, `prototype`) rejected, and well-formed text. The schema is built without recursion, so it converts to JSON Schema. |
+| Text | Not specified | Every string in a timeline, a `VideoRequest` and the director artifacts must be well-formed UTF-16 ([invariant 10](#invariant-10-every-string-is-well-formed-utf-16)). `VideoRequest.title` and `prompt` are trimmed and must contain a visible character (not only whitespace or zero-width characters). |
 | Structural extras | — | Added bounds: `layers` ≤ 500, `zoomRegions` ≤ 200, `negativePrompt` ≤ 4000, `jobId` 1..256, `narration.voiceId` 1..128, track `name` 1..200, `AssetRef.name` 1..255, `provider` 1..120, `license` 1..500, `width` and `height` int ≥ 1, generator `name` 1..120, `version` and `promptVersion` 1..64. `storyboardSceneId` is a free string of 1..128, not an `Id`. |
 | Unknown keys | Not specified | Stripped silently (Zod's default). |
 | When invariants run | Not specified | Skipped if the structural pass produced an aborting issue ([section 5.1](#51-how-validation-runs)). |
 | Invariant 3 | Unique ids | The timeline's own `id` is outside the namespace. Ids are claimed in a fixed order, so the later duplicate is the one reported. |
-| Invariant 4 | Kinds for footage, screen, video clips, image content, image layers, brand logo, audio, `three` model, generated | Also covers overlay `image` content and image layers inside overlay `motion2d` content. |
-| Invariant 5 | Items within bounds; no overlap (sorted) | "Not sorted" and "overlaps" are reported separately. Touching items are allowed. |
-| Invariant 8 | Layers fit the scene | Layers inside overlay content must also fit their overlay item. |
+| Invariant 4 | Kinds for footage, screen, video clips, image content, image layers, brand logo, audio, `three` model, generated | Also covers overlay `image` content, image layers inside overlay `motion2d` content, and the asset-reference props that catalog templates declare (`split-feature.imageAssetId`). |
+| Invariant 5 | Items within bounds; no overlap (sorted) | "Not sorted" and "overlaps" are reported separately. Touching items are allowed. `trimStartFrame` must be smaller than the asset's declared `durationInFrames`. |
+| Invariant 8 | Layers fit the scene | Layers inside overlay content must also fit their overlay item, and `screen` zoom regions must lie within the scene. |
+| Invariant 10 | Not specified | Added: every string is well-formed UTF-16. |
+| `secondsToFrames` | `Math.round(seconds * fps)` | `Math.round(seconds × fps + 1e-9)`, so exact halves that floating point puts just below `.5` still round up. |
+| `allocateFrames` | Largest remainder, exact sum, `RangeError` on invalid input | Also requires safe integers, normalizes weights by their maximum (any finite positive weights work), bounds every loop and checks its postcondition. |
+| `VideoRequestSchema` | Custom aspect or resolution needs custom dims | With a preset aspect ratio and `resolution: 'custom'`, the custom size must match the ratio within ±1 px per side. With `aspectRatio: 'custom'` the resolution preset is ignored. |
 | `safeParseTimeline` | Non-throwing variant | Converts `TimelineMigrationError` into a ZodError (root path for `INVALID_DOCUMENT`, otherwise `schemaVersion`). Other exceptions propagate. |
 | `migrateTimeline` | `(input, migrations)` | Adds a `targetVersion` parameter, checks each step's output version, and uses typed error codes. |
 | `expandCameraPreset` | Push-in, pan, Ken Burns, orbit, dolly, crane and static described | All 15 presets are defined in both spaces: 2D orbit, crane and dolly are approximations; 3D push and pull use `fov`; `handheld` has 6 keyframes; 1-frame scenes collapse to the start pose ([section 7](#7-camera-tracks-and-presets)). |
-| `resolveDimensions` | Custom aspect or resolution requires both dimensions | Custom values are also rounded to the nearest even integer (minimum 2). The 16..8192 range is left to the schemas. |
-| Limits | `checkTimelineLimits`, `checkVideoRequestLimits` | Adds the `INVALID_DIMENSIONS` code. `maxAssets` also bounds `referenceAssetIds`, and `maxPromptChars` also bounds `generated` scene prompts. Limits are inclusive. |
+| `resolveDimensions` | Custom aspect or resolution requires both dimensions | Custom values are also rounded to the nearest even integer, and a resolved side outside 16..8192 throws `RangeError`. |
+| Limits | `checkTimelineLimits`, `checkVideoRequestLimits` | Adds the `INVALID_DIMENSIONS` code. `maxAssets` also bounds `referenceAssetIds`, and `maxPromptChars` also bounds `generated` scene prompts. Adds the optional `maxTrackItems`, `maxLayers` and `maxTimelineBytes` limits (defaults 20 000, 5 000, 20 MiB) with their codes. Limits are inclusive. |
 | Templates | `step-instruction`: `stepNumber` int ≥ 1, `totalSteps` int ≥ 1 | Both are capped at 999, with a refinement `stepNumber ≤ totalSteps`. Every text prop has explicit length bounds, and `stat-counter.value` is bounded to ±1e15. |
 | `ReferenceProfile` | As listed | Added bounds: `keyframeAssetIds` ≤ 50, `dominantColors` ≤ 16, the refinement `endSeconds ≥ startSeconds`, `fontsDetected` ≤ 50, `moodTags` items 1..64 characters, `metadata.fps` (0, 1000], `tempoBpm` (0, 400], `loudnessLufs` −100..10. |
-| Extra exports | — | `TimelineBaseSchema`, `TimelineMetadataSchema`, `TimelineGeneratorSchema`, `NormalizedSchema`, `LanguageTagSchema`, `IsoDateTimeSchema`, `JsonObjectSchema`, `JSON_LIMITS`, `EvenDimensionSchema`, `FpsSchema`, `RESOLUTION_SHORT_SIDE`, `ASPECT_RATIO_VALUES`, `OverlayContentSchema`, `NarrationSchema`, `Vec3Schema`, `TimelineMigrationError`, `formatZodIssues`, `llmSchemaIssues`, `TEMPLATE_IDS`, `isCatalogTemplateId`, `TemplateSummarySchema`, `defineTemplate`. |
+| Extra exports | — | `TimelineBaseSchema`, `TimelineMetadataSchema`, `TimelineGeneratorSchema`, `NormalizedSchema`, `LanguageTagSchema`, `IsoDateTimeSchema`, `JsonObjectSchema`, `JSON_LIMITS`, `RESERVED_JSON_KEYS`, `MAX_URI_LENGTH`, `isWellFormedText`, `toWellFormedText`, `findIllFormedStrings`, `ILL_FORMED_TEXT_MESSAGE`, `EvenDimensionSchema`, `FpsSchema`, `RESOLUTION_SHORT_SIDE`, `ASPECT_RATIO_VALUES`, `dimensionsMatchAspectRatio`, `SECONDS_TO_FRAMES_EPSILON`, `CoreResourceLimitsSchema`, `TimelineSizeLimitsSchema`, `utf8ByteLength`, `countTimelineLayers`, `countTimelineTrackItems`, `OverlayContentSchema`, `NarrationSchema`, `Vec3Schema`, `TimelineMigrationError`, `formatZodIssues`, `llmSchemaIssues`, `TEMPLATE_IDS`, `isCatalogTemplateId`, `getTemplateAssetRefProps`, `TemplateSummarySchema`, `defineTemplate`. |
 
 ## 18. Source map
 
 | File (`packages/schema/src/`) | Contents |
 |---|---|
-| `common.ts` | `IdSchema`, `TemplateIdSchema`, `HexColorSchema`, `FrameSchema`, `DurationFramesSchema`, `EasingSchema`, `NormalizedSchema`, `FontFamilySchema`, `LanguageTagSchema`, `IsoDateTimeSchema`, `JsonValueSchema`, `JsonObjectSchema`, `SafeUriSchema`, `formatZodIssues` |
-| `render-settings.ts` | `AspectRatioSchema`, `ResolutionSchema`, `EvenDimensionSchema`, `FpsSchema`, `RenderSettingsSchema`, `resolveDimensions` |
+| `common.ts` | `IdSchema`, `TemplateIdSchema`, `HexColorSchema`, `FrameSchema`, `DurationFramesSchema`, `EasingSchema`, `NormalizedSchema`, `FontFamilySchema`, `LanguageTagSchema`, `IsoDateTimeSchema`, well-formed text helpers, `JsonValueSchema`, `JsonObjectSchema`, `SafeUriSchema`, `formatZodIssues` |
+| `render-settings.ts` | `AspectRatioSchema`, `ResolutionSchema`, `EvenDimensionSchema`, `FpsSchema`, `RenderSettingsSchema`, `resolveDimensions`, `dimensionsMatchAspectRatio` |
 | `frames.ts` | `secondsToFrames`, `framesToSeconds`, `allocateFrames`, `formatTimecode` |
 | `assets.ts` | `AssetRefSchema`, `AssetKindSchema`, `AssetSourceSchema`, `MimeTypeSchema` |
 | `camera.ts` | Camera keyframes and tracks, `CameraPresetSchema`, `expandCameraPreset` |
@@ -1745,9 +1838,9 @@ The table lists where it is stricter, more specific or broader. None of these di
 | `scene-content.ts` | `SceneContentSchema` (6 engines), `OverlayContentSchema`, `EngineTypeSchema` |
 | `scene.ts`, `chapter.ts`, `brand.ts` | `SceneSchema`, `NarrationSchema`, `ChapterSchema`, `BrandKitSchema` |
 | `tracks.ts` | `TrackSchema` (audio, caption, overlay, video) |
-| `timeline.ts` | `TimelineBaseSchema`, `TimelineSchema` (invariants 1–9), `parseTimeline`, `safeParseTimeline` |
+| `timeline.ts` | `TimelineBaseSchema`, `TimelineSchema` (invariants 1–10), `parseTimeline`, `safeParseTimeline` |
 | `migrations.ts` | `CURRENT_TIMELINE_VERSION`, `TIMELINE_MIGRATIONS`, `migrateTimeline`, `TimelineMigrationError` |
-| `limits.ts` | `ResourceLimitsSchema`, `DEFAULT_RESOURCE_LIMITS`, `checkTimelineLimits`, `checkVideoRequestLimits` |
+| `limits.ts` | `ResourceLimitsSchema`, `CoreResourceLimitsSchema`, `TimelineSizeLimitsSchema`, `DEFAULT_RESOURCE_LIMITS`, `checkTimelineLimits`, `checkVideoRequestLimits`, size counters |
 | `reference-profile.ts` | `ReferenceProfileSchema` |
 | `director.ts` | Request and director artifact schemas, vocabularies, usage, `llmSchemaIssues` |
 | `templates/` | One file per template, plus `catalog.ts`, `helpers.ts` and `types.ts` |
@@ -1760,5 +1853,7 @@ The table lists where it is stricter, more specific or broader. None of these di
 | `render-camera.test.ts` | `resolveDimensions`, `RenderSettingsSchema`, `expandCameraPreset` (every preset × space × 8 durations) |
 | `common.test.ts`, `content-tracks.test.ts` | Primitives, `SafeUri`, JSON limits, content, layers and tracks |
 | `migrations-limits.test.ts` | Migrations (injected v0 → v1) and resource limits |
-| `templates.test.ts`, `director.test.ts` | Catalog, `buildProps` over 7 contexts, LLM safety of every LLM-facing schema |
+| `templates.test.ts`, `director.test.ts`, `template-helpers.test.ts` | Catalog, `buildProps` over 7 contexts, LLM safety of every LLM-facing schema, surrogate-safe `clip` |
+| `hardening.test.ts` | Review regressions: `allocateFrames` guards, ill-formed text, `VideoRequest` trimming and custom sizes, size limits and the node budget, reserved keys, `SafeUri` bypasses and normalization, `secondsToFrames` halves, `resolveDimensions` range errors, the new invariants |
+| `reference-api.test.ts`, `index.test.ts` | `ReferenceProfile` and API DTOs; the public exports |
 | `fixtures.ts` | `buildValidTimeline()` (every engine and track kind) and `buildMinimalTimeline()` |
