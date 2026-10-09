@@ -14,7 +14,8 @@
     "db:migrate:dev": "prisma migrate dev",
     "db:seed": "tsx --env-file-if-exists=.env src/scripts/seed.ts",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "postinstall": "prisma generate"
   },
   "dependencies": {
     "@fastify/cors": "^11.3.1",

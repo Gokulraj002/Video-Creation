@@ -1,7 +1,7 @@
 import { DirectorError, type DirectorProgress, type DirectorResult } from '@vc/ai-director';
 import { VideoRequestSchema, type DirectorRunProgress, type UsageReport } from '@vc/schema';
 import type { AppConfig } from '../config';
-import { ProjectStatus, RunStatus, type PrismaClient } from '../db';
+import { Prisma, ProjectStatus, RunStatus, type PrismaClient } from '../db';
 import { toJsonInput } from '../lib/json';
 import type { Logger } from '../lib/logger';
 import { restoreProjectStatus, type RunOutcome } from '../services/project-status';
@@ -180,8 +180,11 @@ export async function processDirectorRun(runId: string, deps: ProcessRunDeps): P
     }
   }
 
+  // Tokens spent before a failure/cancellation still count (quota + usage reporting).
+  const partialUsage = failure instanceof DirectorError ? failure.usage : null;
+
   if (state.abortReason === 'cancelled') {
-    await finalizeStopped(prisma, runId, projectId, 'cancelled');
+    await finalizeStopped(prisma, runId, projectId, 'cancelled', partialUsage);
     log('info', { projectId }, 'director run cancelled');
     return;
   }
@@ -191,15 +194,16 @@ export async function processDirectorRun(runId: string, deps: ProcessRunDeps): P
   if (state.abortReason === 'timeout') {
     code = 'TIMEOUT';
     message = `Director run exceeded the configured timeout of ${config.director.runTimeoutMs} ms`;
-  } else if (failure instanceof DirectorError) {
+  } else if (failure instanceof DirectorError && failure.code !== 'INTERNAL') {
     code = failure.code;
     message = sanitizeErrorMessage(failure.message);
   } else {
+    // Internal errors may carry stack-ish details: log them, store a generic message.
     code = 'INTERNAL';
     message = 'Unexpected error while directing the video (see server logs)';
   }
   log(code === 'INTERNAL' ? 'error' : 'warn', { projectId, code, err: failure }, 'director run failed');
-  await markRunFailed(prisma, runId, code, message);
+  await markRunFailed(prisma, runId, code, message, partialUsage);
 }
 
 async function persistSuccess(
@@ -251,13 +255,20 @@ export async function markRunFailed(
   runId: string,
   code: string,
   message: string,
+  usage: UsageReport | null = null,
 ): Promise<void> {
   await prisma.$transaction(async (tx) => {
     const row = await tx.directorRun.findUnique({ where: { id: runId }, select: { projectId: true } });
     if (row === null) return;
     const res = await tx.directorRun.updateMany({
       where: { id: runId, status: { in: [RunStatus.QUEUED, RunStatus.RUNNING] } },
-      data: { status: RunStatus.FAILED, errorCode: code, errorMessage: message, finishedAt: new Date() },
+      data: {
+        status: RunStatus.FAILED,
+        errorCode: code,
+        errorMessage: message,
+        finishedAt: new Date(),
+        ...(usage !== null ? usageColumns(usage) : {}),
+      },
     });
     if (res.count > 0) await restoreProjectStatus(tx, row.projectId, 'failed');
   });
@@ -269,12 +280,19 @@ async function finalizeStopped(
   runId: string,
   projectId: string,
   outcome: RunOutcome,
+  usage: UsageReport | null = null,
 ): Promise<void> {
   await prisma.$transaction(async (tx) => {
     await tx.directorRun.updateMany({
       where: { id: runId, status: RunStatus.CANCELLED, finishedAt: null },
       data: { finishedAt: new Date() },
     });
+    if (usage !== null) {
+      await tx.directorRun.updateMany({
+        where: { id: runId, status: RunStatus.CANCELLED, usage: { equals: Prisma.DbNull } },
+        data: usageColumns(usage),
+      });
+    }
     const project = await tx.project.findUnique({ where: { id: projectId }, select: { status: true } });
     if (project?.status === ProjectStatus.DIRECTING) await restoreProjectStatus(tx, projectId, outcome);
   });

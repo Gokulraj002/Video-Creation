@@ -1,9 +1,16 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "lib": ["ES2022"],
+    "lib": [
+      "ES2022"
+    ],
     "noUnusedLocals": true,
     "noUnusedParameters": true
   },
-  "include": ["src", "test", "prisma.config.ts"]
+  "include": [
+    "src",
+    "test",
+    "prisma.config.ts",
+    "vitest.config.ts"
+  ]
 }

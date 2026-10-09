@@ -103,7 +103,7 @@ flowchart TB
   sys -.->|"planned"| vgen
   camp --> wa
   camp --> el
-  campaigns -. "merge as a module (planned, M7)" .-> studio
+  campaigns -.->|"merge as a module (planned, M7)"| studio
 ```
 
 In local development both products share one Postgres server (different databases) and one Redis instance (different queue
@@ -238,8 +238,8 @@ flowchart LR
   capi --> core
   cworker --> core
   cworker --> video
-  web -. "never imports" .-> dirPk
-  studioPk -. "no imports either way until M7" .-> campPk
+  web -.->|"never imports"| dirPk
+  studioPk -.->|"no imports either way until M7"| campPk
 
   linkStyle 11,12 stroke:#dc2626,stroke-width:2px
 ```
