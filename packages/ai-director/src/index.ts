@@ -7,6 +7,7 @@ export * from './provider';
 export * from './providers';
 export * from './structured-output';
 export * from './pricing';
+export * from './cost-ceiling';
 export * from './usage';
 export * from './cache';
 export * from './planning';

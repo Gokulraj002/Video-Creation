@@ -1,6 +1,7 @@
 import {
   allocateFrames,
   checkTimelineLimits,
+  CURRENT_TIMELINE_VERSION,
   expandCameraPreset,
   formatZodIssues,
   IdSchema,
@@ -25,7 +26,7 @@ import {
   type VideoRequest,
 } from '@vc/schema';
 import { cameraPresetForMovement } from './camera-mapping';
-import { InternalDirectorError, LimitExceededError } from './errors';
+import { InternalDirectorError, LimitExceededError, ValidationFailedError } from './errors';
 import { genreProfile } from './genres';
 import { isHexColor, luminance, readableOn, uniqueHexColors } from './util/color';
 import { clip, words } from './util/text';
@@ -33,8 +34,30 @@ import { clip, words } from './util/text';
 export const GENERATOR_NAME = 'vc-ai-director';
 export const GENERATOR_VERSION = '0.1.0';
 export const DEFAULT_FONT = 'Inter';
-/** Max words per caption cue. */
+/** Max words (word-like units for languages written without spaces) per caption cue. */
 export const CAPTION_MAX_WORDS = 7;
+/** Max characters (code points) per caption cue. */
+export const CAPTION_MAX_CUE_CHARS = 80;
+/** Tokens longer than this (code points) are split with `Intl.Segmenter` (ja, zh, th... are written without spaces). */
+export const CAPTION_MAX_UNIT_CHARS = 24;
+/** Fixed chunk size (code points) when a token cannot be segmented into words. */
+export const CAPTION_FALLBACK_CHUNK_CHARS = 12;
+/** Max length of one caption cue text (schema limit). */
+const CAPTION_TEXT_MAX = 500;
+/** Id of the generated caption track. */
+export const CAPTION_TRACK_ID = 'captions';
+
+/**
+ * Ids the director generates: timeline chapters `c{n}`, scenes `c{n}-s{m}`, caption cues `c{n}-s{m}-cap{k}`, the
+ * `captions` track (all in the timeline's global id namespace), plus artifact shot ids `sh{n}` and script segment ids
+ * `c{n}-g{k}`. Input asset ids must not match (the timeline would contain duplicate ids).
+ */
+export const RESERVED_ID_PATTERN = /^(?:captions|c\d+(?:-(?:s\d+(?:-cap\d+)?|g\d+))?|sh\d+)$/;
+
+/** True when `id` is one of the ids the director generates (see {@link RESERVED_ID_PATTERN}). */
+export function isReservedId(id: string): boolean {
+  return RESERVED_ID_PATTERN.test(id);
+}
 
 export interface CompileInput {
   request: VideoRequest;
@@ -54,15 +77,23 @@ export interface CompileResult {
 
 const DEFAULT_COLORS = { primary: '#1E3A8A', secondary: '#F59E0B', accent: '#10B981', background: '#0F172A' } as const;
 
+/** Alpha channel (0..255) of a #RRGGBB[AA] color (255 when absent). */
+function alphaOf(hex: string): number {
+  return hex.length === 9 ? parseInt(hex.slice(7, 9), 16) : 255;
+}
+
 /** Brand kit from the request brand colors + brief palette, with sensible defaults. */
 export function buildBrandKit(request: VideoRequest, palette: readonly string[], assets: readonly AssetRef[], warnings: string[]): BrandKit {
-  const brandColors = uniqueHexColors(request.brand?.colors ?? []);
-  const colors = uniqueHexColors([...brandColors, ...palette]);
+  // Fully transparent colors are meaningless in a brand kit; the background must be opaque (translucent colors
+  // would let whatever is behind the video show through).
+  const brandColors = uniqueHexColors(request.brand?.colors ?? []).filter((c) => alphaOf(c) > 0);
+  const colors = uniqueHexColors([...brandColors, ...palette]).filter((c) => alphaOf(c) > 0);
+  const opaque = (list: readonly string[]) => list.filter((c) => alphaOf(c) === 255);
   const darkestOf = (list: readonly string[]) =>
     list.reduce<string | null>((best, c) => (best === null || luminance(c) < luminance(best) ? c : best), null);
-  // Background: the darkest brand color when the brand has a dark one, else the darkest palette color.
-  const darkBrand = darkestOf(brandColors);
-  const darkest = darkBrand !== null && luminance(darkBrand) < 0.2 ? darkBrand : darkestOf(colors);
+  // Background: the darkest opaque brand color when the brand has a dark one, else the darkest opaque palette color.
+  const darkBrand = darkestOf(opaque(brandColors));
+  const darkest = darkBrand !== null && luminance(darkBrand) < 0.2 ? darkBrand : darkestOf(opaque(colors));
   const background = darkest !== null && luminance(darkest) < 0.2 ? darkest : DEFAULT_COLORS.background;
   const rest = colors.filter((c) => c !== background);
   const primary = rest[0] ?? DEFAULT_COLORS.primary;
@@ -93,16 +124,105 @@ function transitionFor(scene: StoryboardScene, index: number, frames: readonly n
   return transition;
 }
 
-/** Caption cues of ≤ 7 words, frames proportional to word count, contiguous over the scene. */
-function captionCues(sceneId: string, text: string, startFrame: number, frames: number, warnings: string[]): CaptionItem[] {
-  const w = words(text);
-  if (w.length === 0) return [];
-  const chunks: string[][] = [];
-  for (let i = 0; i < w.length; i += CAPTION_MAX_WORDS) chunks.push(w.slice(i, i + CAPTION_MAX_WORDS));
-  let cues = chunks;
+/** One caption word (or word-like unit); `spaceBefore` = it started a whitespace-separated token. */
+interface CaptionUnit {
+  text: string;
+  spaceBefore: boolean;
+  chars: number;
+}
+
+function codePointLength(text: string): number {
+  return Array.from(text).length;
+}
+
+function chunkCodePoints(text: string, size: number): string[] {
+  const points = [...text];
+  const out: string[] = [];
+  for (let i = 0; i < points.length; i += size) out.push(points.slice(i, i + size).join(''));
+  return out;
+}
+
+const SEGMENTERS = new Map<string, Intl.Segmenter | null>();
+
+function wordSegmenter(language: string): Intl.Segmenter | null {
+  if (SEGMENTERS.has(language)) return SEGMENTERS.get(language) ?? null;
+  let segmenter: Intl.Segmenter | null = null;
+  try {
+    segmenter = typeof Intl.Segmenter === 'function' ? new Intl.Segmenter(language, { granularity: 'word' }) : null;
+  } catch {
+    segmenter = null;
+  }
+  SEGMENTERS.set(language, segmenter);
+  return segmenter;
+}
+
+/**
+ * Splits a long token (a whole sentence in languages written without spaces, an emoji run...) into word-like
+ * pieces with `Intl.Segmenter` (punctuation sticks to the preceding word); pieces that are still too long — or every
+ * piece when no segmenter is available — are cut into fixed code-point chunks. Nothing is dropped.
+ */
+function splitLongToken(token: string, language: string): string[] {
+  const pieces: string[] = [];
+  const segmenter = wordSegmenter(language);
+  if (segmenter) {
+    for (const part of segmenter.segment(token)) {
+      const last = pieces.length - 1;
+      if (!part.isWordLike && last >= 0) pieces[last] = `${pieces[last] ?? ''}${part.segment}`;
+      else pieces.push(part.segment);
+    }
+  } else {
+    pieces.push(token);
+  }
+  return pieces.flatMap((p) => (codePointLength(p) > CAPTION_MAX_UNIT_CHARS ? chunkCodePoints(p, CAPTION_FALLBACK_CHUNK_CHARS) : [p]));
+}
+
+function captionUnits(text: string, language: string): CaptionUnit[] {
+  const units: CaptionUnit[] = [];
+  for (const token of words(text)) {
+    const pieces = codePointLength(token) > CAPTION_MAX_UNIT_CHARS ? splitLongToken(token, language) : [token];
+    pieces.forEach((piece, k) => {
+      if (piece.length > 0) units.push({ text: piece, spaceBefore: k === 0, chars: codePointLength(piece) });
+    });
+  }
+  return units;
+}
+
+function cueText(units: readonly CaptionUnit[]): string {
+  return units.map((u, i) => (i > 0 && u.spaceBefore ? ` ${u.text}` : u.text)).join('');
+}
+
+/** Groups units into cues of ≤ `CAPTION_MAX_WORDS` units and ≤ `CAPTION_MAX_CUE_CHARS` characters. */
+function groupCues(units: readonly CaptionUnit[]): CaptionUnit[][] {
+  const cues: CaptionUnit[][] = [];
+  let current: CaptionUnit[] = [];
+  let chars = 0;
+  for (const unit of units) {
+    const extra = unit.chars + (current.length > 0 && unit.spaceBefore ? 1 : 0);
+    if (current.length > 0 && (current.length >= CAPTION_MAX_WORDS || chars + extra > CAPTION_MAX_CUE_CHARS)) {
+      cues.push(current);
+      current = [];
+      chars = 0;
+    }
+    chars += current.length > 0 ? extra : unit.chars;
+    current.push(unit);
+  }
+  if (current.length > 0) cues.push(current);
+  return cues;
+}
+
+/**
+ * Caption cues of ≤ 7 words (word-segmented with `Intl.Segmenter` for languages written without spaces), frames
+ * proportional to word count, contiguous over the scene. When there are more cues than frames, words are regrouped
+ * into fewer, longer cues; text is only cut (with a warning) when a cue would exceed the 500-character limit.
+ */
+function captionCues(sceneId: string, text: string, language: string, startFrame: number, frames: number, warnings: string[]): CaptionItem[] {
+  const units = captionUnits(text, language);
+  if (units.length === 0) return [];
+  let cues = groupCues(units);
   if (cues.length > frames) {
-    cues = chunks.slice(0, frames);
-    warnings.push(`Scene "${sceneId}": narration is too long for ${frames} frame(s); captions were truncated.`);
+    const perCue = Math.ceil(units.length / frames);
+    cues = [];
+    for (let i = 0; i < units.length; i += perCue) cues.push(units.slice(i, i + perCue));
   }
   const allocation = allocateFrames(
     cues.map((c) => c.length),
@@ -110,13 +230,32 @@ function captionCues(sceneId: string, text: string, startFrame: number, frames: 
     1,
   );
   const items: CaptionItem[] = [];
+  let truncated = false;
   let cursor = startFrame;
   cues.forEach((cue, k) => {
     const d = allocation[k] ?? 1;
-    items.push({ id: `${sceneId}-cap${k + 1}`, startFrame: cursor, durationInFrames: d, text: clip(cue.join(' '), 500) });
+    const full = cueText(cue).replace(/\s+/g, ' ').trim();
+    if (full.length > CAPTION_TEXT_MAX) truncated = true;
+    items.push({ id: `${sceneId}-cap${k + 1}`, startFrame: cursor, durationInFrames: d, text: clip(full, CAPTION_TEXT_MAX) });
     cursor += d;
   });
+  if (truncated) warnings.push(`Scene "${sceneId}": narration is too long for ${frames} frame(s); captions were truncated.`);
   return items;
+}
+
+/** Frame-allocation weights from storyboard durations: finite and > 0, rescaled when absurdly large (no overflow). */
+function durationWeights(storyboard: readonly StoryboardScene[]): number[] {
+  const issues: string[] = [];
+  storyboard.forEach((s, i) => {
+    if (!Number.isFinite(s.durationSeconds) || s.durationSeconds <= 0) {
+      issues.push(`storyboard.scenes.${i}.durationSeconds: must be a finite number > 0 (got ${String(s.durationSeconds)})`);
+    }
+  });
+  if (issues.length > 0) throw new ValidationFailedError('Storyboard scene durations are invalid', issues, { stage: 'compile' });
+  const durations = storyboard.map((s) => s.durationSeconds);
+  const largest = durations.reduce((a, b) => Math.max(a, b), 0);
+  // Only relative durations matter; normalizing huge values keeps the allocation arithmetic finite.
+  return largest > 1e6 ? durations.map((d) => Math.max(d / largest, 1e-9)) : durations;
 }
 
 function contentFor(
@@ -177,11 +316,7 @@ export function compileTimeline(input: CompileInput): CompileResult {
     ]);
   }
   const minFrames = Math.max(1, Math.min(fps, Math.floor(totalFrames / sceneCount)));
-  const frames = allocateFrames(
-    storyboard.map((s) => s.durationSeconds),
-    totalFrames,
-    minFrames,
-  );
+  const frames = allocateFrames(durationWeights(storyboard), totalFrames, minFrames);
 
   const specs = new Map(artifacts.sceneSpecs.scenes.map((s) => [s.sceneId, s]));
   const brand = buildBrandKit(request, artifacts.brief.visualStyle.palette, assets, warnings);
@@ -212,7 +347,7 @@ export function compileTimeline(input: CompileInput): CompileResult {
     const voiceOver = sb.voiceOver?.trim() ?? '';
     if (narrate && voiceOver.length > 0) {
       scene.narration = { text: clip(voiceOver, 5000), language: request.language };
-      captions.push(...captionCues(sb.id, voiceOver, cursor, duration, warnings));
+      captions.push(...captionCues(sb.id, voiceOver, request.language, cursor, duration, warnings));
     }
     scenes.push(scene);
     cursor += duration;
@@ -240,7 +375,7 @@ export function compileTimeline(input: CompileInput): CompileResult {
   const tracks: CaptionTrack[] = [];
   if (captions.length > 0) {
     tracks.push({
-      id: 'captions',
+      id: CAPTION_TRACK_ID,
       kind: 'caption',
       name: 'Captions',
       language: request.language,
@@ -259,7 +394,7 @@ export function compileTimeline(input: CompileInput): CompileResult {
 
   const timelineId = IdSchema.safeParse(input.timelineId).success ? input.timelineId : `tl-${Date.now().toString(36)}`;
   const draft = {
-    schemaVersion: 1 as const,
+    schemaVersion: CURRENT_TIMELINE_VERSION,
     id: timelineId,
     title: clip(request.title, 200),
     settings: {

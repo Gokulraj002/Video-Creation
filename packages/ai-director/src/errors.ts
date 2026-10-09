@@ -1,4 +1,5 @@
 import type { DirectorStage, LimitViolation, TokenUsage, UsageReport } from '@vc/schema';
+import type { ModelTokenUsage } from './usage';
 
 export const DIRECTOR_ERROR_CODES = [
   'VALIDATION_FAILED',
@@ -71,13 +72,37 @@ export interface RefusalDetails {
   explanation: string | null;
 }
 
+/**
+ * Tokens a failed-but-billed provider response consumed (refusals and truncations are still billed), so the
+ * director can account for them. `usageByModel` is the per-model breakdown when several models served the
+ * request (server-side fallbacks); `model` is the model that produced the final response.
+ */
+export interface BilledResponseInfo {
+  usage?: TokenUsage | null;
+  usageByModel?: readonly ModelTokenUsage[] | null;
+  model?: string | null;
+}
+
 /** The model declined the request (`stop_reason: "refusal"`). Never retried. */
 export class ProviderRefusalError extends DirectorError {
   readonly category: string | null;
-  constructor(message: string, refusal: RefusalDetails, options: Omit<DirectorErrorOptions, 'details' | 'retryable'> = {}) {
+  /** Tokens consumed by the refused response (null when unknown). */
+  readonly tokenUsage: TokenUsage | null;
+  readonly usageByModel: readonly ModelTokenUsage[] | null;
+  /** Model that produced the refusal (null when unknown). */
+  readonly model: string | null;
+  constructor(
+    message: string,
+    refusal: RefusalDetails,
+    options: Omit<DirectorErrorOptions, 'details' | 'retryable'> = {},
+    billed: BilledResponseInfo = {},
+  ) {
     super('PROVIDER_REFUSAL', message, { ...options, retryable: false, details: refusal });
     this.name = 'ProviderRefusalError';
     this.category = refusal.category;
+    this.tokenUsage = billed.usage ?? null;
+    this.usageByModel = billed.usageByModel && billed.usageByModel.length > 0 ? billed.usageByModel : null;
+    this.model = billed.model ?? null;
   }
 }
 
@@ -109,15 +134,20 @@ export class ProviderRequestError extends DirectorError {
 export class ProviderTruncatedError extends DirectorError {
   /** Tokens consumed by the truncated response (so the director can still account for them). */
   readonly tokenUsage: TokenUsage | null;
+  readonly usageByModel: readonly ModelTokenUsage[] | null;
+  /** Model that produced the truncated response (null when unknown). */
+  readonly model: string | null;
   readonly partialOutput: string | null;
   constructor(
     message: string,
-    extra: { usage?: TokenUsage | null; partialOutput?: string | null } = {},
+    extra: BilledResponseInfo & { partialOutput?: string | null } = {},
     options: Omit<DirectorErrorOptions, 'retryable'> = {},
   ) {
     super('PROVIDER_TRUNCATED', message, { ...options, retryable: false });
     this.name = 'ProviderTruncatedError';
     this.tokenUsage = extra.usage ?? null;
+    this.usageByModel = extra.usageByModel && extra.usageByModel.length > 0 ? extra.usageByModel : null;
+    this.model = extra.model ?? null;
     this.partialOutput = extra.partialOutput ?? null;
   }
 }

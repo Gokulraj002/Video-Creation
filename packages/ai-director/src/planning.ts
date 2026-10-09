@@ -99,9 +99,12 @@ export function planStructure(
   const totalFrames = Math.max(1, secondsToFrames(duration, fps));
   const targetSceneSeconds = targetSceneSecondsFor(request.genre, references);
 
-  // Scene count: >= 1 s per scene, at most one frame per scene, never above maxScenes.
+  // Scene count: >= 1 s per scene, at most one frame per scene, never above maxScenes, and never more than
+  // SCENES_PER_CHAPTER per allowed chapter (a small maxChapters must not pack thousands of scenes into one LLM call;
+  // like maxScenes, it lengthens scenes instead).
   const hardMax = duration < 1 ? 1 : Math.max(1, Math.min(Math.floor(duration), totalFrames, limits.maxScenes));
-  const expected = clamp(Math.round(duration / targetSceneSeconds), 1, Math.min(limits.maxScenes, hardMax));
+  const chapterSceneCap = Math.max(1, limits.maxChapters) * SCENES_PER_CHAPTER;
+  const expected = clamp(Math.round(duration / targetSceneSeconds), 1, Math.min(limits.maxScenes, hardMax, chapterSceneCap));
   const max = clamp(Math.ceil(expected * 1.25), 1, hardMax);
   const min = clamp(Math.floor(expected * 0.75), 1, max);
   const sceneCountRange = { min, max };

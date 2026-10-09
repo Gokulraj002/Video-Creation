@@ -21,7 +21,7 @@ import type {
 } from '../../stages';
 import { uniqueHexColors } from '../../util/color';
 import { clip, clipOr, round, sentences, words } from '../../util/text';
-import { analyzeRequest, beatVisual, comicLine, fnv1a, narration, Rng, shortLine, type TopicAnalysis } from './content';
+import { analyzeRequest, beatVisual, comicLine, displayTitle, fnv1a, narration, Rng, shortLine, type TopicAnalysis } from './content';
 
 type NonEmpty<T> = readonly [T, ...T[]];
 
@@ -100,9 +100,9 @@ export function mockBrief(input: BriefStageInput): CreativeBrief {
         )
       : null;
   return {
-    title: clip(request.title, 200),
+    title: displayTitle(request.title),
     logline: clip(topic.messages[0], 300),
-    objective: clip(p.objective.replace('{title}', request.title), 1000),
+    objective: clip(p.objective.replace('{title}', displayTitle(request.title)), 1000),
     targetAudience: clip(p.audience, 500),
     tone: tone.length > 0 ? tone : [...p.tone],
     genre: request.genre,

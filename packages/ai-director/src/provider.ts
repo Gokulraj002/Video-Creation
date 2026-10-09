@@ -1,5 +1,6 @@
 import type { z } from 'zod';
 import type { DirectorStage, TokenUsage } from '@vc/schema';
+import type { ModelTokenUsage } from './usage';
 
 /** One structured-output request made by the director (one stage, optionally one chunk of it). */
 export interface StructuredGenerationRequest<T> {
@@ -23,6 +24,11 @@ export interface StructuredGenerationResult {
   /** NOT yet validated — the director validates with Zod + semantic checks. */
   output: unknown;
   usage: TokenUsage;
+  /**
+   * Optional per-model breakdown of `usage` (e.g. Anthropic server-side fallbacks, where a declined hop and the
+   * serving fallback model are billed separately). When present the director prices every entry by its own model.
+   */
+  usageByModel?: ModelTokenUsage[];
   provider: string;
   /** Model that actually served the request. */
   model: string;
@@ -34,6 +40,12 @@ export interface AIProvider {
   readonly name: string;
   readonly model: string;
   readonly mode: 'mock' | 'live';
+  /**
+   * Stable fingerprint of every provider setting that can change outputs (model, effort, structured-output mode,
+   * fallbacks, mock logic version...). Part of every director cache key, so changing a setting never serves stale
+   * cached outputs. Optional for backward compatibility (custom providers without it share keys per name + model).
+   */
+  readonly configFingerprint?: string;
   generateStructured<T>(req: StructuredGenerationRequest<T>): Promise<StructuredGenerationResult>;
 }
 

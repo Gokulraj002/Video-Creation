@@ -14,6 +14,8 @@ import { mockBrief, mockChapterScript, mockChapterShotList, mockChapterStoryboar
 import { mockChapterEngineSelection, mockChapterSceneSpecs } from './heuristic/visuals';
 
 export const HEURISTIC_MOCK_MODEL = 'mock-director-v1';
+/** Bump when the heuristic output logic changes (part of the provider's cache fingerprint). */
+export const HEURISTIC_MOCK_VERSION = 2;
 
 /**
  * Deterministic, genre-aware provider that builds schema-valid AND semantically valid output for every stage
@@ -24,6 +26,7 @@ export class HeuristicMockProvider implements AIProvider {
   readonly name = 'mock';
   readonly model = HEURISTIC_MOCK_MODEL;
   readonly mode = 'mock' as const;
+  readonly configFingerprint = `heuristic-mock@${HEURISTIC_MOCK_VERSION}`;
 
   async generateStructured<T>(req: StructuredGenerationRequest<T>): Promise<StructuredGenerationResult> {
     const started = Date.now();

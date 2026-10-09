@@ -13,7 +13,7 @@ import { delegatingProvider, makeRequest } from './helpers';
 
 describe('prompts', () => {
   it('exports the prompt version', () => {
-    expect(PROMPT_VERSION).toBe('m1.0');
+    expect(PROMPT_VERSION).toBe('m1.1');
   });
 
   it('every stage system prompt declares tagged data untrusted and forbids code', () => {

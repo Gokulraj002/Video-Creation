@@ -1,6 +1,14 @@
 import type { GenreProfile } from '../../genres';
 import type { RequestDigest } from '../../stages';
-import { capitalize, clip, limitWords, sentence, sentences, words } from '../../util/text';
+import { capitalize, clip, clipOr, limitWords, sentence, sentences, sliceUnits, words } from '../../util/text';
+
+/** Fallback when the request title is blank (whitespace only). */
+export const UNTITLED = 'Untitled video';
+
+/** The request title, or {@link UNTITLED} when it is blank. */
+export function displayTitle(title: string, max = 200): string {
+  return clipOr(title, UNTITLED, max);
+}
 
 // =============================================================================================
 // Deterministic randomness
@@ -180,19 +188,20 @@ export function analyzeRequest(request: RequestDigest, profile: GenreProfile): T
   const price = PRICE.exec(text)?.[0]?.trim().replace(/[.,]+$/, '') ?? null;
   const contact = CONTACT.exec(text)?.[0]?.trim() ?? null;
   const haystack = `${request.title} ${text}`;
+  const title = displayTitle(request.title);
 
   return {
-    title: request.title,
+    title,
     messages: nonEmpty(
       messageCandidates.filter((m) => m !== ctaSentence).slice(0, 8),
-      genericMessages(request.title, profile),
+      genericMessages(title, profile),
     ),
     callToAction: ctaSentence ? clip(ctaSentence.replace(/[.!]+$/, ''), 200) : null,
-    steps: nonEmpty(steps.slice(0, 60), genericSteps(request.title)),
+    steps: nonEmpty(steps.slice(0, 60), genericSteps(title)),
     cautions: all.filter((s) => CAUTION_HINT.test(s)).map((s) => clip(s, 200)),
     features: features.filter((f, i, arr) => arr.indexOf(f) === i).slice(0, 6),
     location: location ? clip(location.replace(/[,\s]+$/, ''), 160) : null,
-    price: price ? price.slice(0, 40) : null,
+    price: price ? sliceUnits(price, 40) : null,
     contact: contact ? clip(contact, 160) : null,
     numericFacts: messageCandidates.filter((s) => NUMBER.test(s)).slice(0, 10),
     character: CHARACTER_HINTS.find(([re]) => re.test(haystack))?.[1] ?? null,

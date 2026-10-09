@@ -70,9 +70,24 @@ export interface CacheKeyParts {
   schemaName: string;
   system: string;
   prompt: string;
+  /**
+   * `hashStageInput(input)`: the structured stage input. Mock providers build outputs from it and the rendered prompt
+   * does not carry every field, so it must be part of the key. The director always sets it.
+   */
+  inputHash?: string | null;
+  /** `AIProvider.configFingerprint` (effort, structured-output mode, fallbacks, mock version...). */
+  providerFingerprint?: string | null;
 }
 
-/** sha256 hex of the canonical (sorted-key) JSON of the parts. */
+/** sha256 hex of the canonical (sorted-key) JSON of a structured stage input. */
+export function hashStageInput(input: unknown): string {
+  return sha256Hex(canonicalJson(input));
+}
+
+/**
+ * sha256 hex of the canonical (sorted-key) JSON of the parts. Optional parts that are omitted (undefined) do not
+ * contribute, so keys computed without them are unchanged.
+ */
 export function computeCacheKey(parts: CacheKeyParts): string {
   return sha256Hex(
     canonicalJson({
@@ -84,6 +99,8 @@ export function computeCacheKey(parts: CacheKeyParts): string {
       schemaName: parts.schemaName,
       system: parts.system,
       prompt: parts.prompt,
+      inputHash: parts.inputHash ?? undefined,
+      providerFingerprint: parts.providerFingerprint ?? undefined,
     }),
   );
 }

@@ -54,6 +54,29 @@ export function buildChapterSceneSpecsLlmSchema(templates: readonly [AnyTemplate
 export const ChapterSceneSpecsLlmSchema = buildChapterSceneSpecsLlmSchema();
 export type ChapterSceneSpecsLlm = z.infer<typeof ChapterSceneSpecsLlmSchema>;
 
+const SCENE_SPECS_SCHEMA_MEMO = new Map<string, typeof ChapterSceneSpecsLlmSchema>();
+const MAX_SCENE_SPECS_SCHEMAS = 256;
+
+/**
+ * Scene-specs schema restricted to the given templates (the ones selected for a chunk): a much smaller structured
+ * output schema than the whole catalog. Unknown ids are ignored; with no known id the full catalog schema is used.
+ * Memoized per template set (stable instances keep the JSON-schema conversion cached).
+ */
+export function chapterSceneSpecsSchemaFor(templateIds: readonly string[]): typeof ChapterSceneSpecsLlmSchema {
+  const wanted = new Set(templateIds);
+  const selected = TEMPLATE_CATALOG.filter((t) => wanted.has(t.id));
+  const [first, ...rest] = selected;
+  if (!first) return ChapterSceneSpecsLlmSchema;
+  if (selected.length === TEMPLATE_CATALOG.length) return ChapterSceneSpecsLlmSchema;
+  const key = selected.map((t) => t.id).join('|');
+  const cached = SCENE_SPECS_SCHEMA_MEMO.get(key);
+  if (cached) return cached;
+  const schema = buildChapterSceneSpecsLlmSchema([first, ...rest]);
+  if (SCENE_SPECS_SCHEMA_MEMO.size >= MAX_SCENE_SPECS_SCHEMAS) SCENE_SPECS_SCHEMA_MEMO.clear();
+  SCENE_SPECS_SCHEMA_MEMO.set(key, schema);
+  return schema;
+}
+
 /** Output schema of every LLM stage. All are structured-output safe (see `llmSchemaIssues`). */
 export const STAGE_OUTPUT_SCHEMAS = {
   brief: CreativeBriefSchema,
@@ -248,9 +271,20 @@ export interface SceneSpecTemplateInfo {
   propsJsonSchema: Record<string, unknown>;
 }
 
+/** Global SOP step position of a `step-instruction` scene (numbered across the whole video, not per chapter). */
+export interface StepPosition {
+  stepNumber: number;
+  totalSteps: number;
+}
+
 export interface SceneSpecsSceneInput extends PositionedScene {
   shots: Shot[];
   choice: EngineChoice;
+  /**
+   * Set for `step-instruction` scenes: the step's global number and the video's total step count (the director
+   * enforces these values on the final props). Null / absent for other templates.
+   */
+  step?: StepPosition | null;
 }
 
 export interface SceneSpecsStageInput {

@@ -15,6 +15,8 @@ export type ScriptedHandler = (req: StructuredGenerationRequest<unknown>, callIn
 export interface ScriptedMockOptions {
   name?: string;
   model?: string;
+  /** Cache fingerprint (default `scripted:<name>:<model>`). */
+  configFingerprint?: string;
 }
 
 /**
@@ -25,6 +27,7 @@ export class ScriptedMockProvider implements AIProvider {
   readonly name: string;
   readonly model: string;
   readonly mode = 'mock' as const;
+  readonly configFingerprint: string;
   readonly calls: ScriptedCall[] = [];
 
   constructor(
@@ -33,6 +36,7 @@ export class ScriptedMockProvider implements AIProvider {
   ) {
     this.name = options.name ?? 'scripted-mock';
     this.model = options.model ?? 'scripted-mock-v1';
+    this.configFingerprint = options.configFingerprint ?? `scripted:${this.name}:${this.model}`;
   }
 
   async generateStructured<T>(req: StructuredGenerationRequest<T>): Promise<StructuredGenerationResult> {

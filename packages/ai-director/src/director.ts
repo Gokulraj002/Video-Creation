@@ -27,14 +27,21 @@ import {
   type UsageReport,
   type VideoRequest,
 } from '@vc/schema';
-import { computeCacheKey, type DirectorCache } from './cache';
-import { compileTimeline } from './compiler';
+import { computeCacheKey, hashStageInput, type DirectorCache } from './cache';
+import { compileTimeline, isReservedId } from './compiler';
 import { digestPlan, digestReference, digestRequest } from './digest';
-import { coerceEngineChoice, engineOptions, resolveEngineAvailability, type EngineAvailability } from './engines';
+import {
+  assertCompilableEngineAvailable,
+  coerceEngineChoice,
+  engineOptions,
+  resolveEngineAvailability,
+  type EngineAvailability,
+} from './engines';
 import {
   CancelledError,
   DirectorError,
   LimitExceededError,
+  ProviderRefusalError,
   ProviderTruncatedError,
   toDirectorError,
   ValidationFailedError,
@@ -44,6 +51,7 @@ import { DEFAULT_PRICING, type PricingTable } from './pricing';
 import { buildRepairPrompt, PROMPT_VERSION, renderPrompt, systemPromptFor } from './prompts';
 import type { AIProvider, StructuredGenerationResult } from './provider';
 import {
+  chapterSceneSpecsSchemaFor,
   STAGE_MAX_OUTPUT_TOKENS,
   STAGE_OUTPUT_SCHEMAS,
   STAGE_SCHEMA_NAMES,
@@ -56,9 +64,10 @@ import {
   type RequestDigest,
   type SceneSpecTemplateInfo,
   type StageInputMap,
+  type StepPosition,
 } from './stages';
 import { toPromptJsonSchema } from './structured-output';
-import { addUsage, UsageTracker, ZERO_USAGE } from './usage';
+import { addUsage, UsageTracker, ZERO_USAGE, type ModelTokenUsage } from './usage';
 import { parseJsonText } from './util/json';
 import { clip, round } from './util/text';
 import {
@@ -141,6 +150,8 @@ interface Run {
   warnings: string[];
   completedSteps: number;
   totalSteps: number;
+  /** Regenerations must produce a fresh take: their stage calls neither read nor write the cache. */
+  bypassCache: boolean;
 }
 
 interface StageCall<S extends LlmStage, T> {
@@ -170,6 +181,40 @@ interface ChapterOutcome {
 
 const MAX_INSTRUCTIONS_CHARS = 2000;
 const STORYBOARD_SCALE_WARNING = 0.1;
+/** Max reference profiles per run (each one is digested into several stage prompts). Also capped by `limits.maxAssets`. */
+export const MAX_REFERENCE_PROFILES = 20;
+/** Stored storyboard durations (regenerateScene) may differ from the request duration by at most this factor. */
+export const STORED_DURATION_MAX_RATIO = 10;
+const DURATION_RESCALE_TOLERANCE = 1e-6;
+const STEP_TEMPLATE = 'step-instruction';
+/** `step-instruction` props allow step numbers up to 999. */
+const MAX_STEP_NUMBER = 999;
+
+/** Nullable LLM text where a blank string is meaningless ("" call to action, "   " narration) → null. */
+function blankToNull(value: string | null): string | null {
+  return value !== null && value.trim().length === 0 ? null : value;
+}
+
+function hasText(value: string | null | undefined): boolean {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+/**
+ * Global SOP step numbering: every `step-instruction` scene, in video order, numbered 1..N with totalSteps N
+ * (clamped to the template's 999 limit).
+ */
+function stepPositions(order: readonly string[], templateByScene: ReadonlyMap<string, string | null>): Map<string, StepPosition> {
+  const ids = order.filter((id) => templateByScene.get(id) === STEP_TEMPLATE);
+  const total = Math.min(MAX_STEP_NUMBER, Math.max(1, ids.length));
+  return new Map(ids.map((id, i) => [id, { stepNumber: Math.min(total, i + 1), totalSteps: total }]));
+}
+
+/** Tokens billed for a failed attempt (refusals and truncations are billed), or null when the error is not billed. */
+function billedUsageOf(err: unknown, fallbackModel: string): ModelTokenUsage[] | null {
+  if (!(err instanceof ProviderRefusalError) && !(err instanceof ProviderTruncatedError)) return null;
+  if (err.usageByModel && err.usageByModel.length > 0) return err.usageByModel.map((p) => ({ model: p.model, usage: { ...p.usage } }));
+  return [{ model: err.model ?? fallbackModel, usage: err.tokenUsage ? { ...err.tokenUsage } : { ...ZERO_USAGE } }];
+}
 
 function defaultIdFactory(): string {
   return `tl-${globalThis.crypto.randomUUID()}`;
@@ -268,6 +313,7 @@ export class AIDirector {
 
       const outcomes: ChapterOutcome[] = [];
       let sceneCount = 0;
+      let stepCount = 0;
       for (let i = 0; i < outline.chapters.length; i++) {
         const chapter = this.chapterContext(outline, ctx.plan, i);
         this.checkCancelled(run, 'script', chapter.id);
@@ -281,19 +327,28 @@ export class AIDirector {
           nextChapter: next ? { title: next.title, summary: next.summary } : null,
           firstSceneIndex: sceneCount,
           remainingScenesEstimate: remainingEstimate,
+          stepsBefore: stepCount,
         });
         outcomes.push(outcome);
         sceneCount += outcome.scenes.length;
+        stepCount += outcome.choices.filter((c) => c.template === STEP_TEMPLATE).length;
       }
 
+      const storyboardScenes = outcomes.flatMap((o) => o.scenes);
+      // SOP steps are numbered across the whole video (later chapters' step counts are unknown while earlier
+      // chapters run, so the final numbers are enforced once every chapter is done).
+      const numbered = this.numberSteps(
+        storyboardScenes.map((s) => s.id),
+        outcomes.flatMap((o) => o.specs),
+      );
       const artifacts: DirectorArtifacts = {
         brief,
         outline,
         script: { language: ctx.request.language, chapters: outcomes.map((o) => o.script) },
-        storyboard: { scenes: outcomes.flatMap((o) => o.scenes) },
+        storyboard: { scenes: storyboardScenes },
         shotList: { scenes: outcomes.flatMap((o) => o.shots) },
         engineSelection: { choices: outcomes.flatMap((o) => o.choices) },
-        sceneSpecs: { scenes: outcomes.flatMap((o) => o.specs) },
+        sceneSpecs: { scenes: numbered.specs },
       };
       return await this.finish(run, ctx, artifacts);
     } catch (err) {
@@ -306,7 +361,8 @@ export class AIDirector {
   // -------------------------------------------------------------------------------------------
 
   async regenerateScene(input: RegenerateSceneInput, opts: DirectorRunOptions = {}): Promise<DirectorResult> {
-    const run = this.startRun(opts);
+    // A regeneration asks for a NEW take: never serve (or store) cached stage outputs.
+    const run = this.startRun(opts, true);
     try {
       this.checkCancelled(run, null, null);
       const ctx = this.prepare(input);
@@ -314,7 +370,8 @@ export class AIDirector {
       if (!parsedArtifacts.success) {
         throw new ValidationFailedError('The artifacts to regenerate from are invalid', formatZodIssues(parsedArtifacts.error));
       }
-      const artifacts = parsedArtifacts.data;
+      // Stored durations come from the caller: reject absurd values and fit them to the request before any call.
+      const artifacts = this.normalizeStoredDurations(run, parsedArtifacts.data, ctx.request.durationSeconds);
       const scenes = artifacts.storyboard.scenes;
       const index = scenes.findIndex((s) => s.id === input.sceneId);
       const current = scenes[index];
@@ -382,6 +439,8 @@ export class AIDirector {
         ...produced,
         id: sceneId,
         chapterId: current.chapterId,
+        voiceOver: blankToNull(produced.voiceOver),
+        onScreenText: blankToNull(produced.onScreenText),
         durationSeconds: current.durationSeconds,
         transitionIn: index === 0 ? 'cut' : produced.transitionIn,
       };
@@ -403,16 +462,41 @@ export class AIDirector {
       const choices = await this.runEngineSelection(run, ctx, artifacts.brief, chapter, [positioned], scenes.length, sceneId, previousChoice);
       this.checkCancelled(run, 'sceneSpecs', sceneId);
       await this.progress(run, 'sceneSpecs', sceneId, `Designing scene "${sceneId}"`);
-      const specs = await this.runSceneSpecs(run, ctx, artifacts.brief, chapter, [positioned], shots, choices, scenes.length, sceneId);
+      // Global step position from the existing artifacts, with this scene's new template.
+      const order = scenes.map((s) => s.id);
+      const templateByScene = new Map<string, string | null>(artifacts.sceneSpecs.scenes.map((s) => [s.sceneId, s.template]));
+      const newChoice = choices[0];
+      if (newChoice) templateByScene.set(sceneId, newChoice.template);
+      const step = stepPositions(order, templateByScene).get(sceneId);
+      const specs = await this.runSceneSpecs(
+        run,
+        ctx,
+        artifacts.brief,
+        chapter,
+        [positioned],
+        shots,
+        choices,
+        scenes.length,
+        sceneId,
+        new Map(step ? [[sceneId, step]] : []),
+      );
 
       const replaceById = <T>(items: readonly T[], key: (item: T) => string, replacement: T | undefined): T[] =>
         replacement === undefined ? [...items] : items.map((item) => (key(item) === sceneId ? replacement : item));
+      const numbered = this.numberSteps(order, replaceById(artifacts.sceneSpecs.scenes, (s) => s.sceneId, specs[0]));
+      const renumbered = numbered.changed.filter((id) => id !== sceneId);
+      if (renumbered.length > 0) {
+        this.warn(
+          run,
+          `Step numbering was updated for ${renumbered.length} other scene(s) so SOP steps stay numbered across the whole video.`,
+        );
+      }
       const next: DirectorArtifacts = {
         ...artifacts,
         storyboard: { scenes: scenes.map((s, i) => (i === index ? newScene : s)) },
         shotList: { scenes: replaceById(artifacts.shotList.scenes, (s) => s.sceneId, shots[0]) },
         engineSelection: { choices: replaceById(artifacts.engineSelection.choices, (c) => c.sceneId, choices[0]) },
-        sceneSpecs: { scenes: replaceById(artifacts.sceneSpecs.scenes, (s) => s.sceneId, specs[0]) },
+        sceneSpecs: { scenes: numbered.specs },
       };
       return await this.finish(run, ctx, next);
     } catch (err) {
@@ -424,15 +508,18 @@ export class AIDirector {
   // Run helpers
   // -------------------------------------------------------------------------------------------
 
-  private startRun(options: DirectorRunOptions): Run {
-    return { options, usage: new UsageTracker(this.pricing), warnings: [], completedSteps: 0, totalSteps: 0 };
+  private startRun(options: DirectorRunOptions, bypassCache = false): Run {
+    return { options, usage: new UsageTracker(this.pricing), warnings: [], completedSteps: 0, totalSteps: 0, bypassCache };
   }
 
   private fail(run: Run, err: unknown): DirectorError {
     const error = run.options.signal?.aborted && !(err instanceof DirectorError) ? new CancelledError(undefined, { cause: err }) : toDirectorError(err);
     error.usage = run.usage.report();
     error.warnings = [...run.warnings];
-    this.logger.error?.('Director run failed', { code: error.code, message: error.message, stage: error.stage, chunk: error.chunk });
+    const meta = { code: error.code, message: error.message, stage: error.stage, chunk: error.chunk };
+    // A cancellation is a normal outcome requested by the caller, not an error.
+    if (error.code === 'CANCELLED') this.logger.info?.('Director run cancelled', meta);
+    else this.logger.error?.('Director run failed', meta);
     return error;
   }
 
@@ -455,12 +542,20 @@ export class AIDirector {
     this.logger.warn?.(message);
   }
 
+  /** Validates everything a run needs BEFORE any provider call (config, request, references, assets, limits). */
   private prepare(input: PlanProjectInput): RunContext {
+    assertCompilableEngineAvailable(this.availability);
     const parsed = VideoRequestSchema.safeParse(input.request);
     if (!parsed.success) throw new ValidationFailedError('Invalid video request', formatZodIssues(parsed.error));
     const request = parsed.data;
+    const rawReferences = input.references ?? [];
+    const maxReferences = Math.min(MAX_REFERENCE_PROFILES, this.limits.maxAssets);
+    if (rawReferences.length > maxReferences) {
+      const message = `Reference profile count ${rawReferences.length} exceeds the limit of ${maxReferences}`;
+      throw new LimitExceededError(message, [{ code: 'MAX_ASSETS', message, limit: maxReferences, actual: rawReferences.length }]);
+    }
     const references: ReferenceProfile[] = [];
-    (input.references ?? []).forEach((ref, i) => {
+    rawReferences.forEach((ref, i) => {
       const r = ReferenceProfileSchema.safeParse(ref);
       if (!r.success) {
         throw new ValidationFailedError(`Invalid reference profile #${i}`, formatZodIssues(r.error).map((m) => `references.${i}.${m}`));
@@ -475,6 +570,22 @@ export class AIDirector {
       }
       assets.push(a.data);
     });
+    // Asset ids share the timeline's id namespace with the ids the director generates; collisions (or duplicates)
+    // would only surface when compiling, after every provider call.
+    const assetIssues: string[] = [];
+    const firstIndex = new Map<string, number>();
+    assets.forEach((asset, i) => {
+      if (isReservedId(asset.id)) {
+        assetIssues.push(
+          `assets.${i}.id: "${asset.id}" is reserved for ids the director generates (chapters c<n>, scenes c<n>-s<m>, ` +
+            'caption cues c<n>-s<m>-cap<k>, the "captions" track, shots sh<n>, segments c<n>-g<k>); use a different asset id',
+        );
+      }
+      const first = firstIndex.get(asset.id);
+      if (first !== undefined) assetIssues.push(`assets.${i}.id: duplicate asset id "${asset.id}" (already used by assets.${first})`);
+      else firstIndex.set(asset.id, i);
+    });
+    if (assetIssues.length > 0) throw new ValidationFailedError('Invalid asset ids', assetIssues);
     const violations = checkVideoRequestLimits(request, this.limits);
     if (assets.length > this.limits.maxAssets) {
       violations.push({
@@ -496,6 +607,55 @@ export class AIDirector {
       plan,
       planDigest: digestPlan(plan),
     };
+  }
+
+  /**
+   * regenerateScene: stored storyboard durations must be finite, > 0 and (in total) within
+   * {@link STORED_DURATION_MAX_RATIO}× of the request duration; otherwise the run fails with VALIDATION_FAILED before
+   * any provider call. Totals that differ from the request duration are rescaled uniformly (frames are allocated
+   * proportionally, so relative timing is kept).
+   */
+  private normalizeStoredDurations(run: Run, artifacts: DirectorArtifacts, requestSeconds: number): DirectorArtifacts {
+    const scenes = artifacts.storyboard.scenes;
+    const issues: string[] = [];
+    scenes.forEach((s, i) => {
+      if (!Number.isFinite(s.durationSeconds) || s.durationSeconds <= 0) {
+        issues.push(`storyboard.scenes.${i}.durationSeconds: must be a finite number > 0 (got ${String(s.durationSeconds)})`);
+      }
+    });
+    const total = scenes.reduce((a, s) => a + s.durationSeconds, 0);
+    if (issues.length === 0) {
+      const ratio = total / requestSeconds;
+      if (!Number.isFinite(total) || !(ratio <= STORED_DURATION_MAX_RATIO && ratio >= 1 / STORED_DURATION_MAX_RATIO)) {
+        issues.push(
+          `storyboard.scenes: durations sum to ${String(round(total, 3))} s, which does not fit the requested ${requestSeconds} s ` +
+            `(must be within ${STORED_DURATION_MAX_RATIO}×); re-plan the project instead`,
+        );
+      }
+    }
+    if (issues.length > 0) throw new ValidationFailedError('The stored storyboard durations are invalid', issues, { stage: 'storyboard' });
+    if (Math.abs(total / requestSeconds - 1) <= DURATION_RESCALE_TOLERANCE) return artifacts;
+    const factor = requestSeconds / total;
+    this.warn(run, `Stored storyboard durations summed to ${round(total, 2)} s (request ${round(requestSeconds, 2)} s); scaled to fit.`);
+    return {
+      ...artifacts,
+      storyboard: { scenes: scenes.map((s) => ({ ...s, durationSeconds: Math.max(1e-6, s.durationSeconds * factor) })) },
+    };
+  }
+
+  /** Enforces global step numbering on `step-instruction` specs; returns the specs and the ids whose props changed. */
+  private numberSteps(order: readonly string[], specs: readonly SceneSpec[]): { specs: SceneSpec[]; changed: string[] } {
+    const positions = stepPositions(order, new Map(specs.map((s) => [s.sceneId, s.template])));
+    const changed: string[] = [];
+    const out = specs.map((spec) => {
+      const pos = positions.get(spec.sceneId);
+      if (!pos || (spec.props.stepNumber === pos.stepNumber && spec.props.totalSteps === pos.totalSteps)) return spec;
+      const props = validateTemplateProps(spec.template, { ...spec.props, stepNumber: pos.stepNumber, totalSteps: pos.totalSteps });
+      if (!props.success) return spec;
+      changed.push(spec.sceneId);
+      return { ...spec, props: props.data };
+    });
+    return { specs: out, changed };
   }
 
   private chapterContext(outline: ScriptOutline, plan: StructurePlan, index: number): ChapterContext {
@@ -564,18 +724,25 @@ export class AIDirector {
     const schemaName = STAGE_SCHEMA_NAMES[stage];
     this.checkCancelled(run, stage, chunk);
 
-    const key = computeCacheKey({
-      stage,
-      chunk,
-      promptVersion: this.promptVersion,
-      provider: this.provider.name,
-      model: this.provider.model,
-      schemaName,
-      system,
-      prompt,
-    });
-    if (this.cache) {
-      const hit = await this.cache.get(key, { stage, chunk });
+    // The key covers the rendered prompt AND the structured input (mock providers build their output from it and
+    // not every input field is rendered) plus every provider setting that can change outputs.
+    const cache = run.bypassCache ? null : this.cache;
+    const key = cache
+      ? computeCacheKey({
+          stage,
+          chunk,
+          promptVersion: this.promptVersion,
+          provider: this.provider.name,
+          model: this.provider.model,
+          schemaName,
+          system,
+          prompt,
+          inputHash: hashStageInput(call.input),
+          providerFingerprint: this.provider.configFingerprint ?? null,
+        })
+      : '';
+    if (cache) {
+      const hit = await cache.get(key, { stage, chunk });
       if (hit) {
         const checked = this.validateOutput(schema, hit.output, call.validate);
         if (checked.value !== null) {
@@ -589,13 +756,31 @@ export class AIDirector {
 
     let attemptPrompt = prompt;
     let usage: TokenUsage = { ...ZERO_USAGE };
+    /** Per-model usage of every attempt (attempts and fallback hops may be served by different models). */
+    const parts: ModelTokenUsage[] = [];
     let latencyMs = 0;
     let attempts = 0;
     let servedModel = this.provider.model;
     let issues: string[] = [];
     const record = () => {
       if (attempts > 0) {
-        run.usage.record({ stage, chunk, provider: this.provider.name, model: servedModel, attempts, cached: false, usage, latencyMs });
+        run.usage.record({
+          stage,
+          chunk,
+          provider: this.provider.name,
+          model: servedModel,
+          attempts,
+          cached: false,
+          usage,
+          usageByModel: parts,
+          latencyMs,
+        });
+      }
+    };
+    const addParts = (billed: readonly ModelTokenUsage[]) => {
+      for (const part of billed) {
+        parts.push(part);
+        usage = addUsage(usage, part.usage);
       }
     };
 
@@ -619,15 +804,19 @@ export class AIDirector {
           ...(run.options.signal ? { signal: run.options.signal } : {}),
         });
       } catch (err) {
-        if (err instanceof ProviderTruncatedError) {
+        // Refused and truncated responses are billed: count the attempt and its tokens.
+        const billed = billedUsageOf(err, this.provider.model);
+        if (billed) {
           attempts += 1;
           latencyMs += Date.now() - started;
-          if (err.tokenUsage) usage = addUsage(usage, err.tokenUsage);
-          if (attempt < this.maxRepairAttempts) {
-            issues = ['(root): the output was truncated at the max_tokens limit; return a complete but more concise JSON object'];
-            attemptPrompt = buildRepairPrompt(prompt, issues, err.partialOutput ?? '');
-            continue;
-          }
+          addParts(billed);
+          const last = billed[billed.length - 1];
+          if (last) servedModel = last.model;
+        }
+        if (err instanceof ProviderTruncatedError && attempt < this.maxRepairAttempts) {
+          issues = ['(root): the output was truncated at the max_tokens limit; return a complete but more concise JSON object'];
+          attemptPrompt = buildRepairPrompt(prompt, issues, err.partialOutput ?? '');
+          continue;
         }
         record();
         if (run.options.signal?.aborted && !(err instanceof DirectorError)) {
@@ -639,15 +828,15 @@ export class AIDirector {
         throw error;
       }
       attempts += 1;
-      usage = addUsage(usage, result.usage);
+      addParts(result.usageByModel && result.usageByModel.length > 0 ? result.usageByModel : [{ model: result.model, usage: result.usage }]);
       latencyMs += result.latencyMs;
       servedModel = result.model;
 
       const checked = this.validateOutput(schema, result.output, call.validate);
       if (checked.value !== null) {
         record();
-        if (this.cache) {
-          await this.cache.set(key, {
+        if (cache) {
+          await cache.set(key, {
             stage,
             chunk,
             output: checked.value,
@@ -686,11 +875,17 @@ export class AIDirector {
       validate: () => [],
     });
     run.completedSteps += 1;
-    if (brief.genre !== ctx.request.genre) {
-      this.warn(run, `The brief proposed genre "${brief.genre}"; keeping the requested genre "${ctx.request.genre}".`);
-      return { ...brief, genre: ctx.request.genre };
+    // A blank call to action ("") is no call to action.
+    const normalized: CreativeBrief = {
+      ...brief,
+      callToAction: blankToNull(brief.callToAction),
+      referenceInfluence: blankToNull(brief.referenceInfluence),
+    };
+    if (normalized.genre !== ctx.request.genre) {
+      this.warn(run, `The brief proposed genre "${normalized.genre}"; keeping the requested genre "${ctx.request.genre}".`);
+      return { ...normalized, genre: ctx.request.genre };
     }
-    return brief;
+    return normalized;
   }
 
   private async runOutline(run: Run, ctx: RunContext, brief: CreativeBrief): Promise<ScriptOutline> {
@@ -723,6 +918,8 @@ export class AIDirector {
       nextChapter: { title: string; summary: string } | null;
       firstSceneIndex: number;
       remainingScenesEstimate: number;
+      /** step-instruction scenes in the chapters before this one. */
+      stepsBefore: number;
     },
   ): Promise<ChapterOutcome> {
     const label = `chapter ${chapter.number}/${chapter.count}`;
@@ -748,13 +945,22 @@ export class AIDirector {
     run.completedSteps += 1;
     const script: ChapterScript = {
       chapterId: chapter.id,
-      segments: rawScript.segments.map((s, k) => ({ ...s, id: `${chapter.id}-g${k + 1}` })),
+      segments: rawScript.segments.map((s, k) => ({
+        ...s,
+        id: `${chapter.id}-g${k + 1}`,
+        voiceOver: blankToNull(s.voiceOver),
+        onScreenText: blankToNull(s.onScreenText),
+      })),
     };
 
     // Storyboard.
     this.checkCancelled(run, 'storyboard', chapter.id);
     await this.progress(run, 'storyboard', chapter.id, `Storyboarding ${label}`);
-    const segmentIdMap = new Map(rawScript.segments.map((s, k) => [s.id, `${chapter.id}-g${k + 1}`]));
+    // The storyboard prompt shows the director's segment ids; the model's own script ids are accepted as aliases,
+    // but a director id always wins (a model id such as "c1-g1" may alias a DIFFERENT segment).
+    const directorSegmentIds = new Set(script.segments.map((s) => s.id));
+    const aliasMap = new Map(rawScript.segments.map((s, k) => [s.id, `${chapter.id}-g${k + 1}`]));
+    const resolveSegmentId = (id: string): string => (directorSegmentIds.has(id) ? id : (aliasMap.get(id) ?? id));
     const rawStoryboard = await this.callStage(run, {
       stage: 'storyboard',
       chunk: chapter.id,
@@ -774,13 +980,13 @@ export class AIDirector {
           {
             ...v,
             // Accept either the director's ids or the model's original segment ids.
-            scenes: v.scenes.map((s) => ({ ...s, segmentIds: s.segmentIds.map((id) => segmentIdMap.get(id) ?? id) })),
+            scenes: v.scenes.map((s) => ({ ...s, segmentIds: s.segmentIds.map(resolveSegmentId) })),
           },
           { sceneRange: chapter.sceneRange, segmentIds: script.segments.map((s) => s.id) },
         ),
     });
     run.completedSteps += 1;
-    const scenes = this.normalizeStoryboard(run, rawStoryboard.scenes, chapter, segmentIdMap, extra.firstSceneIndex);
+    const scenes = this.normalizeStoryboard(run, rawStoryboard.scenes, chapter, resolveSegmentId, extra.firstSceneIndex);
 
     // Shot list.
     this.checkCancelled(run, 'shotList', chapter.id);
@@ -801,10 +1007,21 @@ export class AIDirector {
     const totalScenes = extra.firstSceneIndex + scenes.length + (chapter.isLast ? 0 : extra.remainingScenesEstimate);
     const choices = await this.runEngineSelection(run, ctx, brief, chapter, positioned, totalScenes, chapter.id, null);
 
+    // Global SOP step numbers: steps of earlier chapters + this chapter's; later chapters are estimated from the
+    // step ratio so far (planProject enforces the exact numbers once every chapter is done).
+    const chapterStepIds = choices.filter((c) => c.template === STEP_TEMPLATE).map((c) => c.sceneId);
+    const stepsSoFar = extra.stepsBefore + chapterStepIds.length;
+    const scenesSoFar = extra.firstSceneIndex + scenes.length;
+    const estimatedSteps = chapter.isLast ? stepsSoFar : stepsSoFar + Math.round((extra.remainingScenesEstimate * stepsSoFar) / Math.max(1, scenesSoFar));
+    const totalSteps = Math.min(MAX_STEP_NUMBER, Math.max(1, estimatedSteps));
+    const steps = new Map<string, StepPosition>(
+      chapterStepIds.map((id, k) => [id, { stepNumber: Math.min(totalSteps, extra.stepsBefore + k + 1), totalSteps }]),
+    );
+
     // Scene specs.
     this.checkCancelled(run, 'sceneSpecs', chapter.id);
     await this.progress(run, 'sceneSpecs', chapter.id, `Designing scenes for ${label}`);
-    const specs = await this.runSceneSpecs(run, ctx, brief, chapter, positioned, shots, choices, totalScenes, chapter.id);
+    const specs = await this.runSceneSpecs(run, ctx, brief, chapter, positioned, shots, choices, totalScenes, chapter.id, steps);
 
     return {
       script: {
@@ -826,7 +1043,7 @@ export class AIDirector {
     run: Run,
     raw: readonly StoryboardScene[],
     chapter: ChapterContext,
-    segmentIdMap: ReadonlyMap<string, string>,
+    resolveSegmentId: (id: string) => string,
     firstSceneIndex: number,
   ): StoryboardScene[] {
     const sum = raw.reduce((a, s) => a + s.durationSeconds, 0);
@@ -841,7 +1058,9 @@ export class AIDirector {
       ...s,
       id: `${chapter.id}-s${m + 1}`,
       chapterId: chapter.id,
-      segmentIds: s.segmentIds.map((id) => segmentIdMap.get(id) ?? id).filter((id, i, a) => a.indexOf(id) === i),
+      segmentIds: s.segmentIds.map(resolveSegmentId).filter((id, i, a) => a.indexOf(id) === i),
+      voiceOver: blankToNull(s.voiceOver),
+      onScreenText: blankToNull(s.onScreenText),
       durationSeconds: Math.max(1e-6, s.durationSeconds * factor),
       transitionIn: firstSceneIndex + m === 0 ? 'cut' : s.transitionIn,
     }));
@@ -867,7 +1086,7 @@ export class AIDirector {
     return scenes.map((scene) => {
       const entry = byScene.get(scene.id);
       if (!entry) throw new DirectorError('INTERNAL', `Missing shot list for scene "${scene.id}"`);
-      return { sceneId: scene.id, shots: entry.shots.map((shot, j) => ({ ...shot, id: `sh${j + 1}` })) };
+      return { sceneId: scene.id, shots: entry.shots.map((shot, j) => ({ ...shot, id: `sh${j + 1}`, notes: blankToNull(shot.notes) })) };
     });
   }
 
@@ -893,7 +1112,7 @@ export class AIDirector {
         scenes: positioned,
         totalScenes,
         engines: engineOptions(this.availability),
-        hasCallToAction: brief.callToAction !== null,
+        hasCallToAction: hasText(brief.callToAction),
         previousChoice,
       },
       validate: (v) => validateChapterEngineSelection(v, scenes),
@@ -903,13 +1122,16 @@ export class AIDirector {
     return positioned.map((p) => {
       const choice = byScene.get(p.scene.id);
       if (!choice) throw new DirectorError('INTERNAL', `Missing engine choice for scene "${p.scene.id}"`);
-      const { choice: coerced, warning } = coerceEngineChoice(choice, {
-        genre: ctx.request.genre,
-        availability: this.availability,
-        isFirst: p.isFirstInVideo,
-        isLast: p.isLastInVideo,
-        hasCallToAction: brief.callToAction !== null,
-      });
+      const { choice: coerced, warning } = coerceEngineChoice(
+        { ...choice, provider: blankToNull(choice.provider) },
+        {
+          genre: ctx.request.genre,
+          availability: this.availability,
+          isFirst: p.isFirstInVideo,
+          isLast: p.isLastInVideo,
+          hasCallToAction: hasText(brief.callToAction),
+        },
+      );
       if (warning) this.warn(run, warning);
       return coerced;
     });
@@ -925,6 +1147,7 @@ export class AIDirector {
     choices: EngineChoice[],
     totalScenes: number,
     chunk: string,
+    steps: ReadonlyMap<string, StepPosition>,
   ): Promise<SceneSpec[]> {
     const shotsByScene = new Map(shots.map((s) => [s.sceneId, s.shots]));
     const choiceByScene = new Map(choices.map((c) => [c.sceneId, c]));
@@ -933,7 +1156,8 @@ export class AIDirector {
     const specs: ChapterSceneSpecsLlm = await this.callStage(run, {
       stage: 'sceneSpecs',
       chunk,
-      schema: STAGE_OUTPUT_SCHEMAS.sceneSpecs,
+      // Only the selected templates: a far smaller structured-output schema than the whole catalog.
+      schema: chapterSceneSpecsSchemaFor(templateIds),
       input: {
         request: ctx.digest,
         brief,
@@ -941,7 +1165,7 @@ export class AIDirector {
         scenes: positioned.map((p) => {
           const choice = choiceByScene.get(p.scene.id);
           if (!choice) throw new DirectorError('INTERNAL', `Missing engine choice for scene "${p.scene.id}"`);
-          return { ...p, shots: shotsByScene.get(p.scene.id) ?? [], choice };
+          return { ...p, shots: shotsByScene.get(p.scene.id) ?? [], choice, step: steps.get(p.scene.id) ?? null };
         }),
         totalScenes,
         templates,

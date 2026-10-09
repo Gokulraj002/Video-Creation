@@ -1,11 +1,42 @@
 /** Text helpers shared by the compiler, prompts and the heuristic mock. */
 
-/** Collapses whitespace and truncates to `max` chars (with an ellipsis when cut). */
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
+}
+
+/**
+ * The first `maxUnits` UTF-16 code units of `text`, never cutting a surrogate pair (the result stays well-formed and
+ * at most `maxUnits` long, so it still satisfies `z.string().max(maxUnits)`).
+ */
+export function sliceUnits(text: string, maxUnits: number): string {
+  const n = Math.max(0, Math.floor(maxUnits));
+  if (text.length <= n) return text;
+  let end = n;
+  if (end > 0 && isHighSurrogate(text.charCodeAt(end - 1)) && isLowSurrogate(text.charCodeAt(end))) end -= 1;
+  return text.slice(0, end);
+}
+
+/** A high surrogate not followed by a low one, or a low surrogate not preceded by a high one (code-unit regex). */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/** Replaces lone (unpaired) surrogates with U+FFFD so the text is well-formed UTF-16 (Postgres jsonb rejects them). */
+export function toWellFormed(text: string): string {
+  return text.replace(LONE_SURROGATE, '�');
+}
+
+/**
+ * Collapses whitespace and truncates to `max` UTF-16 units (with an ellipsis when cut). Cuts on code-point
+ * boundaries: surrogate pairs (emoji, rare CJK) are never split.
+ */
 export function clip(value: string, max: number): string {
-  const clean = value.replace(/\s+/g, ' ').trim();
+  const clean = toWellFormed(value).replace(/\s+/g, ' ').trim();
   if (clean.length <= max) return clean;
-  if (max <= 1) return clean.slice(0, max);
-  return `${clean.slice(0, max - 1).trimEnd()}…`;
+  if (max <= 1) return sliceUnits(clean, max);
+  return `${sliceUnits(clean, max - 1).trimEnd()}…`;
 }
 
 /** Non-empty clipped text, or the clipped fallback. */

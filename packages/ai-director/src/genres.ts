@@ -11,8 +11,10 @@ import type {
 
 type NonEmpty<T> = readonly [T, ...T[]];
 
+/** 3D (`three`) templates of the catalog. */
+export type ThreeTemplateId = Extract<CatalogTemplateId, 'product-turntable' | 'logo-reveal-3d' | 'floating-shapes'>;
 /** Motion2D templates only (used for engine-fallback coercion). */
-export type Motion2DTemplateId = Exclude<CatalogTemplateId, 'product-turntable' | 'logo-reveal-3d' | 'floating-shapes'>;
+export type Motion2DTemplateId = Exclude<CatalogTemplateId, ThreeTemplateId>;
 
 /** Creative defaults per genre: guidance for prompts, the heuristic mock, coercion and the compiler. */
 export interface GenreProfile {
@@ -476,4 +478,19 @@ export function coercionTemplateFor(
   if (position.isFirst) return 'title-card';
   if (position.isLast && position.hasCallToAction) return 'cta-end-card';
   return GENRE_PROFILES[genre].fallbackTemplate;
+}
+
+/** Genres whose body scenes suit the product turntable when they have to be rendered in 3D. */
+const PRODUCT_GENRES: ReadonlySet<VideoGenre> = new Set<VideoGenre>(['product-3d', 'promo', 'cinematic-ad']);
+
+/**
+ * `three` template used when motion2d is unavailable and a scene must be coerced to 3D: `logo-reveal-3d` to open and
+ * to close, `product-turntable` for product-led genres, else `floating-shapes`.
+ */
+export function threeCoercionTemplateFor(
+  genre: VideoGenre,
+  position: { isFirst: boolean; isLast: boolean; hasCallToAction: boolean },
+): ThreeTemplateId {
+  if (position.isFirst || position.isLast) return 'logo-reveal-3d';
+  return PRODUCT_GENRES.has(genre) ? 'product-turntable' : 'floating-shapes';
 }

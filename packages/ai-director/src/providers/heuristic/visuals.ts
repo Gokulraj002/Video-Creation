@@ -75,7 +75,8 @@ function chooseTemplate(
   // Content-aware choices.
   if (p.genre === 'sop-training') {
     const t: CatalogTemplateId = RECAP_HINT.test(text) ? 'bullet-list' : 'step-instruction';
-    if (t !== input.previousChoice?.template) return { template: t, reason: 'one procedure step per scene' };
+    // A procedure step stays a numbered step when regenerated (removing it would renumber every later step).
+    if (t !== input.previousChoice?.template || t === 'step-instruction') return { template: t, reason: 'one procedure step per scene' };
   }
   if (p.genre === 'real-estate' && previous !== 'property-showcase' && (/[$€£₹]/.test(text) || /\b(bed|bath|sq|acre|pool|garden)\w*/i.test(text))) {
     if (input.previousChoice?.template !== 'property-showcase') return { template: 'property-showcase', reason: 'listing details' };
@@ -301,8 +302,11 @@ export function mockChapterSceneSpecs(input: SceneSpecsStageInput): ChapterScene
   const scenes = input.scenes.map((s) => {
     const def = s.choice.template ? getTemplate(s.choice.template) : undefined;
     if (!def) throw new InternalDirectorError(`Scene "${s.scene.id}" has no catalog template`);
+    // The director numbers steps across the whole video; fall back to chunk-local numbering without it.
     const stepIndex = stepScenes.indexOf(s);
-    const stepInfo = { stepNumber: Math.max(1, stepIndex + 1), totalSteps: Math.max(1, stepScenes.length) };
+    const stepInfo = s.step
+      ? { stepNumber: s.step.stepNumber, totalSteps: s.step.totalSteps }
+      : { stepNumber: Math.max(1, stepIndex + 1), totalSteps: Math.max(1, stepScenes.length) };
     const candidate = buildPropsFor(s, input, topic, stepInfo);
     const parsed = def.propsSchema.safeParse(candidate);
     let props: Props;

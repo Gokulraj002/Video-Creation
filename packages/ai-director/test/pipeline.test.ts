@@ -34,7 +34,7 @@ describe('full pipeline with the HeuristicMockProvider', () => {
       const last = progress[progress.length - 1];
       expect(last?.completedSteps).toBe(totalStepsFor(result.plan));
       expect(last?.totalSteps).toBe(totalStepsFor(result.plan));
-      expect(result.timeline.metadata.generator).toEqual({ name: 'vc-ai-director', version: '0.1.0', promptVersion: 'm1.0' });
+      expect(result.timeline.metadata.generator).toEqual({ name: 'vc-ai-director', version: '0.1.0', promptVersion: 'm1.1' });
     });
   });
 

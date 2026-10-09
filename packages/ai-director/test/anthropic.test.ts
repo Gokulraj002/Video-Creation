@@ -5,6 +5,7 @@ import {
   AIDirector,
   AnthropicProvider,
   DirectorError,
+  JsonSchemaRejections,
   ProviderRefusalError,
   ProviderTruncatedError,
   SYSTEM_PROMPTS,
@@ -181,6 +182,9 @@ describe('AnthropicProvider response handling', () => {
     expect(err.code).toBe('PROVIDER_REFUSAL');
     expect(err.retryable).toBe(false);
     expect((err as ProviderRefusalError).category).toBe('cyber');
+    // Refusals are billed: the error carries the response usage and model.
+    expect((err as ProviderRefusalError).tokenUsage).toEqual({ inputTokens: 1200, outputTokens: 340, cacheReadTokens: 900, cacheWriteTokens: 50 });
+    expect((err as ProviderRefusalError).model).toBe('claude-opus-5-5');
     expect(client.requests).toHaveLength(1);
   });
 
@@ -198,7 +202,8 @@ describe('AnthropicProvider response handling', () => {
       if (i === 0) throw apiError(Anthropic.BadRequestError, 400, 'output_config.format.schema: unsupported keyword');
       return message(JSON.stringify(brief));
     });
-    const result = await new AnthropicProvider({ client }).generateStructured(req());
+    // A private registry: the process-wide default would remember this rejection for the other tests.
+    const result = await new AnthropicProvider({ client, jsonSchemaRejections: new JsonSchemaRejections() }).generateStructured(req());
     expect(result.output).toEqual(brief);
     expect(client.requests).toHaveLength(2);
     const retry = client.requests[1]?.params ?? {};

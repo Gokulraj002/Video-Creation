@@ -107,7 +107,9 @@ describe('repair loop', () => {
     expect(err.retryable).toBe(false);
     expect(err.stage).toBe('script');
     expect(provider.calls.filter((c) => c.stage === 'script')).toHaveLength(1);
-    expect(err.usage?.stages.map((s) => s.stage)).toEqual(['brief', 'outline']);
+    // The refused request was made (and is billed): it is counted as one attempt (no usage known here).
+    expect(err.usage?.stages.map((s) => s.stage)).toEqual(['brief', 'outline', 'script']);
+    expect(err.usage?.stages.at(-1)).toMatchObject({ stage: 'script', attempts: 1, cached: false, usage: { inputTokens: 0, outputTokens: 0 } });
   });
 
   it('treats a truncated response as repairable', async () => {

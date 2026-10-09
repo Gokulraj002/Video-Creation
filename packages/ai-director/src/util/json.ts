@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { sliceUnits } from './text';
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -58,5 +59,5 @@ export function parseJsonText(text: string): JsonParseResult {
 
 export function truncate(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
-  return `${text.slice(0, maxChars)}…[truncated ${text.length - maxChars} chars]`;
+  return `${sliceUnits(text, maxChars)}…[truncated ${text.length - maxChars} chars]`;
 }
