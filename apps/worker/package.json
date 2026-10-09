@@ -1,0 +1,17 @@
+{
+  "name": "@vc/worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@remotion/bundler": "4.0.534",
+    "@remotion/renderer": "4.0.534",
+    "@vc/core": "*",
+    "@vc/video": "*",
+    "bullmq": "^5.81.5"
+  }
+}

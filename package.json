@@ -1,0 +1,29 @@
+{
+  "name": "video-creation",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "db:migrate": "npm run migrate -w @vc/core",
+    "dev:api": "npm run dev -w @vc/api",
+    "dev:worker": "npm run dev -w @vc/worker",
+    "dev:web": "npm run dev -w @vc/web",
+    "studio": "npm run studio -w @vc/video",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "vitest run",
+    "build:web": "npm run build -w @vc/web"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.4",
+    "vitest": "^5.0.3"
+  }
+}
