@@ -9,8 +9,8 @@
 | Related | [ARCHITECTURE.md](ARCHITECTURE.md) · [TIMELINE_SCHEMA.md](TIMELINE_SCHEMA.md) · [AI_DIRECTOR.md](AI_DIRECTOR.md) · [DEVELOPMENT.md](DEVELOPMENT.md) · [M1 spec, section 3](milestones/M1_IMPLEMENTATION_SPEC.md#3-vcstudio-api-appsstudio-api--contract) |
 
 > **The Prisma schema file `apps/studio-api/prisma/schema.prisma` is the source of truth.** This document explains it. If the
-> two disagree, the schema file is right and this document must be updated. The generated SQL is in
-> `apps/studio-api/prisma/migrations/20261009082453_init/migration.sql`.
+> two disagree, the schema file is right and this document must be updated. The generated SQL is in two migrations under
+> `apps/studio-api/prisma/migrations/`: `20261009082453_init` and `20261009085125_run_accounting` (section 7).
 
 **Status labels.** Everything in sections 1 to 7 and 9 is **M1** unless marked **Planned (Mx)**. Section 8 is entirely
 planned: none of those tables exist.
@@ -29,7 +29,8 @@ migrations in `db/migrations/`. The two share no tables before M7 (PRD open ques
 | ORM | Prisma 7.10 with the `prisma-client` generator. The client is generated into `apps/studio-api/src/generated/prisma` (gitignored) and used with the driver adapter `@prisma/adapter-pg`: `new PrismaClient({ adapter: new PrismaPg({ connectionString }) })`. |
 | Connection URL | `DATABASE_URL`. The app reads it in `src/config.ts`. The Prisma CLI reads it in `apps/studio-api/prisma.config.ts`, which falls back to `postgres://postgres:postgres@localhost:5432/video_studio` and does not load `.env` files. Tests use `TEST_DATABASE_URL` (default `.../video_studio_test`). |
 | Naming | PascalCase models and camelCase fields in Prisma; snake_case in Postgres through `@@map` and `@map`. Tables: `users`, `api_tokens`, `projects`, `project_versions`, `director_runs`, `director_cache_entries`. Enum types: `project_status`, `run_status`. Example: `DirectorRun.requestedById` is the column `director_runs.requested_by_id`. |
-| Primary keys | `String @id @default(cuid())` on every model except `DirectorCacheEntry`, whose key is the SHA-256 cache key |
+| Migrations | `20261009082453_init` creates both enums, all six tables, their indexes and foreign keys. `20261009085125_run_accounting` makes `director_runs.project_id` nullable with `ON DELETE SET NULL` (it was `NOT NULL` with `ON DELETE CASCADE`), adds `director_runs.warnings` (`jsonb NOT NULL DEFAULT '[]'`) and adds `director_cache_entries.chunk` (`text`, nullable). |
+| Primary keys | `String @id @default(cuid())` on every model except `DirectorCacheEntry`, whose key is a user-scoped SHA-256 cache key (section 3.6) |
 | JSON | Prisma `Json` fields are `jsonb` in Postgres. Their contents are validated with Zod schemas from `@vc/schema` before they are written (section 4). |
 | Money | `DirectorRun.estimatedCostUsd` is `Decimal(12,6)` so sums are exact. DTOs expose it as a number. |
 | Only writer | `@vc/studio-api` (API process and director worker). studio-web never touches the database. |
@@ -43,7 +44,7 @@ erDiagram
   User ||--o{ DirectorRun : "requested"
   Project ||--o{ ProjectVersion : "has versions"
   Project |o--o| ProjectVersion : "currentVersionId"
-  Project ||--o{ DirectorRun : "has runs"
+  Project |o--o{ DirectorRun : "has runs (projectId nullable)"
   DirectorRun |o--o| ProjectVersion : "produced (directorRunId)"
 
   User {
@@ -87,7 +88,7 @@ erDiagram
   }
   DirectorRun {
     String id PK
-    String projectId FK "on delete cascade"
+    String projectId FK "nullable, on delete set null"
     String requestedById FK "on delete cascade"
     RunStatus status "default QUEUED"
     String provider
@@ -95,6 +96,7 @@ erDiagram
     String promptVersion
     Json progress
     Json usage "UsageReport, nullable"
+    Json warnings "string array, default []"
     Int inputTokens "default 0"
     Int outputTokens "default 0"
     Int cacheReadTokens "default 0"
@@ -107,8 +109,9 @@ erDiagram
     DateTime finishedAt "nullable"
   }
   DirectorCacheEntry {
-    String key PK "sha256 cache key"
+    String key PK "sha256 of owner scope + director cache key"
     String stage
+    String chunk "nullable"
     String model
     String provider
     Json output "validated stage output"
@@ -119,7 +122,11 @@ erDiagram
   }
 ```
 
-`DirectorCacheEntry` has no relations. It is a deployment-wide cache, not owned by any user or project.
+`DirectorCacheEntry` has no foreign keys. Its entries are scoped to one user through the key (the requesting user's id is
+hashed into it), but no owner column is stored, so deleting a user or a project does not delete cache entries.
+
+`DirectorRun.projectId` is nullable so that runs outlive their project: deleting a project sets it to null and keeps the run
+rows for usage accounting and daily quotas (sections 3.5 and 9).
 
 ## 3. Tables
 
@@ -154,8 +161,10 @@ Bearer tokens for `/v1/*`. The raw token is never stored, only its SHA-256 hex d
 Indexes: unique on `tokenHash`; `@@index([userId])`.
 
 In M1 tokens are created only by the seed script from `STUDIO_DEV_API_TOKEN` (at least 32 characters; `.env.example` shows how
-to generate a `vcs_`-prefixed random token). The auth hook accepts bearer values of 16 to 512 characters. Revoking a token
-means setting `revokedAt` directly in the database. Token-management endpoints are **planned (M8)**.
+to generate a `vcs_`-prefixed random token). The seed upserts by `tokenHash`: the same token value keeps one row, and a new value
+adds a row while older tokens stay valid. The auth hook accepts bearer values of 16 to 512 characters. Revoking a token means
+setting `revokedAt` directly in the database; re-seeding the same token value clears `revokedAt` again. Token-management
+endpoints are **planned (M8)**.
 
 ### 3.3 `Project` (table `projects`)
 
@@ -192,15 +201,17 @@ An immutable snapshot of a timeline and the director artifacts that produced it.
 | `schemaVersion` | Int | The timeline's `schemaVersion` when written (always 1 in M1). Lets old documents be found without parsing JSON. |
 | `timeline` | Json | `Timeline` v1 (section 4) |
 | `artifacts` | Json | `DirectorArtifacts` (section 4) |
-| `directorRunId` | String, nullable, unique, FK to `DirectorRun.id` | The run that produced this version. `onDelete: SetNull`. Unique, so a run produces at most one version. Nullable so versions created without a run (planned M2 editor edits) fit the same table. |
+| `directorRunId` | String, nullable, unique, FK to `DirectorRun.id` | The run that produced this version, set in the run's success transaction. The API reports it back as `DirectorRunDTO.versionNumber`. `onDelete: SetNull`, so the version survives if the run row is removed. Unique, so a run produces at most one version. Nullable so versions created without a run (planned M2 editor edits) fit the same table. |
 | `createdAt` | DateTime | |
 
 Indexes: `@@unique([projectId, version])`, which also serves "versions of a project" lookups and guards against two writers
 assigning the same number; unique on `directorRunId`.
 
-Rows are never updated after insert. `ProjectVersionSummaryDTO.sceneCount`, `durationInFrames` and `fps` are not columns; they
-are read from the `timeline` JSON. For very long projects with many versions, listing versions therefore reads every
-timeline document. Denormalizing those three values into columns is an option if it shows up in measurements.
+Rows are never updated after insert. They are deleted with their project (cascade), which also removes the link from the
+producing run. `ProjectVersionSummaryDTO.sceneCount`, `durationInFrames` and `fps` are not columns. `GET /v1/projects/:id/versions`
+extracts them in SQL with jsonb operators (`jsonb_array_length(timeline->'scenes')`, `timeline->>'durationInFrames'`,
+`timeline->'settings'->>'fps'`), so the API never loads whole timelines to list versions, but Postgres still reads every timeline
+document of the project. Denormalizing those three values into columns is an option if it shows up in measurements.
 
 ### 3.5 `DirectorRun` (table `director_runs`)
 
@@ -208,31 +219,37 @@ One execution of the AI Director for a project. It is the source of truth for ru
 
 | Field | Type | Notes |
 |---|---|---|
-| `id` | String, PK | The BullMQ job payload is `{runId: id}` |
-| `projectId` | String, FK to `Project.id` | `onDelete: Cascade` |
+| `id` | String, PK | The BullMQ job payload is `{runId: id}`, and the job id is the run id |
+| `projectId` | String, nullable, FK to `Project.id` | `onDelete: SetNull`. Null once the project was deleted: the run row is kept so usage and daily quotas stay accurate. Such runs are no longer addressable through the API (`GET /v1/director-runs/:runId` returns 404), and the worker skips them. |
 | `requestedById` | String, FK to `User.id` | Who started the run. `onDelete: Cascade`. M1 has no user-deletion endpoint. |
 | `status` | `RunStatus` enum, default `QUEUED` | `QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED` (section 5) |
-| `provider` | String | Provider name configured when the run was created (for example `mock`) |
+| `provider` | String | Provider name configured in the API process when the run was created (for example `mock`) |
 | `model` | String | Configured model (for example `mock-director-v1`, `claude-opus-5-5`). The model actually served for each call is in `usage.stages[].model`. |
 | `promptVersion` | String | `PROMPT_VERSION` of `@vc/ai-director` (`m1.0`) |
 | `progress` | Json | `{completedSteps, totalSteps, currentStage, message}` (section 4) |
-| `usage` | Json, nullable | `UsageReport` (section 4) |
+| `usage` | Json, nullable | `UsageReport` (section 4). Written when the run finishes: on success, and also on failure, timeout or cancellation with the usage consumed so far. Null for runs that never started work. |
+| `warnings` | Json, default `[]` | Director warnings as a string array, for example engine-coercion notices. At most 500 entries of at most 2000 characters each. Written together with `usage`. Not exposed by the M1 API; read it from the database. |
 | `inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens` | Int, default 0 | Run totals, copied from `usage.totals` so usage and quota queries can sum columns |
 | `estimatedCostUsd` | Decimal(12,6), default 0 | Estimated USD for the run, from the pricing table (unknown models count as 0) |
-| `errorCode` | String, nullable | A `DirectorError` code (`VALIDATION_FAILED`, `PROVIDER_REFUSAL`, `PROVIDER_UNAVAILABLE`, `PROVIDER_CONFIG`, `PROVIDER_REQUEST`, `PROVIDER_TRUNCATED`, `CANCELLED`, `LIMIT_EXCEEDED`, `INTERNAL`), or one set by studio-api: `TIMEOUT` (run exceeded `DIRECTOR_RUN_TIMEOUT_MS`), `QUEUE_UNAVAILABLE` (the job could not be enqueued), `INTERNAL` (unexpected error, or the BullMQ job itself failed) |
+| `errorCode` | String, nullable | Set only on `FAILED` runs (a cancelled run has none). Either a `DirectorError` code (`VALIDATION_FAILED`, `PROVIDER_REFUSAL`, `PROVIDER_UNAVAILABLE`, `PROVIDER_CONFIG`, `PROVIDER_REQUEST`, `PROVIDER_TRUNCATED`, `CANCELLED`, `LIMIT_EXCEEDED`, `INTERNAL`), or one set by studio-api: `TIMEOUT` (the run exceeded its effective timeout, `max(DIRECTOR_RUN_TIMEOUT_MS, steps × DIRECTOR_STEP_TIMEOUT_MS)`), `QUEUE_UNAVAILABLE` (the job could not be enqueued), `INTERNAL` (unexpected error, or the BullMQ job itself failed) |
 | `errorMessage` | String, nullable | Sanitized message, safe to show to the user: credentials that look like Anthropic keys or bearer tokens are redacted, control characters removed, length capped at 1000. Unexpected errors get a generic message; details go to the server log. |
 | `createdAt` | DateTime | When the run was queued |
 | `startedAt`, `finishedAt` | DateTime, nullable | `startedAt` is set when the worker claims the run. `finishedAt` is set on reaching a terminal state, including by the cancel endpoint. |
+
+The optional `version` back-relation is the `ProjectVersion` whose `directorRunId` points at this run.
 
 Indexes:
 
 - `@@index([projectId, createdAt])`: runs of a project, newest first (latest 20), and the active-run check.
 - `@@index([requestedById, createdAt])`: per-user usage for today and this month, and the daily quota checks.
 
-**Usage is written only on success.** The token columns, `estimatedCostUsd` and `usage` are filled in the success
-transaction. A run that fails, times out or is cancelled keeps zeros and `usage = null`, even if it already spent tokens on
-provider calls. `/v1/usage` and the daily USD quota therefore undercount live spend from unsuccessful runs. Every run, whatever
-its status, still counts toward the daily run quota.
+**Usage is recorded for every run that did work.** The token columns, `estimatedCostUsd`, `usage` and `warnings` are written
+in the success transaction, by `markRunFailed` (failure and timeout), and by the worker's cancellation finaliser, which fills
+them only if `usage` is still null. Runs cancelled while `QUEUED`, and runs failed with `QUEUE_UNAVAILABLE`, keep zeros and
+`usage = null` because they made no provider calls. Runs failed because their worker process died (`INTERNAL`, section 5.2)
+also keep zeros, even if they had spent tokens, so `/v1/usage` and the USD quota undercount in that case. Every run, whatever
+its status, counts toward the daily run quota. Because run rows survive project deletion, `/v1/usage` and the quotas include
+runs of deleted projects.
 
 ### 3.6 `DirectorCacheEntry` (table `director_cache_entries`)
 
@@ -241,8 +258,9 @@ skips the provider call entirely.
 
 | Field | Type | Notes |
 |---|---|---|
-| `key` | String, PK | `computeCacheKey(...)`: SHA-256 hex of canonical (sorted-key) JSON of `{stage, chunk, promptVersion, provider, model, schemaName, system, prompt}` |
-| `stage` | String | Intended for inspection. The M1 `CacheEntry` interface of `@vc/ai-director` does not carry the stage, so `PrismaDirectorCache` stores `unknown` unless an entry provides one. |
+| `key` | String, PK | User-scoped: `sha256(scope + "\n" + directorKey)` as hex, where `scope` is the id of the user who requested the run (`DirectorRun.requestedById`) and `directorKey` is `computeCacheKey(...)` of `@vc/ai-director`: SHA-256 hex of canonical (sorted-key) JSON of `{stage, chunk, promptVersion, provider, model, schemaName, system, prompt}`. One user's runs can therefore never hit, and so reveal, another user's entries. |
+| `stage` | String | The `DirectorStage` that produced the output (`brief`, `outline`, `script`, `storyboard`, `shotList`, `engineSelection`, `sceneSpecs`). A row whose `stage` is not a valid stage is treated as a miss. |
+| `chunk` | String, nullable | The chunk the output belongs to, for example a chapter id such as `c1`. Null for whole-project stages (`brief`, `outline`). |
 | `model`, `provider` | String | For inspection and targeted cleanup |
 | `output` | Json | The validated output of the stage. Only outputs that passed Zod and the semantic validator are cached. |
 | `usage` | Json | `TokenUsage` of the call that produced the output. A row whose `usage` fails `TokenUsageSchema` is treated as a miss. |
@@ -250,8 +268,9 @@ skips the provider call entirely.
 | `createdAt` | DateTime | |
 | `lastHitAt` | DateTime, nullable | Last hit time. Null if never hit. |
 
-No indexes beyond the primary key. Writes are upserts by `key`. A hit is recorded in the run's usage as a `StageUsage` with `cached: true`, zero tokens and
-zero cost; the stored `usage` keeps what the original call cost.
+No indexes beyond the primary key. Writes are upserts by `key`. A hit is recorded in the run's usage as a `StageUsage` with
+`cached: true`, zero tokens and zero cost; the stored `usage` keeps what the original call cost. The table has no owner column:
+the user id only exists inside the hash, so entries cannot be selected by user.
 
 The prompt version is part of the hashed key, so bumping `PROMPT_VERSION` makes old entries unreachable without deleting them
 (section 9). Changing an LLM-facing schema without bumping `PROMPT_VERSION` can serve stale outputs, because the key covers the
@@ -267,8 +286,9 @@ same schema (for timelines, with `parseTimeline`) rather than trusting the datab
 | `Project.request` | The user's request: title, prompt, genre, style notes, duration, aspect ratio, resolution, custom dimensions, fps, language, brand, voice-over and music intent, reference asset ids | `VideoRequestSchema` (also checked with `checkVideoRequestLimits`) | `POST /v1/projects` | No version field in M1 |
 | `ProjectVersion.timeline` | The compiled timeline: render settings, `durationInFrames`, brand kit, assets, chapters, scenes, tracks, generator metadata | `TimelineSchema` v1 with all invariants. See [TIMELINE_SCHEMA.md](TIMELINE_SCHEMA.md). | Success transaction | `schemaVersion` inside the document, mirrored in the `schemaVersion` column, plus `TIMELINE_MIGRATIONS` |
 | `ProjectVersion.artifacts` | `{brief, outline, script, storyboard, shotList, engineSelection, sceneSpecs}` | `DirectorArtifactsSchema` | Success transaction | No version field in M1 |
-| `DirectorRun.progress` | `{completedSteps, totalSteps, currentStage: DirectorStage \| null, message: string \| null}` | The `progress` shape of `DirectorRunDTO` | Created as `{0, 0, null, "Queued"}`. Reset to `"Starting AI Director"` when the worker claims the run, then updated at most every 500 ms. On success it ends at `completedSteps = totalSteps`, stage `compile`, message `"Timeline ready"`. | — |
-| `DirectorRun.usage` | `{stages: StageUsage[], totals}` | `UsageReportSchema` | On success | — |
+| `DirectorRun.progress` | `{completedSteps, totalSteps, currentStage: DirectorStage \| null, message: string \| null}` | `DirectorRunProgressSchema` (the `progress` shape of `DirectorRunDTO`) | Created as `{0, N, null, "Queued"}`, where `N` is the planned step count of the project's request (0 if it no longer plans, for example after limits were lowered). Reset to `"Starting AI Director"` when the worker claims the run, then updated at most every 500 ms. On success it ends at `completedSteps = totalSteps`, stage `compile`, message `"Timeline ready"`. Not changed by cancellation or failure. | — |
+| `DirectorRun.usage` | `{stages: StageUsage[], totals}` | `UsageReportSchema` | When the run finishes: success, failure, timeout, or cancellation while running (partial usage) | — |
+| `DirectorRun.warnings` | `string[]`, for example engine-coercion notices | None (plain strings, capped at 500 entries of 2000 characters) | Together with `usage` | — |
 | `DirectorCacheEntry.output` | One stage output, for example a `CreativeBrief` or one chapter's script, storyboard, shot list, engine selection or scene specs | The stage's LLM-facing schema | After validation | Covered by `PROMPT_VERSION` in the key |
 | `DirectorCacheEntry.usage` | `{inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens}` | `TokenUsageSchema` | With the entry | — |
 
@@ -341,15 +361,25 @@ stateDiagram-v2
   end note
 ```
 
-The status after a run stops is decided in one place, `restoreProjectStatus` (`src/services/project-status.ts`): `READY` if
-the project has a current version; otherwise `FAILED` when the run failed and `DRAFT` when it was cancelled. It does nothing
-while another run of the project is still active, so a late finaliser cannot overwrite `DIRECTING` after a quick re-run.
+A successful run sets `READY` and the new `currentVersionId` in its success transaction. The status after a run stops
+**without** producing a version is decided in one place, `restoreProjectStatus` (`src/services/project-status.ts`), called by
+the cancel endpoint, `markRunFailed` and the worker's cancellation finaliser:
+
+| Run outcome | Project has a current version | Project has no version yet |
+|---|---|---|
+| `FAILED` (any error code, including `TIMEOUT` and `QUEUE_UNAVAILABLE`) | `READY` | `FAILED` |
+| `CANCELLED` | `READY` | `DRAFT` |
+
+It does nothing while another run of the project is still active, so a late finaliser cannot overwrite `DIRECTING` after a
+quick re-run.
 
 - The web app starts a run right after creating a project, so `DRAFT` is usually brief. Through the API, or after cancelling a
   first run, a project can stay `DRAFT` indefinitely.
 - A failed or cancelled re-run never loses work: the project returns to `READY` and keeps its current version.
 - If the job cannot be enqueued, the run is marked `FAILED` (`QUEUE_UNAVAILABLE`), the project status is restored, and the API
-  returns 503.
+  returns 503. Exception: if Redis was unreachable when the API process started, the enqueue waits for Redis instead of failing,
+  so the run stays `QUEUED` and the project `DIRECTING` until Redis comes up
+  ([DEVELOPMENT.md troubleshooting](DEVELOPMENT.md#11-troubleshooting)).
 - `READY` does not mean rendered. Rendering is **planned (M2)**, with its own status on the planned `Render` table.
 
 ### 5.2 DirectorRun
@@ -359,19 +389,28 @@ stateDiagram-v2
   [*] --> QUEUED: POST director-runs (202)
   QUEUED --> RUNNING: worker claims the job
   QUEUED --> CANCELLED: POST cancel
-  QUEUED --> FAILED: enqueue failed (QUEUE_UNAVAILABLE)
+  QUEUED --> FAILED: enqueue failed (QUEUE_UNAVAILABLE) or BullMQ job failed (INTERNAL)
   RUNNING --> SUCCEEDED: version committed in one transaction
-  RUNNING --> FAILED: DirectorError, TIMEOUT or INTERNAL
-  RUNNING --> CANCELLED: POST cancel, worker aborts
+  RUNNING --> FAILED: DirectorError, TIMEOUT or INTERNAL (partial usage kept)
+  RUNNING --> CANCELLED: POST cancel, worker aborts (partial usage kept)
   SUCCEEDED --> [*]
   FAILED --> [*]
   CANCELLED --> [*]
 
   note right of RUNNING
-    Known M1 gap: if the worker dies,
-    the run stays RUNNING until cancelled
+    If the worker dies, the run stays RUNNING
+    until a worker runs again (then FAILED,
+    INTERNAL) or the user cancels it
   end note
 ```
+
+**Worker crashes.** The worker sets `maxStalledCount: 0`. When a worker process dies mid-run, its job lock expires (30 s) and
+the stalled-job check of the next running worker flags the job; that worker then fails it instead of re-running it, and
+`onJobFailed` marks the run `FAILED` with `INTERNAL` ("The director worker stopped unexpectedly while processing this run") and
+restores the project status. In a local test this happened about a minute after the worker was restarted. Usage spent before the
+crash is not recorded for such runs. While no worker is running, or with `QUEUE_DRIVER=inline` (no BullMQ job), nothing ends the
+run: it stays `RUNNING`, and the project is blocked with 409 `RUN_ACTIVE`, until the user cancels it. A stale-run reaper is still
+an open item ([ROADMAP known gaps](ROADMAP.md#known-gaps-carried-out-of-m1)).
 
 Invariants:
 
@@ -381,8 +420,10 @@ Invariants:
    the current status (section 6).
 4. `startedAt` is set when a run becomes `RUNNING`; `finishedAt` when it reaches a terminal state. A run cancelled while
    `QUEUED` never gets a `startedAt`.
-5. A `SUCCEEDED` run has exactly one `ProjectVersion` with its id in `directorRunId` (unique). Failed and cancelled runs have
-   none.
+5. A `SUCCEEDED` run has exactly one `ProjectVersion` with its id in `directorRunId` (unique) while its project exists. Failed and
+   cancelled runs have none.
+6. Deleting a project never deletes runs: its versions cascade away, and its runs keep their status, usage and error with
+   `projectId = null`. Only terminal runs can be in that state, because deletion is refused while a run is active.
 
 ## 6. Query patterns, indexes and concurrency
 
@@ -391,11 +432,12 @@ Invariants:
 | Authenticate a request | `ApiToken` by `tokenHash`, with its `User`; `lastUsedAt` updated at most once per minute | unique `tokenHash` |
 | `GET /v1/projects` | `Project` where `ownerId`, order by `updatedAt` desc then `id` desc, cursor = id of the last item (unknown cursor: 400 `INVALID_CURSOR`) | `[ownerId, updatedAt]` |
 | `GET /v1/projects/:id` and every project-scoped route | `Project` where `id` and `ownerId` | primary key |
-| Run by id | `DirectorRun` where `id` and `project.ownerId` | primary key |
+| Run by id, cancel | `DirectorRun` where `id` and `project.ownerId`. A run whose project was deleted (`projectId = null`) matches nothing, so it returns 404. | primary key |
 | Latest runs of a project, active-run check | `DirectorRun` where `projectId` (and `status` in `QUEUED`, `RUNNING`), order by `createdAt` desc then `id` desc | `[projectId, createdAt]` |
-| Usage today and this month, daily quotas | Aggregate `DirectorRun` where `requestedById` and `createdAt` at or after the start of the current UTC day or UTC month: count of runs (all statuses) and sums of the token and cost columns | `[requestedById, createdAt]` |
-| Versions of a project, one version | `ProjectVersion` where `projectId` (and `version`) | unique `[projectId, version]` |
-| Cache lookup | `DirectorCacheEntry` by `key` | primary key |
+| Usage today and this month, daily quotas | Aggregate `DirectorRun` where `requestedById` and `createdAt` at or after the start of the current UTC day or UTC month: count of runs (all statuses) and sums of the token and cost columns. No join to `Project`, so runs of deleted projects are included. | `[requestedById, createdAt]` |
+| Versions of a project | Raw SQL on `project_versions` where `project_id`, order by `version` desc, with jsonb operators for scene count, duration and fps (section 3.4) | unique `[projectId, version]` |
+| One version | `ProjectVersion` by `(projectId, version)` | unique `[projectId, version]` |
+| Cache lookup | `DirectorCacheEntry` by `key` (the user-scoped hash) | primary key |
 
 Because `updatedAt` changes whenever a run starts or ends, a project can move between pages while someone is paging through the
 project list.
@@ -405,13 +447,20 @@ How M1 keeps concurrent writers consistent:
 - **One active run per project.** `startDirectorRun` (`src/services/director-runs.ts`) runs in a transaction that first takes a
   row lock on the project (`SELECT ... FOR UPDATE`), then checks for an active run, checks the quota, inserts the run and sets
   the project to `DIRECTING`. Two simultaneous requests for the same project are serialized, and the second gets 409.
+  `deleteProject` takes the same lock (owner-scoped) before its active-run check, so a project cannot be deleted while a run is
+  being started for it.
 - **Quotas are soft across projects.** The quota check happens under the project's lock, not a per-user lock, so simultaneous
   runs on different projects can each pass it. A single run can also go past the USD limit, since cost is known only at the end.
-- **Claiming a run is atomic.** The worker moves a run from `QUEUED` to `RUNNING` with one conditional update
-  (`updateMany where status = QUEUED`). If it matches no row (already claimed, cancelled or deleted), the job is skipped.
+- **Claiming a run is atomic.** The worker skips a run that is not `QUEUED` or whose `projectId` is null, then moves it from
+  `QUEUED` to `RUNNING` with one conditional update (`updateMany where status = QUEUED`). If that matches no row (already
+  claimed or cancelled), the job is skipped.
 - **Ending a run is conditional.** Progress writes and the success update match only `status = RUNNING`. If a cancel landed
   first, the success transaction rolls back and the run is finalised as cancelled. Marking `FAILED` matches only `QUEUED` or
-  `RUNNING`; cancelling matches only `QUEUED` or `RUNNING` (otherwise 409 `RUN_NOT_ACTIVE`).
+  `RUNNING`; cancelling matches only `QUEUED` or `RUNNING` (otherwise 409 `RUN_NOT_ACTIVE`). The cancellation finaliser in the
+  worker only fills `finishedAt` if it is still null and the usage columns if `usage` is still null, so it never overwrites what
+  the cancel endpoint or an earlier write recorded.
+- **Cancellation reaches a running director** through the run row: the worker polls the status every 2 s and checks it on every
+  progress event, then aborts the in-flight provider call.
 - **Version numbers** are `max(version) + 1` inside the success transaction, backed by `@@unique([projectId, version])`.
 
 ## 7. Migration workflow
@@ -423,12 +472,14 @@ Prisma CLI commands read `DATABASE_URL` from the environment through `apps/studi
 ### 7.1 First-time setup
 
 ```bash
+pnpm install                                      # postinstall runs prisma generate -> src/generated/prisma (gitignored)
 docker compose up -d                              # Postgres 16 + Redis 7
 cp apps/studio-api/.env.example apps/studio-api/.env   # then set STUDIO_DEV_API_TOKEN
-pnpm --filter @vc/studio-api db:generate          # prisma generate -> src/generated/prisma (gitignored)
 pnpm studio:db:migrate                            # prisma migrate deploy (video_studio)
 pnpm studio:db:seed                               # dev user + hashed STUDIO_DEV_API_TOKEN
 ```
+
+The full local setup, including the web app, is in [DEVELOPMENT.md](DEVELOPMENT.md#2-first-time-setup).
 
 `docker/postgres/init-databases.sql` only runs on an empty volume. If your `pgdata` volume existed before the studio, create the
 databases once:
@@ -437,7 +488,9 @@ databases once:
 docker compose exec postgres psql -U postgres -c 'CREATE DATABASE video_studio' -c 'CREATE DATABASE video_studio_test'
 ```
 
-Run `db:generate` after every install, checkout or schema change. CI runs it before `pnpm typecheck`.
+`pnpm install` generates the Prisma client through the `@vc/studio-api` `postinstall` script, without needing a database. Run
+`pnpm --filter @vc/studio-api db:generate` by hand after changing `schema.prisma` or checking out a commit that changes it. CI
+runs it explicitly before `pnpm typecheck`.
 
 ### 7.2 Changing the schema (development)
 
@@ -453,8 +506,8 @@ pnpm --filter @vc/studio-api db:generate
   shadow database, so the database user needs permission to create databases (the local `postgres` user has it).
 - To review or hand-edit the SQL first (partial indexes, data backfills), add `--create-only`, edit `migration.sql`, then run
   `migrate dev` again to apply it.
-- Commit `schema.prisma`, the new migration directory and `migration_lock.toml` together. The initial migration is
-  `20261009082453_init`.
+- Commit `schema.prisma`, the new migration directory and `migration_lock.toml` together. The committed migrations are
+  `20261009082453_init` and `20261009085125_run_accounting` (section 1).
 - Keep `@map` / `@@map` on every new field and model so Postgres names stay snake_case.
 - Never edit or delete a migration that has been applied anywhere else. Fix forward with a new migration.
 - Prefer additive changes. For renames and drops, use expand and contract: add the new column, deploy code that writes both,
