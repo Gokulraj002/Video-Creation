@@ -155,7 +155,7 @@ to be met. M1 rows describe what M1 delivers; everything else is planned.
 |---|---|---|
 | CREATE-1 | Form fields: title (1 to 200 chars), prompt (up to `LIMIT_MAX_PROMPT_CHARS`, default 20 000), genre (14 values), style notes (up to 2 000). | M1 |
 | CREATE-2 | Duration entered as a value plus unit (s, min, h). No hardcoded maximum. The form shows the configured limit from `GET /v1/system/config`, and the API rejects requests above it with 422 `LIMIT_EXCEEDED`. | M1 |
-| CREATE-3 | Aspect ratio (9:16, 16:9, 1:1, 4:5, custom W×H with even dimensions from 16 to 8192), resolution (480p to 2160p or custom), fps (schema 1 to 240, capped by `LIMIT_MAX_FPS`, default 60), language (BCP-47, default `en`). | M1 |
+| CREATE-3 | Aspect ratio (9:16, 16:9, 1:1, 4:5, custom W×H with even dimensions from 16 to 8192), resolution (480p to 2160p or custom), fps (schema 1 to 240, default 30, capped by `LIMIT_MAX_FPS` whose default is 60), language (BCP-47, default `en`). | M1 |
 | CREATE-4 | Brand name and up to 5 colour inputs in the M1 form. The API contract additionally accepts up to 8 colours, heading and body fonts, and a logo asset id. | M1 |
 | CREATE-5 | Voice-over (toggle, style, gender) and music (toggle, mood). In M1 these set intent only: voice-over text is scripted and a caption track is derived from it. No audio is generated until M4. | M1 (intent) / M4 (audio) |
 | CREATE-6 | On submit: validate with `VideoRequestSchema` in a Server Action, create the project, start a director run, redirect to the project page. | M1 |
