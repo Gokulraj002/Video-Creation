@@ -32,7 +32,7 @@ export async function GET(request: Request, context: { params: Promise<Params> }
     const projectVersion = await getProjectVersion(projectId, version);
     const page = pageChapterRows(storyboardFor(projectVersion), chapterId, offset, limit);
     if (!page) return jsonError(404, 'NOT_FOUND', 'Chapter not found.');
-    return jsonOk(page);
+    return await jsonOk(page, request);
   } catch (error) {
     return errorResponse(error, 'GET /api/projects/:id/versions/:version/storyboard');
   }

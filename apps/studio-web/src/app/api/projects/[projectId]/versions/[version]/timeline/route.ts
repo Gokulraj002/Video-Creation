@@ -11,13 +11,13 @@ export const dynamic = 'force-dynamic';
 
 type Params = { projectId: string; version: string };
 
-export async function GET(_request: Request, context: { params: Promise<Params> }): Promise<Response> {
+export async function GET(request: Request, context: { params: Promise<Params> }): Promise<Response> {
   const { projectId, version: rawVersion } = await context.params;
   const version = parseVersionParam(rawVersion);
   if (!isValidId(projectId) || version === null) return jsonError(400, 'VALIDATION_ERROR', 'Invalid project or version.');
   try {
     const projectVersion = await getProjectVersion(projectId, version);
-    return jsonOk(projectVersion.timeline);
+    return await jsonOk(projectVersion.timeline, request);
   } catch (error) {
     return errorResponse(error, 'GET /api/projects/:id/versions/:version/timeline');
   }

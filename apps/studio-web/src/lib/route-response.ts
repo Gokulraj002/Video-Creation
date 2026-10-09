@@ -1,5 +1,7 @@
 import 'server-only';
 
+import { promisify } from 'node:util';
+import { gzip } from 'node:zlib';
 import { DbIdSchema } from '@vc/schema';
 import { proxyStatusFor, publicFailureMessage } from './api-failure';
 import { isStudioApiError } from './studio-api';
@@ -12,8 +14,27 @@ import { isStudioApiError } from './studio-api';
 
 export const NO_STORE = { 'Cache-Control': 'no-store' } as const;
 
-export function jsonOk(body: unknown): Response {
-  return Response.json(body, { headers: NO_STORE });
+const gzipAsync = promisify(gzip);
+
+/** Bodies above this size are gzipped when the client accepts it (Next.js does not compress route handlers). */
+const COMPRESS_MIN_BYTES = 16 * 1024;
+
+export async function jsonOk(body: unknown, request?: Request): Promise<Response> {
+  const text = JSON.stringify(body);
+  const acceptsGzip = /\bgzip\b/i.test(request?.headers.get('accept-encoding') ?? '');
+  if (acceptsGzip && text.length >= COMPRESS_MIN_BYTES) {
+    // zlib's async API runs on the libuv thread pool, so multi-MB timelines do not block the event loop.
+    const compressed = await gzipAsync(Buffer.from(text, 'utf8'));
+    return new Response(new Uint8Array(compressed), {
+      headers: {
+        ...NO_STORE,
+        'Content-Type': 'application/json',
+        'Content-Encoding': 'gzip',
+        Vary: 'Accept-Encoding',
+      },
+    });
+  }
+  return new Response(text, { headers: { ...NO_STORE, 'Content-Type': 'application/json', Vary: 'Accept-Encoding' } });
 }
 
 export function jsonError(status: number, code: string, message: string): Response {

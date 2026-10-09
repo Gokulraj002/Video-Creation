@@ -256,7 +256,7 @@ async function ProjectBody({
     panel = (
       <>
         {runsResult && !runsResult.ok ? <ApiErrorAlert failure={runsResult.failure} title="Could not load the run history" /> : null}
-        <UsageView run={usageRun} runs={runs} />
+        <UsageView run={usageRun} runs={runs} page={page} hrefForPage={(p) => href('usage', p)} />
       </>
     );
   } else if (tab === 'request') {

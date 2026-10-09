@@ -72,6 +72,7 @@ export default function TimelineJsonInner({
         </div>
       </div>
       <pre
+        id="timeline-json"
         tabIndex={0}
         aria-label="Timeline JSON"
         className="max-h-[70vh] overflow-auto rounded-xl border bg-muted/40 p-4 font-mono text-xs leading-relaxed"

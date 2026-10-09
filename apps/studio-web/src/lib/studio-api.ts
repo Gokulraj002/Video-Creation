@@ -414,7 +414,17 @@ export async function listProjectVersions(projectId: string): Promise<ProjectVer
  * too (entries are only ever served to the identity that fetched them). Bounded (entries × TTL) to cap memory;
  * in-flight requests are shared; failures are never cached; deleting a project evicts its versions.
  */
-const versionCache = new TtlCache<string, Promise<ProjectVersionDTO>>({ maxEntries: 3, ttlMs: 5 * 60_000 });
+const VERSION_CACHE_KEY = Symbol.for('vc.studio-web.versionCache');
+type VersionCache = TtlCache<string, Promise<ProjectVersionDTO>>;
+/**
+ * Kept on `globalThis`: Next.js bundles pages and route handlers separately, each with its own instance of this
+ * module, and the page, the timeline route and the storyboard route must share one cache.
+ */
+const versionCache: VersionCache = (() => {
+  const store = globalThis as typeof globalThis & { [VERSION_CACHE_KEY]?: VersionCache };
+  store[VERSION_CACHE_KEY] ??= new TtlCache<string, Promise<ProjectVersionDTO>>({ maxEntries: 3, ttlMs: 5 * 60_000 });
+  return store[VERSION_CACHE_KEY];
+})();
 
 function tokenFingerprint(): string {
   return createHash('sha256')

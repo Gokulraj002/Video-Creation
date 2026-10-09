@@ -10,11 +10,11 @@ import { getDirectorRun } from '@/lib/studio-api';
  */
 export const dynamic = 'force-dynamic';
 
-export async function GET(_request: Request, context: { params: Promise<{ runId: string }> }): Promise<Response> {
+export async function GET(request: Request, context: { params: Promise<{ runId: string }> }): Promise<Response> {
   const { runId } = await context.params;
   if (!isValidId(runId)) return jsonError(400, 'VALIDATION_ERROR', 'Invalid run id.');
   try {
-    return jsonOk(toClientRun(await getDirectorRun(runId)));
+    return await jsonOk(toClientRun(await getDirectorRun(runId)), request);
   } catch (error) {
     return errorResponse(error, 'GET /api/runs/:runId');
   }

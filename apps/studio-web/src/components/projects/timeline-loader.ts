@@ -1,43 +1,54 @@
 import '@/lib/zod-jitless';
 import { ApiErrorSchema, TimelineSchema, type Timeline } from '@vc/schema';
 import { useEffect, useState } from 'react';
+import { setTimelineLoaded, takeTimelineResponse, type RawTimelineResponse } from './timeline-fetch';
 
 /**
  * Lazily loads a version's timeline from the same-origin route handler (`/api/projects/:id/versions/:v/timeline`,
  * a server-side proxy — the API token never reaches the browser) and validates it with `TimelineSchema`.
  * The page itself never serializes the timeline (multi-hour timelines are several MB).
- * Client-only module (imported by client components). Results are kept per page session (soft navigations between tabs reuse them); at most two timelines are held.
+ * Client-only module (imported by client components). Results are kept per page session (soft navigations between
+ * tabs reuse them); at most two timelines are held. The download itself may already have been started by
+ * `prefetchTimeline` (see `timeline-fetch.ts`).
  */
 
 const MAX_CACHED = 2;
 const pending = new Map<string, Promise<Timeline>>();
 const resolved = new Map<string, Timeline>();
 
-function remember<V>(map: Map<string, V>, key: string, value: V): void {
+function remember<V>(map: Map<string, V>, key: string, value: V, onEvict?: (key: string) => void): void {
   map.delete(key);
   map.set(key, value);
   while (map.size > MAX_CACHED) {
     const oldest = map.keys().next();
     if (oldest.done) break;
     map.delete(oldest.value);
+    onEvict?.(oldest.value);
   }
 }
 
+function evictResolved(key: string): void {
+  const [projectId, version] = splitKey(key);
+  if (projectId !== null) setTimelineLoaded(projectId, version, false);
+}
+
+function splitKey(key: string): [string | null, number] {
+  const at = key.lastIndexOf(':');
+  return at > 0 ? [key.slice(0, at), Number(key.slice(at + 1))] : [null, 0];
+}
+
 async function fetchTimeline(projectId: string, version: number): Promise<Timeline> {
-  let response: Response;
+  let response: RawTimelineResponse;
   try {
-    response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/versions/${version}/timeline`, {
-      cache: 'no-store',
-    });
+    response = await takeTimelineResponse(projectId, version);
   } catch {
     throw new Error('Lost connection to the studio while loading the timeline.');
   }
-  const body: unknown = await response.json().catch(() => undefined);
   if (!response.ok) {
-    const envelope = ApiErrorSchema.safeParse(body);
+    const envelope = ApiErrorSchema.safeParse(response.body);
     throw new Error(envelope.success ? envelope.data.error.message : `Could not load the timeline (HTTP ${response.status}).`);
   }
-  const parsed = TimelineSchema.safeParse(body);
+  const parsed = TimelineSchema.safeParse(response.body);
   if (!parsed.success) throw new Error('The timeline did not pass validation.');
   return parsed.data;
 }
@@ -48,7 +59,8 @@ export function loadTimeline(projectId: string, version: number): Promise<Timeli
   if (inFlight) return inFlight;
   const promise = fetchTimeline(projectId, version).then(
     (timeline) => {
-      remember(resolved, key, timeline);
+      remember(resolved, key, timeline, evictResolved);
+      setTimelineLoaded(projectId, version, true);
       return timeline;
     },
     (error: unknown) => {

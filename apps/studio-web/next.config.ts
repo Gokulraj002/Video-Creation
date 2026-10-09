@@ -13,6 +13,7 @@ import type { NextConfig } from 'next';
  *   `ws:` / `wss:` (HMR).
  * - `style-src 'unsafe-inline'`: React `style` attributes (the Remotion composition is all inline styles) and the
  *   Player injects a `<style>` element at runtime.
+ * - `media-src data: blob:`: the Remotion Player plays a tiny silent `data:audio/mp3` clip to unlock audio playback.
  * - `img-src data: blob:` / `font-src data:`: inline icons and data-URI assets.
  * Everything else is same-origin only; the page cannot be framed (`frame-ancestors 'none'` + `X-Frame-Options`).
  */
@@ -24,7 +25,7 @@ export function contentSecurityPolicy(dev: boolean): string {
     'img-src': ["'self'", 'data:', 'blob:'],
     'font-src': ["'self'", 'data:'],
     'connect-src': ["'self'", ...(dev ? ['ws:', 'wss:'] : [])],
-    'media-src': ["'self'", 'blob:'],
+    'media-src': ["'self'", 'data:', 'blob:'],
     'object-src': ["'none'"],
     'frame-src': ["'none'"],
     'base-uri': ["'self'"],

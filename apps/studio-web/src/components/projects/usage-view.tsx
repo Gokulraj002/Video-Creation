@@ -1,13 +1,18 @@
 import type { DirectorRunDTO, UsageReport } from '@vc/schema';
 import { ChartColumn, Check, Minus } from 'lucide-react';
 import { EmptyState } from '@/components/empty-state';
+import { Pager } from '@/components/pager';
 import { RunStatusBadge } from '@/components/status-badge';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Table, TableBody, TableCell, TableFooter, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { formatElapsed } from '@/lib/duration';
 import { formatCompactNumber, formatDateTime, formatLatency, formatNumber, formatUsd } from '@/lib/format';
+import { paginate } from '@/lib/project-tabs';
 import { STAGE_LABELS } from '@/lib/run-status';
+
+/** Per-chunk usage rows per page (a multi-hour run has hundreds of director calls). */
+export const USAGE_ROWS_PER_PAGE = 100;
 
 function Metric({ label, value }: { label: string; value: string }) {
   return (
@@ -18,10 +23,33 @@ function Metric({ label, value }: { label: string; value: string }) {
   );
 }
 
-/** Per-stage usage table: stage, chunk, attempts, cached, tokens, est. cost. */
-export function UsageTable({ usage }: { usage: UsageReport }) {
+/** Per-stage usage table: stage, chunk, attempts, cached, tokens, est. cost (paginated; totals cover every row). */
+export function UsageTable({
+  usage,
+  page = 1,
+  hrefForPage,
+}: {
+  usage: UsageReport;
+  page?: number;
+  hrefForPage?: (page: number) => string;
+}) {
   const { totals } = usage;
   const anyUnknownPricing = usage.stages.some((s) => !s.pricingKnown);
+  const slice = hrefForPage
+    ? paginate(usage.stages, page, USAGE_ROWS_PER_PAGE)
+    : { items: usage.stages, page: 1, pageCount: 1, start: 0, total: usage.stages.length };
+  const pager = hrefForPage ? (
+    <Pager
+      label="Usage pages"
+      noun="calls"
+      page={slice.page}
+      pageCount={slice.pageCount}
+      start={slice.start}
+      shown={slice.items.length}
+      total={slice.total}
+      hrefFor={hrefForPage}
+    />
+  ) : null;
   return (
     <div className="flex flex-col gap-4">
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
@@ -32,6 +60,7 @@ export function UsageTable({ usage }: { usage: UsageReport }) {
         <Metric label="Cache read / write" value={`${formatCompactNumber(totals.cacheReadTokens)} / ${formatCompactNumber(totals.cacheWriteTokens)}`} />
         <Metric label="Est. cost" value={formatUsd(totals.estimatedCostUsd)} />
       </div>
+      {pager}
       <div className="rounded-xl border bg-card">
         <Table>
           <TableHeader>
@@ -50,8 +79,8 @@ export function UsageTable({ usage }: { usage: UsageReport }) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {usage.stages.map((stage, i) => (
-              <TableRow key={`${stage.stage}-${stage.chunk ?? ''}-${i}`}>
+            {slice.items.map((stage, i) => (
+              <TableRow key={`${stage.stage}-${stage.chunk ?? ''}-${slice.start + i}`}>
                 <TableCell className="whitespace-nowrap font-medium">{STAGE_LABELS[stage.stage]}</TableCell>
                 <TableCell className="font-mono text-xs text-muted-foreground">{stage.chunk ?? '—'}</TableCell>
                 <TableCell className="hidden whitespace-nowrap text-xs text-muted-foreground md:table-cell">
@@ -62,9 +91,9 @@ export function UsageTable({ usage }: { usage: UsageReport }) {
                 </TableCell>
                 <TableCell className="text-center">
                   {stage.cached ? (
-                    <Check className="mx-auto size-4 text-success" aria-label="cached" />
+                    <Check className="mx-auto size-4 text-success" role="img" aria-label="cached" />
                   ) : (
-                    <Minus className="mx-auto size-4 text-muted-foreground" aria-label="not cached" />
+                    <Minus className="mx-auto size-4 text-muted-foreground" role="img" aria-label="not cached" />
                   )}
                 </TableCell>
                 <TableCell className="text-right tabular-nums">{formatNumber(stage.usage.inputTokens)}</TableCell>
@@ -99,6 +128,7 @@ export function UsageTable({ usage }: { usage: UsageReport }) {
           </TableFooter>
         </Table>
       </div>
+      {pager}
       {anyUnknownPricing ? (
         <p className="text-xs text-muted-foreground">* No pricing configured for this model — cost shown as $0.</p>
       ) : null}
@@ -106,7 +136,17 @@ export function UsageTable({ usage }: { usage: UsageReport }) {
   );
 }
 
-export function UsageView({ run, runs }: { run: DirectorRunDTO | null; runs: readonly DirectorRunDTO[] | null }) {
+export function UsageView({
+  run,
+  runs,
+  page,
+  hrefForPage,
+}: {
+  run: DirectorRunDTO | null;
+  runs: readonly DirectorRunDTO[] | null;
+  page: number;
+  hrefForPage: (page: number) => string;
+}) {
   return (
     <div className="flex flex-col gap-6">
       {run?.usage ? (
@@ -119,7 +159,7 @@ export function UsageView({ run, runs }: { run: DirectorRunDTO | null; runs: rea
               {run.provider} · {run.model} · started {run.startedAt ? formatDateTime(run.startedAt) : '—'}
             </p>
           </div>
-          <UsageTable usage={run.usage} />
+          <UsageTable usage={run.usage} page={page} hrefForPage={hrefForPage} />
         </section>
       ) : (
         <EmptyState
