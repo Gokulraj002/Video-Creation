@@ -83,19 +83,23 @@ model Project {
 }
 
 model ProjectVersion {
-  id            String       @id @default(cuid())
-  projectId     String       @map("project_id")
-  project       Project      @relation("ProjectVersions", fields: [projectId], references: [id], onDelete: Cascade)
-  version       Int
-  schemaVersion Int          @map("schema_version")
+  id               String       @id @default(cuid())
+  projectId        String       @map("project_id")
+  project          Project      @relation("ProjectVersions", fields: [projectId], references: [id], onDelete: Cascade)
+  version          Int
+  schemaVersion    Int          @map("schema_version")
   /// Timeline v1 document (@vc/schema TimelineSchema).
-  timeline      Json
+  timeline         Json
   /// DirectorArtifacts (@vc/schema DirectorArtifactsSchema).
-  artifacts     Json
+  artifacts        Json
+  /// Summary columns written with the timeline (the version list never loads the timeline JSON).
+  sceneCount       Int          @default(0) @map("scene_count")
+  durationInFrames Int          @default(1) @map("duration_in_frames")
+  fps              Int          @default(30)
   /// The director run that produced this version (null if the run row was removed).
-  directorRunId String?      @unique @map("director_run_id")
-  directorRun   DirectorRun? @relation(fields: [directorRunId], references: [id], onDelete: SetNull)
-  createdAt     DateTime     @default(now()) @map("created_at")
+  directorRunId    String?      @unique @map("director_run_id")
+  directorRun      DirectorRun? @relation(fields: [directorRunId], references: [id], onDelete: SetNull)
+  createdAt        DateTime     @default(now()) @map("created_at")
 
   currentOf Project? @relation("CurrentVersion")
 
@@ -125,16 +129,22 @@ model DirectorRun {
   cacheReadTokens  Int       @default(0) @map("cache_read_tokens")
   cacheWriteTokens Int       @default(0) @map("cache_write_tokens")
   estimatedCostUsd Decimal   @default(0) @map("estimated_cost_usd") @db.Decimal(12, 6)
+  /// Cost ceiling estimated from the plan at start; counts against the daily USD quota while the run is active.
+  reservedCostUsd  Decimal   @default(0) @map("reserved_cost_usd") @db.Decimal(12, 6)
   errorCode        String?   @map("error_code")
   errorMessage     String?   @map("error_message")
   createdAt        DateTime  @default(now()) @map("created_at")
   startedAt        DateTime? @map("started_at")
   finishedAt       DateTime? @map("finished_at")
+  /// Liveness of a RUNNING run (written by its worker every few seconds); stale heartbeats are reaped.
+  heartbeatAt      DateTime? @map("heartbeat_at")
 
   version ProjectVersion?
 
   @@index([projectId, createdAt])
   @@index([requestedById, createdAt])
+  @@index([requestedById, status])
+  @@index([status, heartbeatAt])
   @@map("director_runs")
 }
 

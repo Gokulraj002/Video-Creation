@@ -1,11 +1,17 @@
 import { DEFAULT_RESOURCE_LIMITS, VideoRequestSchema } from '@vc/schema';
 import { describe, expect, it } from 'vitest';
 import {
+  SCHEMA_PROMPT_MAX,
   apiErrorDetailsToFieldErrors,
+  aspectRatioMismatch,
   formToVideoRequestInput,
   issuePathToErrorKey,
   normalizeBrandColors,
   parseProjectForm,
+  promptLengthError,
+  promptMaxChars,
+  summarizeFieldErrors,
+  titleLengthError,
 } from './project-form';
 
 function makeForm(fields: Record<string, string | string[]>): FormData {
@@ -184,5 +190,88 @@ describe('error mapping', () => {
     ).toEqual({ brandColors: 'Invalid hex color', duration: 'Too small' });
     expect(apiErrorDetailsToFieldErrors('nope')).toEqual({});
     expect(apiErrorDetailsToFieldErrors(undefined)).toEqual({});
+  });
+});
+
+describe('prompt limit', () => {
+  it('uses the lower of the configured limit and the schema cap', () => {
+    expect(SCHEMA_PROMPT_MAX).toBe(20_000);
+    expect(promptMaxChars(null)).toBe(SCHEMA_PROMPT_MAX);
+    expect(promptMaxChars({ maxPromptChars: 5000 })).toBe(5000);
+    // A configured limit above the schema cap can never be reached: the schema rejects first.
+    expect(promptMaxChars({ maxPromptChars: 50_000 })).toBe(SCHEMA_PROMPT_MAX);
+  });
+
+  it('distinguishes empty from too long', () => {
+    expect(promptLengthError(0, 100)).toBe('Describe the video you want');
+    expect(promptLengthError(150, 100)).toBe('The prompt is too long: 150 characters (limit 100)');
+    expect(promptLengthError(100, 100)).toBeNull();
+    expect(titleLengthError(0)).toBe('Give the project a title');
+    expect(titleLengthError(201)).toMatch(/too long: 201 characters \(limit 200\)/);
+  });
+
+  it('reports the precise message for the effective limit', () => {
+    const limits = { ...DEFAULT_RESOURCE_LIMITS, maxPromptChars: 50 };
+    const tooLong = parseProjectForm(makeForm({ ...BASE, prompt: 'x'.repeat(60) }), limits);
+    expect(tooLong.success).toBe(false);
+    if (!tooLong.success) expect(tooLong.fieldErrors.prompt).toBe('The prompt is too long: 60 characters (limit 50)');
+
+    const empty = parseProjectForm(makeForm({ ...BASE, prompt: '   ', title: '' }), limits);
+    expect(empty.success).toBe(false);
+    if (!empty.success) {
+      expect(empty.fieldErrors.prompt).toBe('Describe the video you want');
+      expect(empty.fieldErrors.title).toBe('Give the project a title');
+    }
+
+    const schemaCap = parseProjectForm(makeForm({ ...BASE, prompt: 'x'.repeat(20_001) }));
+    expect(schemaCap.success).toBe(false);
+    if (!schemaCap.success) expect(schemaCap.fieldErrors.prompt).toBe('The prompt is too long: 20,001 characters (limit 20,000)');
+  });
+});
+
+describe('custom dimensions vs aspect ratio', () => {
+  it('accepts dimensions that match the preset ratio within ±1 px per side (same rule as the schema)', () => {
+    expect(aspectRatioMismatch('16:9', 1920, 1080)).toBeNull();
+    expect(aspectRatioMismatch('9:16', 1080, 1920)).toBeNull();
+    expect(aspectRatioMismatch('4:5', 1080, 1350)).toBeNull();
+    expect(aspectRatioMismatch('1:1', 512, 512)).toBeNull();
+    // 1000 × 9/16 = 562.5 → both even neighbours 562 and 564 are within rounding.
+    expect(aspectRatioMismatch('16:9', 1000, 562)).toBeNull();
+    expect(aspectRatioMismatch('16:9', 1000, 564)).toBeNull();
+    expect(aspectRatioMismatch('16:9', 1000, 566)).not.toBeNull();
+    expect(aspectRatioMismatch('custom', 1000, 1000)).toBeNull();
+  });
+
+  it('rejects mismatching dimensions with a suggestion', () => {
+    const mismatch = aspectRatioMismatch('16:9', 1000, 1000);
+    expect(mismatch?.expectedHeight).toBe(562);
+    expect(mismatch?.message).toMatch(/1000 × 1000 is not 16:9\. Use 1000 × 562/);
+    expect(mismatch?.message).toMatch(/Custom W × H/);
+  });
+
+  it('enforces the rule when the resolution is custom and the aspect ratio is a preset', () => {
+    const bad = parseProjectForm(makeForm({ ...BASE, resolution: 'custom', customWidth: '1000', customHeight: '1000' }));
+    expect(bad.success).toBe(false);
+    if (!bad.success) expect(bad.fieldErrors.customWidth).toMatch(/not 16:9/);
+    // Reported together with unrelated errors (the schema refinement alone would only run once the rest is valid).
+    const both = parseProjectForm(makeForm({ ...BASE, title: '', resolution: 'custom', customWidth: '1000', customHeight: '1000' }));
+    expect(both.success).toBe(false);
+    if (!both.success) expect(Object.keys(both.fieldErrors).sort()).toEqual(['customWidth', 'title']);
+
+    expect(
+      parseProjectForm(makeForm({ ...BASE, resolution: 'custom', customWidth: '1280', customHeight: '720' })).success,
+    ).toBe(true);
+    // A custom aspect ratio accepts any valid W × H, and the (ignored) preset resolution is normalized to custom.
+    const custom = parseProjectForm(makeForm({ ...BASE, aspectRatio: 'custom', resolution: '1080p', customWidth: '1000', customHeight: '1000' }));
+    expect(custom.success).toBe(true);
+    if (custom.success) expect(custom.request.resolution).toBe('custom');
+  });
+});
+
+describe('summarizeFieldErrors', () => {
+  it('lists invalid fields in on-screen order', () => {
+    expect(summarizeFieldErrors({})).toBeNull();
+    expect(summarizeFieldErrors({ fps: 'x' })).toBe('1 field needs attention: Frame rate.');
+    expect(summarizeFieldErrors({ fps: 'x', title: 'y', prompt: 'z' })).toBe('3 fields need attention: Title, Prompt, Frame rate.');
   });
 });

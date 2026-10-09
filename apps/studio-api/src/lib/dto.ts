@@ -1,8 +1,10 @@
+import type { z } from 'zod';
 import {
   AspectRatioSchema,
   DirectorArtifactsSchema,
   DirectorRunProgressSchema,
-  parseTimeline,
+  formatZodIssues,
+  safeParseTimeline,
   UsageReportSchema,
   VideoGenreSchema,
   VideoRequestSchema,
@@ -17,7 +19,7 @@ import {
   type ProjectVersionSummaryDTO,
 } from '@vc/schema';
 import type { Prisma, ProjectStatus, RunStatus } from '../db';
-import { notFound } from './errors';
+import { DataIntegrityError, notFound } from './errors';
 
 // ---------------------------------------------------------------------------------------------
 // Prisma include shapes used with the mappers
@@ -67,6 +69,14 @@ export const toProjectStatusDto = (status: ProjectStatus): ProjectStatusDTO => P
 export const toRunStatusDto = (status: RunStatus): DirectorRunStatus => RUN_STATUS[status];
 
 const iso = (d: Date): string => d.toISOString();
+
+type SafeResult<T> = { success: true; data: T } | { success: false; error: z.ZodError };
+
+/** Unwraps a safeParse of STORED data: a failure is a data-integrity problem (500), never a client 400. */
+function stored<T>(result: SafeResult<T>, entity: string, entityId: string): T {
+  if (result.success) return result.data;
+  throw new DataIntegrityError(entity, entityId, formatZodIssues(result.error, 20));
+}
 const isoOrNull = (d: Date | null): string | null => (d === null ? null : d.toISOString());
 
 // ---------------------------------------------------------------------------------------------
@@ -110,9 +120,9 @@ export function toProjectSummaryDto(project: ProjectRow): ProjectSummaryDTO {
     id: project.id,
     title: project.title,
     status: toProjectStatusDto(project.status),
-    genre: VideoGenreSchema.parse(project.genre),
+    genre: stored(VideoGenreSchema.safeParse(project.genre), 'project', project.id),
     durationSeconds: project.durationSeconds,
-    aspectRatio: AspectRatioSchema.parse(project.aspectRatio),
+    aspectRatio: stored(AspectRatioSchema.safeParse(project.aspectRatio), 'project', project.id),
     createdAt: iso(project.createdAt),
     updatedAt: iso(project.updatedAt),
     currentVersion: project.currentVersion?.version ?? null,
@@ -122,7 +132,7 @@ export function toProjectSummaryDto(project: ProjectRow): ProjectSummaryDTO {
 export function toProjectDetailDto(project: ProjectRow, latestRun: RunRow | null): ProjectDetailDTO {
   return {
     ...toProjectSummaryDto(project),
-    request: VideoRequestSchema.parse(project.request),
+    request: stored(VideoRequestSchema.safeParse(project.request), 'project.request', project.id),
     latestRun: latestRun === null ? null : toDirectorRunDto(latestRun),
   };
 }
@@ -140,10 +150,19 @@ export function toVersionSummaryDto(row: VersionSummaryRow): ProjectVersionSumma
   };
 }
 
-/** Full version DTO. The stored timeline goes through `parseTimeline` so older schema versions migrate on read. */
+/**
+ * Full version DTO. The stored timeline goes through `safeParseTimeline` so older schema versions migrate on
+ * read; a row that fails validation is reported as DATA_INTEGRITY (500) instead of a client error.
+ */
 export function toVersionDto(row: VersionRow): ProjectVersionDTO {
-  const timeline = parseTimeline(row.timeline);
-  const artifacts = DirectorArtifactsSchema.parse(row.artifacts);
+  let timelineResult: ReturnType<typeof safeParseTimeline>;
+  try {
+    timelineResult = safeParseTimeline(row.timeline);
+  } catch (err) {
+    throw new DataIntegrityError('projectVersion.timeline', row.id, [err instanceof Error ? err.message : String(err)]);
+  }
+  const timeline = stored(timelineResult, 'projectVersion.timeline', row.id);
+  const artifacts = stored(DirectorArtifactsSchema.safeParse(row.artifacts), 'projectVersion.artifacts', row.id);
   return {
     id: row.id,
     projectId: row.projectId,

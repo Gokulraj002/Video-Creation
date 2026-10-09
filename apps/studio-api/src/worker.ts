@@ -1,29 +1,53 @@
 import { ConfigError, loadConfig } from './config';
 import { createPrisma } from './db';
 import { createDirectorFactory } from './director/factory';
-import { markRunFailed, processDirectorRun } from './director/process-run';
+import { processDirectorRun, type ProcessRunDeps } from './director/process-run';
+import { handleFailedJob, startReaper } from './director/reaper';
 import { createConsoleLogger } from './lib/logger';
-import { startDirectorWorker } from './queue/bullmq';
+import { BullmqDirectorQueue, startDirectorWorker } from './queue/bullmq';
 import { DIRECTOR_QUEUE_NAME } from './queue/types';
 
-/** BullMQ worker entrypoint: consumes `studio-director` jobs and runs the AI Director. */
+/** BullMQ worker entrypoint: consumes `studio-director` jobs, runs the AI Director and reaps stale runs. */
 async function main(): Promise<void> {
   const config = loadConfig();
   const logger = createConsoleLogger(config.logLevel, { service: 'studio-worker' });
-  const prisma = createPrisma(config.databaseUrl);
+  const prisma = createPrisma(config.databaseUrl, {
+    max: config.databasePool.max,
+    connectionTimeoutMs: config.databasePool.connectionTimeoutMs,
+  });
   const directorFactory = createDirectorFactory(config);
-  const deps = { prisma, config, directorFactory, logger };
+  // Aborted on SIGINT/SIGTERM: in-flight runs stop and are recorded FAILED (SHUTDOWN), see ProcessRunDeps.
+  const shutdownController = new AbortController();
+  const deps: ProcessRunDeps = { prisma, config, directorFactory, logger, shutdownSignal: shutdownController.signal };
+  /** Runs this process is processing right now (a failed-job event for one of them is not a lost run). */
+  const active = new Set<string>();
+  // Producer-side connection used by the reaper to inspect jobs of old QUEUED runs.
+  const inspector = new BullmqDirectorQueue(config.redisUrl, { timeoutMs: config.queue.enqueueTimeoutMs, logger });
 
   const handle = startDirectorWorker({
     redisUrl: config.redisUrl,
     concurrency: config.director.workerConcurrency,
+    lockDurationMs: config.queue.jobLockMs,
     logger,
-    processor: (job) => processDirectorRun(job.runId, deps),
-    // Stalled job (crashed worker) or an unexpected processor error: details go to the log only.
+    processor: async (job) => {
+      active.add(job.runId);
+      try {
+        await processDirectorRun(job.runId, deps);
+      } finally {
+        active.delete(job.runId);
+      }
+    },
+    // Stalled job (crashed worker, long Redis outage) or an unexpected processor error: fail the run unless
+    // it is still being processed (here, or by another worker with a fresh heartbeat). Details go to the log.
     onJobFailed: async (job) => {
-      await markRunFailed(prisma, job.runId, 'INTERNAL', 'The director worker stopped unexpectedly while processing this run');
+      const outcome = await handleFailedJob(
+        { prisma, config, logger, isActiveLocally: (runId) => active.has(runId) },
+        job.runId,
+      );
+      if (outcome !== 'marked-failed') logger.warn({ runId: job.runId, outcome }, 'failed director job ignored: run is alive');
     },
   });
+  const reaper = startReaper({ prisma, queue: inspector, config, logger }, config.director.reaperIntervalMs);
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -32,9 +56,12 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     shuttingDown = true;
-    logger.info({ signal }, 'shutting down studio-worker (waiting for active runs; signal again to force)');
+    logger.info({ signal, activeRuns: active.size }, 'shutting down studio-worker (stopping active runs; signal again to force)');
+    shutdownController.abort();
     try {
+      await reaper.stop();
       await handle.close();
+      await inspector.close();
       await prisma.$disconnect();
       process.exit(0);
     } catch (err) {
@@ -53,6 +80,8 @@ async function main(): Promise<void> {
       provider: directorFactory.providerInfo.name,
       model: directorFactory.providerInfo.model,
       cache: config.director.cacheEnabled,
+      lockDurationMs: config.queue.jobLockMs,
+      reaperIntervalMs: config.director.reaperIntervalMs,
     },
     'studio-worker ready',
   );

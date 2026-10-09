@@ -22,13 +22,18 @@ import {
   type SystemConfigDTO,
   type UsageSummaryDTO,
 } from '@vc/schema';
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import type { ApiFailure, ApiFailureKind } from './api-failure';
+import { PUBLIC_FAILURE_MESSAGES, type ApiFailure, type ApiFailureKind } from './api-failure';
+import { TtlCache } from './ttl-cache';
 
 /**
  * Server-only client for `@vc/studio-api`. Reads `STUDIO_API_URL` + `STUDIO_API_TOKEN` (never `NEXT_PUBLIC_`),
  * validates EVERY response body with the `@vc/schema` DTO schemas and throws `StudioApiError` on any failure.
  * The token is only ever placed in the outgoing `Authorization` header — it is never logged or returned.
+ *
+ * Errors carry two messages: `message` (internal detail — base URL, network error, schema issues; logged
+ * server-side only) and `publicMessage` (safe to render for any user; what `toFailure()` exposes).
  */
 
 const DEFAULT_API_URL = 'http://localhost:4100';
@@ -39,15 +44,18 @@ export class StudioApiError extends Error {
   readonly status: number | null;
   readonly code: string;
   readonly details: unknown;
-  readonly apiUrl: string | null;
+  /** User-facing message (never contains internal details). */
+  readonly publicMessage: string;
 
   constructor(init: {
     kind: ApiFailureKind;
+    /** Internal detail, for server logs. */
     message: string;
     code: string;
     status?: number | null;
     details?: unknown;
-    apiUrl?: string | null;
+    /** Defaults to a generic message for the kind (or `message` for API-provided `http` / `not_found` errors). */
+    publicMessage?: string;
   }) {
     super(init.message);
     this.name = 'StudioApiError';
@@ -55,13 +63,20 @@ export class StudioApiError extends Error {
     this.code = init.code;
     this.status = init.status ?? null;
     this.details = init.details;
-    this.apiUrl = init.apiUrl ?? null;
+    this.publicMessage =
+      init.publicMessage ??
+      (init.kind === 'http' || init.kind === 'not_found' ? init.message : PUBLIC_FAILURE_MESSAGES[init.kind]);
   }
 
-  /** Serializable, token-free view for rendering (Server → Client Components). */
+  /** Serializable, token- and detail-free view for rendering (Server → Client Components). */
   toFailure(): ApiFailure {
-    return { kind: this.kind, status: this.status, code: this.code, message: this.message, apiUrl: this.apiUrl };
+    return { kind: this.kind, status: this.status, code: this.code, message: this.publicMessage };
   }
+}
+
+/** Logs the internal detail of a failed call (never the token: it is not part of any message). */
+function logFailure(method: string, path: string, error: StudioApiError): void {
+  console.error(`[studio-api] ${method} ${path} failed (${error.kind}/${error.code}): ${error.message}`);
 }
 
 export function isStudioApiError(error: unknown): error is StudioApiError {
@@ -107,7 +122,6 @@ function readConfig(requireToken: boolean): StudioApiConfig {
       kind: 'not_configured',
       code: 'CONFIG_MISSING_TOKEN',
       message: 'STUDIO_API_TOKEN is not set, so the web app cannot authenticate to the Studio API.',
-      apiUrl: baseUrl,
     });
   }
   return { baseUrl, token: token === '' ? null : token };
@@ -169,6 +183,20 @@ interface SendOptions {
 }
 
 async function send(method: HttpMethod, path: string, opts: SendOptions = {}): Promise<{ status: number; json: unknown }> {
+  try {
+    return await sendOnce(method, path, opts);
+  } catch (error) {
+    if (error instanceof StudioApiError && shouldLog(error)) logFailure(method, path, error);
+    throw error;
+  }
+}
+
+/** Expected outcomes (404, 409 run active, 422 limits, 429 quota…) are part of normal flow and not logged. */
+function shouldLog(error: StudioApiError): boolean {
+  return error.kind !== 'http' && error.kind !== 'not_found' ? true : (error.status ?? 500) >= 500;
+}
+
+async function sendOnce(method: HttpMethod, path: string, opts: SendOptions): Promise<{ status: number; json: unknown }> {
   const auth = opts.auth ?? true;
   const { baseUrl, token } = readConfig(auth);
   const headers: Record<string, string> = { Accept: 'application/json' };
@@ -191,11 +219,12 @@ async function send(method: HttpMethod, path: string, opts: SendOptions = {}): P
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch (error) {
+    const timedOut = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
     throw new StudioApiError({
       kind: 'unreachable',
       code: 'API_UNREACHABLE',
-      message: describeNetworkError(error),
-      apiUrl: baseUrl,
+      message: `${baseUrl}: ${describeNetworkError(error)}`,
+      publicMessage: timedOut ? 'The Studio API did not respond in time.' : PUBLIC_FAILURE_MESSAGES.unreachable,
     });
   }
 
@@ -215,13 +244,20 @@ async function send(method: HttpMethod, path: string, opts: SendOptions = {}): P
     const message = envelope.success
       ? envelope.data.error.message
       : `The Studio API responded with HTTP ${response.status}.`;
+    const kind = kindForStatus(response.status);
     throw new StudioApiError({
-      kind: kindForStatus(response.status),
+      kind,
       status: response.status,
       code,
       message,
+      // 5xx bodies may carry internals (stack traces from a proxy, …): keep them out of the UI.
+      publicMessage:
+        kind === 'unauthorized'
+          ? PUBLIC_FAILURE_MESSAGES.unauthorized
+          : response.status >= 500
+            ? `The Studio API could not process the request (HTTP ${response.status}).`
+            : message,
       details: envelope.success ? envelope.data.error.details : undefined,
-      apiUrl: baseUrl,
     });
   }
 
@@ -231,7 +267,6 @@ async function send(method: HttpMethod, path: string, opts: SendOptions = {}): P
       status: response.status,
       code: 'INVALID_JSON',
       message: `${method} ${path} returned a body that is not valid JSON.`,
-      apiUrl: baseUrl,
     });
   }
   return { status: response.status, json };
@@ -253,7 +288,6 @@ async function requestJson<S extends z.ZodType>(
       status,
       code: 'INVALID_RESPONSE',
       message: `${method} ${path} returned data that does not match the expected schema (${summary}).`,
-      apiUrl: getStudioApiConnectionInfo().baseUrl,
     });
   }
   return parsed.data;
@@ -299,12 +333,23 @@ export async function getUsageSummary(): Promise<UsageSummaryDTO> {
   return requestJson('GET', '/v1/usage', UsageSummaryDTOSchema);
 }
 
+/**
+ * Page envelope with the optional `total` (number of projects over ALL pages). Declared here as well so the count is
+ * kept whether or not the installed `@vc/schema` already lists `total` (older schemas would strip the unknown key).
+ */
+const ProjectSummaryPageWithTotalSchema = ProjectSummaryPageSchema.extend({
+  total: z.number().int().min(0).optional(),
+});
+export type ProjectSummaryPageWithTotal = ProjectSummaryPage & { total?: number | undefined };
+
 /** `GET /v1/projects?limit=&cursor=` (owner-scoped, updatedAt desc). */
-export async function listProjects(opts: { limit?: number; cursor?: string | null } = {}): Promise<ProjectSummaryPage> {
+export async function listProjects(
+  opts: { limit?: number; cursor?: string | null } = {},
+): Promise<ProjectSummaryPageWithTotal> {
   const params = new URLSearchParams();
   params.set('limit', String(Math.max(1, Math.min(100, Math.trunc(opts.limit ?? 20)))));
   if (opts.cursor) params.set('cursor', opts.cursor);
-  return requestJson('GET', `/v1/projects?${params.toString()}`, ProjectSummaryPageSchema);
+  return requestJson('GET', `/v1/projects?${params.toString()}`, ProjectSummaryPageWithTotalSchema);
 }
 
 /** `POST /v1/projects` → 201 ProjectDetailDTO. The body is re-validated before sending. */
@@ -321,6 +366,7 @@ export async function getProject(projectId: string): Promise<ProjectDetailDTO> {
 /** `DELETE /v1/projects/:id` → 204 (409 while a run is active). */
 export async function deleteProject(projectId: string): Promise<void> {
   await send('DELETE', `/v1/projects/${idSegment(projectId, 'project')}`);
+  forgetProjectVersions(projectId);
 }
 
 /** `POST /v1/projects/:id/director-runs` → 202 DirectorRunDTO (409 RUN_ACTIVE, 429 QUOTA_EXCEEDED). */
@@ -361,16 +407,55 @@ export async function listProjectVersions(projectId: string): Promise<ProjectVer
   );
 }
 
-/** `GET /v1/projects/:id/versions/:version`. */
+/**
+ * Parsed project versions, shared across requests. A version is immutable once created (the API only ever adds
+ * `max + 1`), and a multi-hour version is several MB of JSON (~0.3 s to fetch + validate), so tab switches, the
+ * storyboard chapter loader and the timeline route reuse it instead of refetching. Keyed by the token fingerprint
+ * too (entries are only ever served to the identity that fetched them). Bounded (entries × TTL) to cap memory;
+ * in-flight requests are shared; failures are never cached; deleting a project evicts its versions.
+ */
+const versionCache = new TtlCache<string, Promise<ProjectVersionDTO>>({ maxEntries: 3, ttlMs: 5 * 60_000 });
+
+function tokenFingerprint(): string {
+  return createHash('sha256')
+    .update((process.env.STUDIO_API_TOKEN ?? '').trim())
+    .digest('hex')
+    .slice(0, 16);
+}
+
+function versionCacheKey(projectId: string, version: number): string {
+  return `${tokenFingerprint()}:${projectId}:${version}`;
+}
+
+/** Drops cached versions of a project (after deleting it). */
+export function forgetProjectVersions(projectId: string): void {
+  const marker = `:${projectId}:`;
+  versionCache.deleteWhere((key) => key.includes(marker));
+}
+
+/** `GET /v1/projects/:id/versions/:version` (cached — see `versionCache`). */
 export async function getProjectVersion(projectId: string, version: number): Promise<ProjectVersionDTO> {
   if (!Number.isInteger(version) || version < 1) {
     throw new StudioApiError({ kind: 'not_found', status: 404, code: 'NOT_FOUND', message: 'Invalid version.' });
   }
-  return requestJson(
-    'GET',
-    `/v1/projects/${idSegment(projectId, 'project')}/versions/${version}`,
-    ProjectVersionDTOSchema,
-  );
+  const path = `/v1/projects/${idSegment(projectId, 'project')}/versions/${version}`;
+  const key = versionCacheKey(projectId, version);
+  const cached = versionCache.get(key);
+  if (cached) return cached;
+  const pending = requestJson('GET', path, ProjectVersionDTOSchema);
+  versionCache.set(key, pending);
+  pending.catch(() => {
+    if (versionCache.peek(key) === pending) versionCache.delete(key);
+  });
+  return pending;
+}
+
+/** Version summary (no artifacts / timeline) from `listProjectVersions`, for pages that do not need the payload. */
+export function findVersionSummary(
+  versions: readonly ProjectVersionSummaryDTO[],
+  version: number | null,
+): ProjectVersionSummaryDTO | null {
+  return version === null ? null : (versions.find((v) => v.version === version) ?? null);
 }
 
 // ---------------------------------------------------------------------------------------------

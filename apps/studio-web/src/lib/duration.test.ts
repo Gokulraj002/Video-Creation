@@ -53,6 +53,42 @@ describe('parseDurationInput', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toMatch(/unit/);
   });
+
+  it('rejects non-finite / unrepresentably large values with a friendly message', () => {
+    const hugeDigits = parseDurationInput('9'.repeat(400), 's');
+    expect(hugeDigits).toEqual({ ok: false, error: 'That number is too large' });
+    // Finite as a number, but the seconds overflow (or exceed exact integer precision).
+    const overflow = parseDurationInput(`1${'0'.repeat(306)}`, 'h');
+    expect(overflow).toEqual({ ok: false, error: 'That duration is too large' });
+    expect(parseDurationInput('12345678901234567890', 's')).toEqual({ ok: false, error: 'That duration is too large' });
+    // Large but representable values are fine (no hardcoded product maximum).
+    expect(parseDurationInput('1000000', 'h')).toEqual({ ok: true, seconds: 3_600_000_000 });
+  });
+
+  it('never reads a thousands separator as a decimal comma', () => {
+    for (const value of ['1,000', '12,500', '1,000,000']) {
+      const result = parseDurationInput(value, 's');
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toMatch(/ambiguous/);
+    }
+    const hint = parseDurationInput('1,000', 'min');
+    if (!hint.ok) expect(hint.error).toContain('1000');
+    // Mixed or repeated separators are rejected as well.
+    expect(parseDurationInput('1.000,5', 's').ok).toBe(false);
+    expect(parseDurationInput('1,000.5', 's').ok).toBe(false);
+    expect(parseDurationInput('1,5,5', 's').ok).toBe(false);
+  });
+
+  it('keeps unambiguous decimal commas', () => {
+    expect(parseDurationInput('1,5', 'min')).toEqual({ ok: true, seconds: 90 });
+    expect(parseDurationInput('1,25', 'min')).toEqual({ ok: true, seconds: 75 });
+    expect(parseDurationInput('0,500', 'min')).toEqual({ ok: true, seconds: 30 });
+    expect(parseDurationInput('1234,5', 's')).toEqual({ ok: true, seconds: 1234.5 });
+  });
+
+  it('rejects values that round to zero', () => {
+    expect(parseDurationInput('0.0001', 's')).toEqual({ ok: false, error: 'Duration is too short' });
+  });
 });
 
 describe('isDurationUnit', () => {

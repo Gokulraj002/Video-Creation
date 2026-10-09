@@ -1,5 +1,6 @@
 import {
   checkVideoRequestLimits,
+  DbIdSchema,
   type CreateProjectRequest,
   type ProjectDetailDTO,
   type ProjectSummaryPage,
@@ -15,10 +16,10 @@ import {
   toProjectSummaryDto,
   toVersionDto,
   toVersionSummaryDto,
-  type VersionSummaryRow,
 } from '../lib/dto';
 import { AppError, conflict, notFound } from '../lib/errors';
 import { toJsonInput } from '../lib/json';
+import type { SizeBoundedLru } from '../lib/lru';
 import { ACTIVE_RUN_STATUSES } from './project-status';
 
 export interface ListProjectsOptions {
@@ -26,35 +27,67 @@ export interface ListProjectsOptions {
   cursor: string | null;
 }
 
+/** Page of the owner's projects plus their total count (`total` is optional in ProjectSummaryPageSchema). */
+export type ProjectSummaryPageWithTotal = ProjectSummaryPage & { total: number };
+
+interface ProjectCursor {
+  updatedAt: Date;
+  id: string;
+}
+
+const CURSOR_SEPARATOR = '~';
+
+/** Opaque keyset cursor: (updatedAt, id) of the last row served, base64url-encoded. */
+export function encodeProjectCursor(cursor: ProjectCursor): string {
+  return Buffer.from(`${cursor.updatedAt.toISOString()}${CURSOR_SEPARATOR}${cursor.id}`, 'utf8').toString('base64url');
+}
+
+export function decodeProjectCursor(raw: string): ProjectCursor | null {
+  if (!/^[A-Za-z0-9_-]+$/.test(raw)) return null;
+  const text = Buffer.from(raw, 'base64url').toString('utf8');
+  const at = text.indexOf(CURSOR_SEPARATOR);
+  if (at <= 0) return null;
+  const iso = text.slice(0, at);
+  const id = DbIdSchema.safeParse(text.slice(at + 1));
+  const updatedAt = new Date(iso);
+  if (!id.success || Number.isNaN(updatedAt.getTime()) || updatedAt.toISOString() !== iso) return null;
+  return { updatedAt, id: id.data };
+}
+
+/**
+ * Owner's projects, keyset-paginated on (updatedAt desc, id desc). The cursor carries the position of the
+ * last row served (not a row reference), so rows touched or deleted between pages never cause duplicates or
+ * errors; an undecodable cursor is 400 INVALID_CURSOR.
+ */
 export async function listProjects(
   prisma: PrismaClient,
   ownerId: string,
   { limit, cursor }: ListProjectsOptions,
-): Promise<ProjectSummaryPage> {
+): Promise<ProjectSummaryPageWithTotal> {
   let where: Prisma.ProjectWhereInput = { ownerId };
   if (cursor !== null) {
-    const anchor = await prisma.project.findFirst({
-      where: { id: cursor, ownerId },
-      select: { id: true, updatedAt: true },
-    });
-    if (anchor === null) throw new AppError(400, 'INVALID_CURSOR', 'Unknown pagination cursor');
-    // Keyset pagination on (updatedAt desc, id desc).
+    const position = decodeProjectCursor(cursor);
+    if (position === null) throw new AppError(400, 'INVALID_CURSOR', 'Invalid pagination cursor');
     where = {
       ownerId,
-      OR: [{ updatedAt: { lt: anchor.updatedAt } }, { updatedAt: anchor.updatedAt, id: { lt: anchor.id } }],
+      OR: [{ updatedAt: { lt: position.updatedAt } }, { updatedAt: position.updatedAt, id: { lt: position.id } }],
     };
   }
-  const rows = await prisma.project.findMany({
-    where,
-    orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
-    take: limit + 1,
-    include: projectInclude,
-  });
+  const [rows, total] = await Promise.all([
+    prisma.project.findMany({
+      where,
+      orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
+      include: projectInclude,
+    }),
+    prisma.project.count({ where: { ownerId } }),
+  ]);
   const page = rows.slice(0, limit);
   const last = page[page.length - 1];
   return {
     items: page.map(toProjectSummaryDto),
-    nextCursor: rows.length > limit && last !== undefined ? last.id : null,
+    nextCursor: rows.length > limit && last !== undefined ? encodeProjectCursor(last) : null,
+    total,
   };
 }
 
@@ -127,49 +160,65 @@ async function assertOwnedProject(prisma: PrismaClient, ownerId: string, project
   if (found === null) throw notFound('Project');
 }
 
-interface RawVersionSummary {
-  id: string;
-  project_id: string;
-  version: number;
-  schema_version: number;
-  created_at: Date;
-  scene_count: number | null;
-  duration_in_frames: number | null;
-  fps: number | null;
-}
+/** The version list is not paginated (its DTO is a plain array): it returns the latest versions only. */
+export const VERSION_LIST_LIMIT = 100;
 
-/** Version list, newest first. Scene count / duration / fps are read with jsonb operators (no full timeline load). */
+/**
+ * Latest VERSION_LIST_LIMIT versions, newest first, from the summary columns written with each version
+ * (the timeline JSON is never loaded for the list).
+ */
 export async function listVersions(
   prisma: PrismaClient,
   ownerId: string,
   projectId: string,
 ): Promise<ProjectVersionSummaryDTO[]> {
   await assertOwnedProject(prisma, ownerId, projectId);
-  const rows = await prisma.$queryRaw<RawVersionSummary[]>`
-    SELECT id,
-           project_id,
-           version,
-           schema_version,
-           created_at,
-           jsonb_array_length(COALESCE(timeline->'scenes', '[]'::jsonb))::int AS scene_count,
-           (timeline->>'durationInFrames')::int AS duration_in_frames,
-           (timeline->'settings'->>'fps')::int AS fps
-      FROM project_versions
-     WHERE project_id = ${projectId}
-     ORDER BY version DESC`;
-  return rows.map((row) => {
-    const summary: VersionSummaryRow = {
-      id: row.id,
-      projectId: row.project_id,
-      version: row.version,
-      schemaVersion: row.schema_version,
-      createdAt: row.created_at,
-      sceneCount: row.scene_count ?? 0,
-      durationInFrames: row.duration_in_frames ?? 1,
-      fps: row.fps ?? 30,
-    };
-    return toVersionSummaryDto(summary);
+  const rows = await prisma.projectVersion.findMany({
+    where: { projectId },
+    orderBy: { version: 'desc' },
+    take: VERSION_LIST_LIMIT,
+    select: {
+      id: true,
+      projectId: true,
+      version: true,
+      schemaVersion: true,
+      createdAt: true,
+      sceneCount: true,
+      durationInFrames: true,
+      fps: true,
+    },
   });
+  return rows.map(toVersionSummaryDto);
+}
+
+/** Owner-scoped id of a project version (404 when the project or the version does not exist / is not owned). */
+export async function findVersionId(
+  prisma: PrismaClient,
+  ownerId: string,
+  projectId: string,
+  version: number,
+): Promise<string> {
+  const row = await prisma.projectVersion.findFirst({
+    where: { projectId, version, project: { ownerId } },
+    select: { id: true },
+  });
+  if (row !== null) return row.id;
+  await assertOwnedProject(prisma, ownerId, projectId);
+  throw notFound('Project version');
+}
+
+/**
+ * Serialized ProjectVersionDTO of a version id. Versions are immutable, so the validated + migrated JSON is
+ * cached (byte-bounded LRU): a version is loaded and validated once per process, not on every view.
+ */
+export async function versionDtoJson(prisma: PrismaClient, cache: SizeBoundedLru | null, versionId: string): Promise<string> {
+  const cached = cache?.get(versionId);
+  if (cached !== undefined) return cached;
+  const row = await prisma.projectVersion.findUnique({ where: { id: versionId } });
+  if (row === null) throw notFound('Project version');
+  const json = JSON.stringify(toVersionDto(row));
+  cache?.set(versionId, json);
+  return json;
 }
 
 export async function getVersion(
@@ -178,10 +227,8 @@ export async function getVersion(
   projectId: string,
   version: number,
 ): Promise<ProjectVersionDTO> {
-  await assertOwnedProject(prisma, ownerId, projectId);
-  const row = await prisma.projectVersion.findUnique({
-    where: { projectId_version: { projectId, version } },
-  });
+  const id = await findVersionId(prisma, ownerId, projectId, version);
+  const row = await prisma.projectVersion.findUnique({ where: { id } });
   if (row === null) throw notFound('Project version');
   return toVersionDto(row);
 }

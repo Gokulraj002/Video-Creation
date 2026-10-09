@@ -1,11 +1,21 @@
-import { DirectorError, type DirectorProgress, type DirectorResult } from '@vc/ai-director';
-import { VideoRequestSchema, type DirectorRunProgress, type UsageReport } from '@vc/schema';
+import {
+  addUsage,
+  DirectorError,
+  estimateCostUsd,
+  ZERO_USAGE,
+  type DirectorProgress,
+  type DirectorResult,
+  type PricingTable,
+} from '@vc/ai-director';
+import { VideoRequestSchema, type DirectorRunProgress, type TokenUsage, type UsageReport } from '@vc/schema';
 import { effectiveRunTimeoutMs, type AppConfig } from '../config';
 import { Prisma, ProjectStatus, RunStatus, type PrismaClient } from '../db';
 import { toJsonInput } from '../lib/json';
 import type { Logger } from '../lib/logger';
+import { retryTransient } from '../lib/retry';
 import { restoreProjectStatus, type RunOutcome } from '../services/project-status';
-import type { DirectorFactory } from './factory';
+import { spentTodayExcluding } from '../services/usage';
+import type { DirectorFactory, ProviderCallUsage } from './factory';
 import { plannedTotalSteps } from './plan';
 import { PrismaDirectorCache } from './prisma-cache';
 
@@ -14,10 +24,22 @@ export interface ProcessRunDeps {
   config: AppConfig;
   directorFactory: DirectorFactory;
   logger: Logger;
-  /** Minimum interval between progress writes (default 500 ms). */
+  /** Minimum interval between progress writes within one stage (default 500 ms); stage changes write at once. */
   progressThrottleMs?: number;
-  /** How often the DB is polled for a cancellation while a provider call is in flight (default 2000 ms). */
+  /**
+   * How often the run's heartbeat is written while it is RUNNING (default 2000 ms); the same write notices a
+   * cancellation (the conditional update matches no row) and aborts the in-flight provider call.
+   */
   cancelPollMs?: number;
+  /**
+   * Aborted when the process shuts down: in-flight runs stop promptly and are recorded FAILED with code
+   * SHUTDOWN (partial usage kept, project status restored). They are deliberately NOT re-queued: a re-queue
+   * during a crash/restart loop could run (and bill) the same request repeatedly, while FAILED is final and
+   * the user can start the run again cheaply (validated stage outputs are cached).
+   */
+  shutdownSignal?: AbortSignal;
+  /** Backoff for the final run writes (default ~1 min, see FINAL_WRITE_RETRY_DELAYS_MS). */
+  finalWriteRetryDelaysMs?: readonly number[];
 }
 
 const MAX_ERROR_MESSAGE = 1000;
@@ -43,19 +65,50 @@ function toRunProgress(p: DirectorProgress): DirectorRunProgress {
   };
 }
 
-function usageColumns(usage: UsageReport) {
+function tokenColumns(totals: TokenUsage, costUsd: number) {
   return {
-    usage: toJsonInput(usage),
-    inputTokens: usage.totals.inputTokens,
-    outputTokens: usage.totals.outputTokens,
-    cacheReadTokens: usage.totals.cacheReadTokens,
-    cacheWriteTokens: usage.totals.cacheWriteTokens,
-    estimatedCostUsd: usage.totals.estimatedCostUsd.toFixed(6),
+    inputTokens: totals.inputTokens,
+    outputTokens: totals.outputTokens,
+    cacheReadTokens: totals.cacheReadTokens,
+    cacheWriteTokens: totals.cacheWriteTokens,
+    estimatedCostUsd: costUsd.toFixed(6),
   };
+}
+
+function usageColumns(usage: UsageReport) {
+  return { usage: toJsonInput(usage), ...tokenColumns(usage.totals, usage.totals.estimatedCostUsd) };
 }
 
 function warningsJson(warnings: readonly string[] | undefined): string[] {
   return (warnings ?? []).slice(0, 500).map((w) => w.slice(0, 2000));
+}
+
+/** Running totals of the provider requests of one run (what it has spent so far, before the final report). */
+export class LiveUsageMeter {
+  private tokens: TokenUsage = { ...ZERO_USAGE };
+  private cost = 0;
+  private calls = 0;
+
+  constructor(private readonly pricing: Readonly<PricingTable>) {}
+
+  add(call: ProviderCallUsage): void {
+    this.tokens = addUsage(this.tokens, call.usage);
+    this.cost += estimateCostUsd(call.model, call.usage, this.pricing).costUsd;
+    this.calls += 1;
+  }
+
+  get costUsd(): number {
+    return this.cost;
+  }
+
+  get callCount(): number {
+    return this.calls;
+  }
+
+  /** DirectorRun token/cost columns for the usage so far. */
+  columns(): ReturnType<typeof tokenColumns> {
+    return tokenColumns(this.tokens, this.cost);
+  }
 }
 
 class RunNoLongerActiveError extends Error {
@@ -65,18 +118,30 @@ class RunNoLongerActiveError extends Error {
   }
 }
 
-type AbortReason = 'cancelled' | 'timeout';
+type AbortReason = 'cancelled' | 'timeout' | 'quota' | 'shutdown';
+
+const SHUTDOWN_MESSAGE =
+  'The director worker shut down while processing this run; start it again (completed stages are cached)';
 
 /**
  * Processes one director run (shared by the BullMQ worker and the inline queue):
- * claim QUEUED → RUNNING, run the AI Director with progress persistence + cancellation + timeout, then
- * persist the new ProjectVersion atomically (or record FAILED / CANCELLED). Usage consumed before a
- * failure or cancellation is always persisted (quotas and /v1/usage count real spend). Never throws for
- * run-level failures; those are recorded on the run row.
+ * claim QUEUED → RUNNING, run the AI Director with progress + usage persistence, a heartbeat, cancellation,
+ * a timeout, a live daily-spend check and shutdown handling, then persist the new ProjectVersion atomically
+ * (or record FAILED / CANCELLED). Usage consumed so far is written with progress (a crashed worker keeps
+ * what it spent) and the final report is always persisted. Final writes are retried through short database
+ * outages. Never throws for run-level failures; those are recorded on the run row.
  */
 export async function processDirectorRun(runId: string, deps: ProcessRunDeps): Promise<void> {
   const { prisma, config, logger } = deps;
   const log = (level: 'info' | 'warn' | 'error', obj: object, msg: string) => logger[level]({ runId, ...obj }, msg);
+  const retry = <T>(label: string, fn: () => Promise<T>, isRetryable?: (err: unknown) => boolean): Promise<T> =>
+    retryTransient(fn, {
+      ...(deps.finalWriteRetryDelaysMs !== undefined ? { delaysMs: deps.finalWriteRetryDelaysMs } : {}),
+      ...(isRetryable !== undefined ? { isRetryable } : {}),
+      logger,
+      label,
+      logBindings: { runId },
+    });
 
   const run = await prisma.directorRun.findUnique({
     where: { id: runId },
@@ -86,15 +151,23 @@ export async function processDirectorRun(runId: string, deps: ProcessRunDeps): P
     log('info', {}, 'director run skipped (not queued)');
     return;
   }
+  if (deps.shutdownSignal?.aborted === true) {
+    await retry('recording the shutdown', () => markRunFailed(prisma, runId, 'SHUTDOWN', SHUTDOWN_MESSAGE));
+    log('warn', {}, 'director run not started: shutting down');
+    return;
+  }
   const projectId = run.projectId;
+  const userId = run.requestedById;
   const totalSteps = plannedTotalSteps(run.project.request, config.limits);
   const timeoutMs = effectiveRunTimeoutMs(config, totalSteps);
 
+  const claimedAt = new Date();
   const claimed = await prisma.directorRun.updateMany({
     where: { id: runId, status: RunStatus.QUEUED },
     data: {
       status: RunStatus.RUNNING,
-      startedAt: new Date(),
+      startedAt: claimedAt,
+      heartbeatAt: claimedAt,
       progress: { completedSteps: 0, totalSteps, currentStage: null, message: 'Starting AI Director' },
     },
   });
@@ -105,53 +178,112 @@ export async function processDirectorRun(runId: string, deps: ProcessRunDeps): P
 
   const controller = new AbortController();
   // Mutated from callbacks, so kept in an object (no stale control-flow narrowing).
-  const state: { abortReason: AbortReason | null; lastProgress: DirectorProgress | null } = {
-    abortReason: null,
-    lastProgress: null,
-  };
+  const state: {
+    abortReason: AbortReason | null;
+    lastProgress: DirectorProgress | null;
+    /** The director has returned: progress writes stop, the heartbeat keeps the row alive during final writes. */
+    finished: boolean;
+    quota: { othersUsd: number; runUsd: number } | null;
+  } = { abortReason: null, lastProgress: null, finished: false, quota: null };
   const abort = (reason: AbortReason): void => {
-    if (state.abortReason !== null) return;
+    if (state.abortReason !== null || state.finished) return;
     state.abortReason = reason;
-    controller.abort(new Error(reason === 'timeout' ? 'Director run timed out' : 'Director run cancelled'));
+    const messages: Record<AbortReason, string> = {
+      cancelled: 'Director run cancelled',
+      timeout: 'Director run timed out',
+      quota: 'Daily AI spend limit reached',
+      shutdown: 'Director worker shutting down',
+    };
+    controller.abort(new Error(messages[reason]));
   };
+  const onShutdown = () => abort('shutdown');
+  deps.shutdownSignal?.addEventListener('abort', onShutdown, { once: true });
 
-  const isStillRunning = async (): Promise<boolean> => {
-    const row = await prisma.directorRun.findUnique({ where: { id: runId }, select: { status: true } });
-    return row !== null && row.status === RunStatus.RUNNING;
-  };
+  const meter = new LiveUsageMeter(deps.directorFactory.pricing);
 
   const timeout = setTimeout(() => abort('timeout'), timeoutMs);
   timeout.unref();
-  let polling = false;
-  const poll = setInterval(() => {
-    if (polling || state.abortReason !== null) return;
-    polling = true;
-    isStillRunning()
-      .then((running) => {
-        if (!running) abort('cancelled');
+
+  // Heartbeat + cancellation poll. The conditional update matching no row means the run left RUNNING.
+  let beating = false;
+  const heartbeat = setInterval(() => {
+    if (beating) return;
+    beating = true;
+    prisma.directorRun
+      .updateMany({ where: { id: runId, status: RunStatus.RUNNING }, data: { heartbeatAt: new Date() } })
+      .then((res) => {
+        if (res.count === 0) abort('cancelled');
       })
-      .catch((err: unknown) => log('warn', { err }, 'cancellation poll failed'))
+      .catch((err: unknown) => log('warn', { err }, 'heartbeat write failed'))
       .finally(() => {
-        polling = false;
+        beating = false;
       });
   }, deps.cancelPollMs ?? 2000);
-  poll.unref();
+  heartbeat.unref();
 
+  // Progress (+ usage so far) writes: immediately on a stage change, otherwise throttled with a trailing flush.
+  // Writes are chained so they reach the database in order; each writes the latest progress.
   const throttleMs = deps.progressThrottleMs ?? 500;
-  let lastWrite = 0;
-  const onProgress = async (p: DirectorProgress): Promise<void> => {
-    state.lastProgress = p;
-    if (state.abortReason !== null) return;
-    const now = Date.now();
-    if (now - lastWrite >= throttleMs) {
-      lastWrite = now;
+  let lastWriteAt = 0;
+  let lastWrittenKey: string | null = null;
+  let trailing: NodeJS.Timeout | null = null;
+  let writes: Promise<void> = Promise.resolve();
+  const writeProgress = (): Promise<void> => {
+    if (trailing !== null) {
+      clearTimeout(trailing);
+      trailing = null;
+    }
+    const next = writes.then(async () => {
+      const p = state.lastProgress;
+      if (p === null || state.finished || state.abortReason !== null) return;
+      lastWriteAt = Date.now();
+      lastWrittenKey = `${p.stage}\u0000${p.chunk ?? ''}`;
       const res = await prisma.directorRun.updateMany({
         where: { id: runId, status: RunStatus.RUNNING },
-        data: { progress: toRunProgress(p) },
+        data: { progress: toRunProgress(p), heartbeatAt: new Date(), ...meter.columns() },
       });
       if (res.count === 0) abort('cancelled');
-    } else if (!(await isStillRunning())) {
-      abort('cancelled');
+    });
+    writes = next.catch((err: unknown) => log('warn', { err }, 'progress write failed'));
+    return next;
+  };
+  const scheduleTrailingWrite = (): void => {
+    if (trailing !== null) return;
+    trailing = setTimeout(
+      () => {
+        trailing = null;
+        void writeProgress().catch(() => undefined);
+      },
+      Math.max(0, throttleMs - (Date.now() - lastWriteAt)),
+    );
+    trailing.unref();
+  };
+
+  const usdLimit = config.quotas.directorUsdPerDay;
+  /** Today's spend of the user's other runs + this run's live spend reached the daily limit? */
+  const spendLimitReached = async (): Promise<boolean> => {
+    const runUsd = meter.costUsd;
+    // Zero-cost runs (mock provider, cache hits) never trip the spend limit.
+    if (runUsd <= 0) return false;
+    const othersUsd = await spentTodayExcluding(prisma, userId, runId, new Date());
+    state.quota = { othersUsd, runUsd };
+    return othersUsd + runUsd >= usdLimit;
+  };
+
+  const onProgress = async (p: DirectorProgress): Promise<void> => {
+    state.lastProgress = p;
+    if (state.abortReason !== null || state.finished) return;
+    // Every LLM stage is preceded by a progress event: stop before spending more once the limit is reached.
+    // (Compile makes no provider calls, so a finished plan is never discarded for the quota.)
+    if (p.stage !== 'compile' && (await spendLimitReached())) {
+      abort('quota');
+      return;
+    }
+    const key = `${p.stage}\u0000${p.chunk ?? ''}`;
+    if (key !== lastWrittenKey || Date.now() - lastWriteAt >= throttleMs) {
+      await writeProgress();
+    } else {
+      scheduleTrailingWrite();
     }
   };
 
@@ -160,62 +292,102 @@ export async function processDirectorRun(runId: string, deps: ProcessRunDeps): P
   try {
     const request = VideoRequestSchema.parse(run.project.request);
     // Cache entries are scoped to the requesting user (no cross-tenant hits).
-    const cache = config.director.cacheEnabled ? new PrismaDirectorCache(prisma, run.requestedById) : null;
-    const director = deps.directorFactory.createDirector({ cache, logger, logBindings: { runId } });
+    const cache = config.director.cacheEnabled ? new PrismaDirectorCache(prisma, userId) : null;
+    const director = deps.directorFactory.createDirector({
+      cache,
+      logger,
+      logBindings: { runId },
+      onProviderCall: (call) => meter.add(call),
+    });
     result = await director.planProject({ request }, { signal: controller.signal, onProgress });
   } catch (err) {
     failure = err;
   } finally {
     clearTimeout(timeout);
-    clearInterval(poll);
+    deps.shutdownSignal?.removeEventListener('abort', onShutdown);
+  }
+  state.finished = true;
+  if (trailing !== null) clearTimeout(trailing);
+  await writes;
+
+  try {
+    await finishRun();
+  } finally {
+    clearInterval(heartbeat);
   }
 
-  if (result !== null && state.abortReason === null) {
-    try {
-      const steps = state.lastProgress?.totalSteps ?? totalSteps;
-      await persistSuccess(prisma, runId, projectId, result, {
-        completedSteps: steps,
-        totalSteps: steps,
-        currentStage: 'compile',
-        message: 'Timeline ready',
-      });
-      log('info', { projectId, usage: result.usage.totals, warnings: result.warnings.length }, 'director run succeeded');
-      return;
-    } catch (err) {
-      if (err instanceof RunNoLongerActiveError) {
-        await finalizeStopped(prisma, runId, projectId, 'cancelled', result.usage, result.warnings);
-        log('info', { projectId }, 'director run cancelled before its result was saved');
+  async function finishRun(): Promise<void> {
+    // A complete result is kept unless the user cancelled (a late timeout/quota/shutdown signal changes nothing).
+    if (result !== null && state.abortReason !== 'cancelled') {
+      const done = result;
+      try {
+        const steps = state.lastProgress?.totalSteps ?? totalSteps;
+        await retry(
+          'saving the director result',
+          () =>
+            persistSuccess(prisma, runId, projectId, done, {
+              completedSteps: steps,
+              totalSteps: steps,
+              currentStage: 'compile',
+              message: 'Timeline ready',
+            }),
+          (err) => !(err instanceof RunNoLongerActiveError),
+        );
+        log('info', { projectId, usage: done.usage.totals, warnings: done.warnings.length }, 'director run succeeded');
         return;
+      } catch (err) {
+        if (err instanceof RunNoLongerActiveError) {
+          await retry('recording the cancellation', () =>
+            finalizeStopped(prisma, runId, projectId, 'cancelled', done.usage, done.warnings),
+          );
+          log('info', { projectId }, 'director run cancelled before its result was saved');
+          return;
+        }
+        log('error', { projectId, err }, 'could not save the director result');
+        failure = err;
       }
-      failure = err;
     }
-  }
 
-  // Tokens spent before a failure/cancellation still count (quota + usage reporting).
-  const partialUsage = result?.usage ?? (failure instanceof DirectorError ? (failure.usage ?? null) : null);
-  const warnings = result?.warnings ?? (failure instanceof DirectorError ? failure.warnings : undefined);
+    // Tokens spent before a failure/cancellation still count (quota + usage reporting). Without a report
+    // (non-director error) the usage columns written with progress are kept.
+    const partialUsage = result?.usage ?? (failure instanceof DirectorError ? (failure.usage ?? null) : null);
+    const warnings = result?.warnings ?? (failure instanceof DirectorError ? failure.warnings : undefined);
 
-  if (state.abortReason === 'cancelled') {
-    await finalizeStopped(prisma, runId, projectId, 'cancelled', partialUsage, warnings);
-    log('info', { projectId }, 'director run cancelled');
-    return;
-  }
+    if (state.abortReason === 'cancelled') {
+      await retry('recording the cancellation', () =>
+        finalizeStopped(prisma, runId, projectId, 'cancelled', partialUsage, warnings),
+      );
+      log('info', { projectId }, 'director run cancelled');
+      return;
+    }
 
-  let code: string;
-  let message: string;
-  if (state.abortReason === 'timeout') {
-    code = 'TIMEOUT';
-    message = `Director run exceeded its timeout of ${timeoutMs} ms`;
-  } else if (failure instanceof DirectorError && failure.code !== 'INTERNAL') {
-    code = failure.code;
-    message = sanitizeErrorMessage(failure.message);
-  } else {
-    // Internal errors may carry stack-ish details: log them, store a generic message.
-    code = 'INTERNAL';
-    message = 'Unexpected error while directing the video (see server logs)';
+    let code: string;
+    let message: string;
+    if (state.abortReason === 'timeout' && result === null) {
+      code = 'TIMEOUT';
+      message = `Director run exceeded its timeout of ${timeoutMs} ms`;
+    } else if (state.abortReason === 'quota' && result === null) {
+      code = 'QUOTA_EXCEEDED';
+      const q = state.quota;
+      message =
+        q === null
+          ? 'Director run stopped: the daily AI spend limit was reached'
+          : `Director run stopped: today's AI spend reached the daily limit ($${(q.othersUsd + q.runUsd).toFixed(2)} ` +
+            `of $${usdLimit.toFixed(2)} per UTC day, $${q.runUsd.toFixed(2)} by this run)`;
+    } else if (state.abortReason === 'shutdown' && result === null) {
+      code = 'SHUTDOWN';
+      message = SHUTDOWN_MESSAGE;
+    } else if (failure instanceof DirectorError && failure.code !== 'INTERNAL') {
+      code = failure.code;
+      message = sanitizeErrorMessage(failure.message);
+    } else {
+      // Internal errors may carry stack-ish details: log them, store a generic message.
+      code = 'INTERNAL';
+      message = 'Unexpected error while directing the video (see server logs)';
+    }
+    log(code === 'INTERNAL' ? 'error' : 'warn', { projectId, code, err: failure }, 'director run failed');
+    await retry('recording the run failure', () => markRunFailed(prisma, runId, code, message, partialUsage, warnings));
   }
-  log(code === 'INTERNAL' ? 'error' : 'warn', { projectId, code, err: failure }, 'director run failed');
-  await markRunFailed(prisma, runId, code, message, partialUsage, warnings);
 }
 
 async function persistSuccess(
@@ -249,6 +421,9 @@ async function persistSuccess(
           schemaVersion: result.timeline.schemaVersion,
           timeline,
           artifacts,
+          sceneCount: result.timeline.scenes.length,
+          durationInFrames: result.timeline.durationInFrames,
+          fps: result.timeline.settings.fps,
           directorRunId: runId,
         },
         select: { id: true },

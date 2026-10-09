@@ -1,14 +1,18 @@
 import {
+  ASPECT_RATIO_VALUES,
+  AspectRatioSchema,
   HexColorSchema,
   LimitViolationSchema,
   VideoRequestSchema,
   checkVideoRequestLimits,
+  type AspectRatio,
   type LimitViolation,
   type ResourceLimits,
   type VideoRequest,
 } from '@vc/schema';
 import { z } from 'zod';
 import { parseDurationInput } from './duration';
+import { formatNumber } from './format';
 
 /**
  * Pure mapping from the "New project" form to a `VideoRequest` (validated with `VideoRequestSchema`).
@@ -61,6 +65,33 @@ export type FormErrorKey =
 
 export type FieldErrors = Partial<Record<FormErrorKey, string>>;
 
+/** Field labels in on-screen (DOM) order — used for the single error summary announced on submit. */
+export const FORM_ERROR_LABELS: readonly (readonly [FormErrorKey, string])[] = [
+  ['title', 'Title'],
+  ['prompt', 'Prompt'],
+  ['genre', 'Genre'],
+  ['language', 'Language'],
+  ['styleNotes', 'Style notes'],
+  ['brandName', 'Brand name'],
+  ['brandColors', 'Brand colors'],
+  ['duration', 'Duration'],
+  ['aspectRatio', 'Aspect ratio'],
+  ['resolution', 'Resolution'],
+  ['customWidth', 'Width'],
+  ['customHeight', 'Height'],
+  ['fps', 'Frame rate'],
+  ['voiceOverStyle', 'Voice style'],
+  ['voiceOverGender', 'Voice'],
+  ['musicMood', 'Music mood'],
+];
+
+/** One-sentence summary of the invalid fields, e.g. `2 fields need attention: Title, Prompt.` (null when none). */
+export function summarizeFieldErrors(errors: FieldErrors): string | null {
+  const labels = FORM_ERROR_LABELS.filter(([key]) => errors[key] !== undefined).map(([, label]) => label);
+  if (labels.length === 0) return null;
+  return `${labels.length} field${labels.length === 1 ? ' needs' : 's need'} attention: ${labels.join(', ')}.`;
+}
+
 /** Anything with FormData's read API (FormData itself, or a test double). */
 export interface FormLike {
   get(name: string): FormDataEntryValue | null;
@@ -68,6 +99,76 @@ export interface FormLike {
 }
 
 export const MAX_BRAND_COLORS = 5;
+
+/** Hard caps baked into `VideoRequestSchema` (the API's configured limits may be lower, never higher). */
+export const SCHEMA_TITLE_MAX = VideoRequestSchema.shape.title.maxLength ?? 200;
+export const SCHEMA_PROMPT_MAX = VideoRequestSchema.shape.prompt.maxLength ?? 20_000;
+
+/**
+ * Effective prompt maximum: the configured `maxPromptChars` capped by the schema maximum (whichever is lower).
+ * Without limits (API offline) the schema cap applies.
+ */
+export function promptMaxChars(limits: Pick<ResourceLimits, 'maxPromptChars'> | null | undefined): number {
+  const configured = limits?.maxPromptChars;
+  return typeof configured === 'number' && Number.isFinite(configured) && configured > 0
+    ? Math.min(Math.trunc(configured), SCHEMA_PROMPT_MAX)
+    : SCHEMA_PROMPT_MAX;
+}
+
+/** Precise prompt message: empty vs. too long (with the actual length and the effective limit). */
+export function promptLengthError(length: number, max: number): string | null {
+  if (length <= 0) return 'Describe the video you want';
+  if (length > max) {
+    return `The prompt is too long: ${formatNumber(length)} characters (limit ${formatNumber(max)})`;
+  }
+  return null;
+}
+
+/** Precise title message: empty vs. too long. */
+export function titleLengthError(length: number, max: number = SCHEMA_TITLE_MAX): string | null {
+  if (length <= 0) return 'Give the project a title';
+  if (length > max) return `The title is too long: ${formatNumber(length)} characters (limit ${formatNumber(max)})`;
+  return null;
+}
+
+/**
+ * Custom W × H vs. a preset aspect ratio — client-side mirror of the `VideoRequestSchema` refinement
+ * (`dimensionsMatchAspectRatio` in @vc/schema): with `resolution: 'custom'` and a preset `aspectRatio`, the custom
+ * size must match that ratio up to rounding, i.e. some exact-ratio size (t·w, t·h) lies within ±1 px of each side.
+ * Otherwise the user must pick `aspectRatio: 'custom'` for a free size.
+ * Returns `null` when the size matches (or the rule does not apply), otherwise a suggested height + message.
+ */
+export function aspectRatioMismatch(
+  aspectRatio: AspectRatio,
+  width: number,
+  height: number,
+): { expectedHeight: number; message: string } | null {
+  if (aspectRatio === 'custom') return null;
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+  const { w, h } = ASPECT_RATIO_VALUES[aspectRatio];
+  const low = Math.max((width - 1) / w, (height - 1) / h);
+  const high = Math.min((width + 1) / w, (height + 1) / h);
+  if (low <= high) return null;
+  const expectedHeight = Math.max(2, Math.round((width * h) / w / 2) * 2);
+  return {
+    expectedHeight,
+    message: `${width} × ${height} is not ${aspectRatio}. Use ${width} × ${expectedHeight}, or set the aspect ratio to “Custom W × H” for a free size.`,
+  };
+}
+
+/** Even integer in the schema's dimension range (only then is the ratio rule meaningful). */
+function isValidDimension(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value % 2 === 0 && value >= 16 && value <= 8192;
+}
+
+/** Applies `aspectRatioMismatch` to the raw request input (independently of other fields' validity). */
+function ratioError(input: Record<string, unknown>): string | null {
+  const aspectRatio = AspectRatioSchema.safeParse(input.aspectRatio);
+  if (!aspectRatio.success || input.resolution !== 'custom') return null;
+  const { customWidth, customHeight } = input;
+  if (!isValidDimension(customWidth) || !isValidDimension(customHeight)) return null;
+  return aspectRatioMismatch(aspectRatio.data, customWidth, customHeight)?.message ?? null;
+}
 
 function text(form: FormLike, name: string): string {
   const value = form.get(name);
@@ -119,7 +220,9 @@ export function formToVideoRequestInput(form: FormLike): FormToRequestResult {
   if (!duration.ok) preErrors.duration = duration.error;
 
   const aspectRatio = text(form, FORM_FIELDS.aspectRatio);
-  const resolution = text(form, FORM_FIELDS.resolution);
+  // A custom aspect ratio always uses the custom W × H, so a preset resolution would be ignored (and misleading
+  // in the stored request): normalize it to `custom`.
+  const resolution = aspectRatio === 'custom' ? 'custom' : text(form, FORM_FIELDS.resolution);
   const isCustom = aspectRatio === 'custom' || resolution === 'custom';
 
   const fpsRaw = text(form, FORM_FIELDS.fps);
@@ -216,26 +319,42 @@ export function limitViolationToErrorKey(violation: LimitViolation): FormErrorKe
 }
 
 const FRIENDLY_MESSAGES: Partial<Record<FormErrorKey, string>> = {
-  title: 'Give the project a title (up to 200 characters)',
-  prompt: 'Describe the video you want (up to 20,000 characters)',
   genre: 'Pick a genre',
   aspectRatio: 'Pick an aspect ratio',
   resolution: 'Pick a resolution',
   language: 'Use a BCP-47 language tag such as "en" or "pt-BR"',
 };
 
+function stringLength(value: unknown): number {
+  return typeof value === 'string' ? value.length : 0;
+}
+
+/** Display message for a schema issue on `key` (precise empty / too-long copy for title and prompt). */
+function messageFor(key: FormErrorKey, input: Record<string, unknown>, issueMessage: string, promptMax: number): string {
+  if (key === 'title') return titleLengthError(stringLength(input.title)) ?? issueMessage;
+  if (key === 'prompt') return promptLengthError(stringLength(input.prompt), promptMax) ?? issueMessage;
+  return FRIENDLY_MESSAGES[key] ?? issueMessage;
+}
+
 export type ParseProjectFormResult =
   | { success: true; request: VideoRequest }
   | { success: false; fieldErrors: FieldErrors; formError: string | null };
 
 /**
- * Full form → `VideoRequest` pipeline: raw parsing, `VideoRequestSchema.safeParse`, and (when limits are known)
- * `checkVideoRequestLimits`. Returns per-field messages suitable for display.
+ * Full form → `VideoRequest` pipeline: raw parsing, `VideoRequestSchema.safeParse`, the custom-dimensions vs.
+ * aspect-ratio rule (mirrors the schema refinement), and (when limits are known) `checkVideoRequestLimits`.
+ * Returns per-field messages suitable for display.
  */
 export function parseProjectForm(form: FormLike, limits?: ResourceLimits | null): ParseProjectFormResult {
   const { input, preErrors } = formToVideoRequestInput(form);
   const fieldErrors: FieldErrors = { ...preErrors };
   const unplaced: string[] = [];
+  const promptMax = promptMaxChars(limits);
+
+  // Checked on the raw input so it shows together with other field errors (the schema refinement only runs once
+  // the rest of the object is valid) and with UI wording instead of the API's.
+  const mismatch = ratioError(input);
+  if (mismatch) fieldErrors.customWidth = mismatch;
 
   const parsed = VideoRequestSchema.safeParse(input);
   if (!parsed.success) {
@@ -246,9 +365,14 @@ export function parseProjectForm(form: FormLike, limits?: ResourceLimits | null)
         continue;
       }
       if (fieldErrors[key] === undefined) {
-        fieldErrors[key] = FRIENDLY_MESSAGES[key] ?? issue.message;
+        fieldErrors[key] = messageFor(key, input, issue.message, promptMax);
       }
     }
+  }
+
+  if (parsed.success && fieldErrors.prompt === undefined) {
+    const promptError = promptLengthError(parsed.data.prompt.length, promptMax);
+    if (promptError) fieldErrors.prompt = promptError;
   }
 
   if (parsed.success && Object.keys(fieldErrors).length === 0 && limits) {

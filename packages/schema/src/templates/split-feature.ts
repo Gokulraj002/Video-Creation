@@ -23,6 +23,7 @@ export const splitFeatureTemplate = defineTemplate({
     'imagePrompt) on the other. Use to explain a feature, benefit or concept with a visual.',
   genres: ['promo', 'product-3d', 'explainer', 'presentation', 'real-estate', 'corporate-training', 'long-form'],
   propsSchema: SplitFeaturePropsSchema,
+  assetRefProps: { imageAssetId: 'image' },
   minDurationSeconds: 4,
   buildProps(ctx): SplitFeatureProps {
     const c = colorsOf(ctx);

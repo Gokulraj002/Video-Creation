@@ -34,10 +34,28 @@ describe('seedDevUser', () => {
       await t.close();
     }
 
-    // Re-seeding un-revokes the token.
-    await prisma.apiToken.updateMany({ data: { revokedAt: new Date() } });
-    await seedDevUser(prisma, 'dev@localhost', raw);
-    expect((await prisma.apiToken.findFirstOrThrow()).revokedAt).toBeNull();
+    expect(first.warnings).toEqual([]);
+  });
+
+  it('never re-activates a revoked token or reassigns a token of another user (warns instead)', async () => {
+    const raw = 'dev-token-for-tests-0123456789abcdef-XYZ';
+    const seeded = await seedDevUser(prisma, 'dev@localhost', raw);
+    const revokedAt = new Date('2026-01-02T03:04:05.000Z');
+    await prisma.apiToken.updateMany({ data: { revokedAt } });
+    const again = await seedDevUser(prisma, 'dev@localhost', raw);
+    const row = await prisma.apiToken.findFirstOrThrow();
+    expect(row.revokedAt).toEqual(revokedAt);
+    expect(row.userId).toBe(seeded.userId);
+    expect(again.warnings).toHaveLength(1);
+    expect(again.warnings[0]).toMatch(/revoked .* stays revoked/);
+    expect(again.warnings[0]).not.toContain(raw);
+
+    // Same token value seeded for another email: the token stays with its original owner.
+    const other = await seedDevUser(prisma, 'other@localhost', raw);
+    expect(other.userId).not.toBe(seeded.userId);
+    expect((await prisma.apiToken.findFirstOrThrow()).userId).toBe(seeded.userId);
+    expect(other.warnings.some((w) => /belongs to another user/.test(w))).toBe(true);
+    expect(await prisma.apiToken.count()).toBe(1);
   });
 });
 

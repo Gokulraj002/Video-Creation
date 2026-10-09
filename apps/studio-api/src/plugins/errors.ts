@@ -1,7 +1,7 @@
 import type { FastifyError, FastifyInstance, FastifyReply } from 'fastify';
 import fp from 'fastify-plugin';
 import { ZodError } from 'zod';
-import { AppError } from '../lib/errors';
+import { AppError, DataIntegrityError } from '../lib/errors';
 
 export interface ErrorBody {
   error: { code: string; message: string; details?: unknown };
@@ -68,14 +68,23 @@ function fastifyClientErrorCode(error: FastifyError): string {
 
 /**
  * Uniform error envelope: `{error: {code, message, details?}}`.
- * ZodError → 400 VALIDATION_ERROR (with issues); AppError → its status/code; Fastify 4xx → mapped code;
+ * ZodError → 400 VALIDATION_ERROR (with issues); AppError → its status/code (DataIntegrityError → 500
+ * DATA_INTEGRITY, details logged only); Fastify 4xx → mapped code;
  * anything else → 500 INTERNAL with a generic message (never a stack trace).
  */
 export const errorsPlugin = fp(
   async (app: FastifyInstance) => {
     app.setErrorHandler((error: unknown, request, reply) => {
       if (error instanceof AppError) {
-        if (error.statusCode >= 500) request.log.error({ err: error }, 'request failed');
+        if (error instanceof DataIntegrityError) {
+          // Details (entity, id, issues) are for operators only; the client gets the generic envelope.
+          request.log.error(
+            { err: error, entity: error.entity, entityId: error.entityId, issues: error.issues.slice(0, 50) },
+            'stored data failed validation',
+          );
+        } else if (error.statusCode >= 500) {
+          request.log.error({ err: error }, 'request failed');
+        }
         const body: ErrorBody = { error: { code: error.code, message: error.message } };
         if (error.details !== undefined) body.error.details = error.details;
         return send(reply, error.statusCode, body);

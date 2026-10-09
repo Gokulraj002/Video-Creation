@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { AssetKind } from '../assets';
 import { formatZodIssues, JsonObjectSchema, type JsonObject } from '../common';
 import { VideoGenreSchema, type VideoGenre } from '../director';
 import { bulletListTemplate } from './bullet-list';
@@ -62,6 +63,17 @@ export function getTemplate(id: string): AnyTemplateDefinition | undefined {
 
 export function isCatalogTemplateId(id: string): id is CatalogTemplateId {
   return BY_ID.has(id);
+}
+
+export interface TemplateAssetRefProp {
+  prop: string;
+  kind: AssetKind;
+}
+
+/** Asset-reference props of a catalog template (`[]` for unknown templates, so future templates never fail). */
+export function getTemplateAssetRefProps(id: string): readonly TemplateAssetRefProp[] {
+  const refs = getTemplate(id)?.assetRefProps;
+  return refs ? Object.entries(refs).map(([prop, kind]) => ({ prop, kind })) : [];
 }
 
 export interface ListTemplatesFilter {

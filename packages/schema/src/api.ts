@@ -203,14 +203,18 @@ export const ApiErrorSchema = z.object({
 });
 export type ApiError = z.infer<typeof ApiErrorSchema>;
 
-/** Cursor-paginated list envelope: `{items, nextCursor}` (`nextCursor` null on the last page). */
+/**
+ * Cursor-paginated list envelope: `{items, nextCursor, total?}` (`nextCursor` null on the last page; `total`, when
+ * present, is the number of matching items over ALL pages).
+ */
 export function paginated<T extends z.ZodType>(item: T) {
   return z.object({
     items: z.array(item),
     nextCursor: z.string().min(1).nullable(),
+    total: NonNegativeInt.optional(),
   });
 }
-export type Paginated<T> = { items: T[]; nextCursor: string | null };
+export type Paginated<T> = { items: T[]; nextCursor: string | null; total?: number };
 
 export const ProjectSummaryPageSchema = paginated(ProjectSummaryDTOSchema);
 export type ProjectSummaryPage = z.infer<typeof ProjectSummaryPageSchema>;

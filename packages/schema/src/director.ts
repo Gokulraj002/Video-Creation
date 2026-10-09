@@ -1,15 +1,19 @@
 import { z } from 'zod';
 import { CameraPresetSchema } from './camera';
 import {
+  findIllFormedStrings,
   FontFamilySchema,
   HexColorSchema,
   IdSchema,
+  ILL_FORMED_TEXT_MESSAGE,
   JsonObjectSchema,
   LanguageTagSchema,
   TemplateIdSchema,
 } from './common';
 import {
+  ASPECT_RATIO_VALUES,
   AspectRatioSchema,
+  dimensionsMatchAspectRatio,
   EvenDimensionSchema,
   FpsSchema,
   ResolutionSchema,
@@ -105,14 +109,32 @@ export const MusicSettingsSchema = z.object({
 });
 export type MusicSettings = z.infer<typeof MusicSettingsSchema>;
 
+/** Matches when a string has at least one character that is neither whitespace nor an invisible format char. */
+const VISIBLE_CHAR = /[^\s\p{Cf}]/u;
+
+/** Trimmed text with at least one visible character (whitespace / zero-width-only input is rejected). */
+const RequiredUserText = (max: number) =>
+  z
+    .string()
+    .trim()
+    .min(1, 'Must not be empty or whitespace-only')
+    .max(max)
+    .refine((v) => v.length === 0 || VISIBLE_CHAR.test(v), {
+      message: 'Must contain at least one visible (non-whitespace) character',
+    });
+
 /**
  * A user's video request. `durationSeconds` has NO maximum here — resource limits are applied separately
- * (`checkVideoRequestLimits`). `custom` aspect ratio / resolution requires even custom dims in [16, 8192].
+ * (`checkVideoRequestLimits`).
+ * - `title` and `prompt` are trimmed and must contain a visible character; every string must be well-formed UTF-16.
+ * - `custom` aspect ratio / resolution requires even custom dims in [16, 8192].
+ * - aspectRatio `custom`: the custom W×H is used as-is and the resolution preset is IGNORED.
+ * - resolution `custom` with a preset aspect ratio: the custom W×H must match that ratio (±1 px per side).
  */
 export const VideoRequestSchema = z
   .object({
-    title: z.string().min(1).max(200),
-    prompt: z.string().min(1).max(20000),
+    title: RequiredUserText(200),
+    prompt: RequiredUserText(20000),
     genre: VideoGenreSchema,
     styleNotes: z.string().max(2000).optional(),
     durationSeconds: z.number().positive(),
@@ -144,6 +166,24 @@ export const VideoRequestSchema = z
         });
       }
     }
+    if (
+      req.resolution === 'custom' &&
+      req.aspectRatio !== 'custom' &&
+      req.customWidth !== undefined &&
+      req.customHeight !== undefined &&
+      !dimensionsMatchAspectRatio(req.customWidth, req.customHeight, req.aspectRatio)
+    ) {
+      const { w, h } = ASPECT_RATIO_VALUES[req.aspectRatio];
+      const expectedHeight = Math.max(2, Math.round((req.customWidth * h) / w / 2) * 2);
+      ctx.addIssue({
+        code: 'custom',
+        path: ['customWidth'],
+        message:
+          `Custom size ${req.customWidth}×${req.customHeight} does not match aspect ratio ${req.aspectRatio} ` +
+          `(e.g. ${req.customWidth}×${expectedHeight}; ±1 px per side allowed). Use aspectRatio "custom" for a free size.`,
+      });
+    }
+    findIllFormedStrings(req, (path) => ctx.addIssue({ code: 'custom', path, message: ILL_FORMED_TEXT_MESSAGE }));
   });
 export type VideoRequest = z.infer<typeof VideoRequestSchema>;
 export type VideoRequestInput = z.input<typeof VideoRequestSchema>;
@@ -322,15 +362,27 @@ export const SceneSpecsSchema = z.object({
 });
 export type SceneSpecs = z.infer<typeof SceneSpecsSchema>;
 
-export const DirectorArtifactsSchema = z.object({
-  brief: CreativeBriefSchema,
-  outline: ScriptOutlineSchema,
-  script: ScriptSchema,
-  storyboard: StoryboardSchema,
-  shotList: ShotListSchema,
-  engineSelection: EngineSelectionSchema,
-  sceneSpecs: SceneSpecsSchema,
-});
+/** Scene-spec props are checked by `JsonObjectSchema` itself; skip them in the artifact-wide string walk. */
+const SKIP_PROPS: ReadonlySet<string> = new Set(['props']);
+
+/** All director artifacts. Every string must be well-formed UTF-16 (artifacts are stored as PostgreSQL `jsonb`). */
+export const DirectorArtifactsSchema = z
+  .object({
+    brief: CreativeBriefSchema,
+    outline: ScriptOutlineSchema,
+    script: ScriptSchema,
+    storyboard: StoryboardSchema,
+    shotList: ShotListSchema,
+    engineSelection: EngineSelectionSchema,
+    sceneSpecs: SceneSpecsSchema,
+  })
+  .superRefine((artifacts, ctx) => {
+    findIllFormedStrings(
+      artifacts,
+      (path) => ctx.addIssue({ code: 'custom', path, message: ILL_FORMED_TEXT_MESSAGE }),
+      SKIP_PROPS,
+    );
+  });
 export type DirectorArtifacts = z.infer<typeof DirectorArtifactsSchema>;
 
 export const DirectorStageSchema = z.enum([

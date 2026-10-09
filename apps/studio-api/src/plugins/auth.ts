@@ -29,14 +29,23 @@ export const authDecoratorPlugin = fp(
   { name: 'studio-auth-decorator' },
 );
 
+export interface AuthHookOptions {
+  /** Called before a 401 is thrown (e.g. to count failed attempts per client IP). */
+  onFailure?: (request: FastifyRequest) => Promise<void>;
+}
+
 /**
  * Builds the `onRequest` hook that authenticates `Authorization: Bearer <token>` against hashed
  * `ApiToken` rows (revoked tokens are rejected). Register it inside the `/v1` scope.
  */
-export function createAuthHook(prisma: PrismaClient) {
+export function createAuthHook(prisma: PrismaClient, options: AuthHookOptions = {}) {
+  const fail = async (request: FastifyRequest): Promise<never> => {
+    await options.onFailure?.(request);
+    throw unauthorized();
+  };
   return async function authenticate(request: FastifyRequest): Promise<void> {
     const raw = parseBearerToken(request.headers.authorization);
-    if (raw === null) throw unauthorized();
+    if (raw === null) return fail(request);
     const token = await prisma.apiToken.findUnique({
       where: { tokenHash: hashToken(raw) },
       select: {
@@ -46,7 +55,7 @@ export function createAuthHook(prisma: PrismaClient) {
         user: { select: { id: true, email: true, name: true } },
       },
     });
-    if (token === null || token.revokedAt !== null) throw unauthorized();
+    if (token === null || token.revokedAt !== null) return fail(request);
     const now = Date.now();
     if (token.lastUsedAt === null || now - token.lastUsedAt.getTime() > LAST_USED_REFRESH_MS) {
       await prisma.apiToken.updateMany({ where: { id: token.id }, data: { lastUsedAt: new Date(now) } });

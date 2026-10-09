@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ConfigError, effectiveRunTimeoutMs, loadConfig } from '../src/config';
+import { ConfigError, effectiveRunTimeoutMs, loadConfig, MAX_TIMER_MS } from '../src/config';
 
 const BASE = { DATABASE_URL: 'postgres://u:p@localhost:5432/db' };
 
@@ -25,7 +25,12 @@ describe('loadConfig', () => {
       cacheEnabled: true,
       pricingOverrides: null,
       workerConcurrency: 2,
+      heartbeatStaleMs: 60_000,
+      queuedStaleMs: 600_000,
+      reaperIntervalMs: 30_000,
     });
+    expect(c.databasePool).toEqual({ max: 10, connectionTimeoutMs: 5_000 });
+    expect(c.queue).toEqual({ enqueueTimeoutMs: 3_000, jobLockMs: 300_000 });
     expect(c.limits).toEqual({
       maxDurationSeconds: 7200,
       maxWidth: 3840,
@@ -37,8 +42,10 @@ describe('loadConfig', () => {
       maxAssets: 500,
       maxPromptChars: 20000,
     });
-    expect(c.quotas).toEqual({ directorRunsPerDay: 50, directorUsdPerDay: 25 });
+    expect(c.quotas).toEqual({ directorRunsPerDay: 50, directorUsdPerDay: 25, activeRunsPerUser: 2 });
     expect(c.rateLimitPerMinute).toBe(300);
+    expect(c.rateLimitUnauthPerMinute).toBe(60);
+    expect(c.versionCacheMaxBytes).toBe(64 * 1024 * 1024);
     expect(c.dev.userEmail).toBe('dev@localhost');
   });
 
@@ -101,9 +108,52 @@ describe('loadConfig', () => {
     const c = loadConfig(BASE);
     // 30 s video: 8 steps × 2 min < 30 min minimum.
     expect(effectiveRunTimeoutMs(c, 8)).toBe(1_800_000);
-    // 2 h video: 24 chapters → 2 + 5 × 24 + 1 = 123 steps × 2 min.
-    expect(effectiveRunTimeoutMs(c, 123)).toBe(123 * 120_000);
+    // 2 h long-form video: 25 chapters → 2 + 5 × 25 + 1 = 128 steps × 2 min.
+    expect(effectiveRunTimeoutMs(c, 128)).toBe(128 * 120_000);
     const noScale = loadConfig({ ...BASE, DIRECTOR_STEP_TIMEOUT_MS: '0', DIRECTOR_RUN_TIMEOUT_MS: '5000' });
     expect(effectiveRunTimeoutMs(noScale, 500)).toBe(5000);
+  });
+});
+
+describe('timer bounds (setTimeout fires immediately above 2^31 - 1 ms)', () => {
+  it('rejects timeouts above MAX_TIMER_MS and clamps the scaled run timeout to it', () => {
+    expect(MAX_TIMER_MS).toBe(2_147_483_647);
+    expect(() => loadConfig({ ...BASE, DIRECTOR_RUN_TIMEOUT_MS: '2592000000' })).toThrow(/DIRECTOR_RUN_TIMEOUT_MS/);
+    expect(() => loadConfig({ ...BASE, DIRECTOR_STEP_TIMEOUT_MS: '2147483648' })).toThrow(/DIRECTOR_STEP_TIMEOUT_MS/);
+    expect(() => loadConfig({ ...BASE, DIRECTOR_JOB_LOCK_MS: '1000' })).toThrow(/DIRECTOR_JOB_LOCK_MS/);
+    expect(() => loadConfig({ ...BASE, DIRECTOR_REAPER_INTERVAL_MS: '10' })).toThrow(/DIRECTOR_REAPER_INTERVAL_MS/);
+    expect(loadConfig({ ...BASE, DIRECTOR_REAPER_INTERVAL_MS: '0' }).director.reaperIntervalMs).toBe(0);
+    const max = loadConfig({ ...BASE, DIRECTOR_RUN_TIMEOUT_MS: String(MAX_TIMER_MS) });
+    expect(max.director.runTimeoutMs).toBe(MAX_TIMER_MS);
+    // 100 min per step × 423 steps (2 h social short) would be ~2.5e9 ms.
+    const perStep = loadConfig({ ...BASE, DIRECTOR_STEP_TIMEOUT_MS: '6000000' });
+    expect(effectiveRunTimeoutMs(perStep, 423)).toBe(MAX_TIMER_MS);
+    expect(effectiveRunTimeoutMs(loadConfig({ ...BASE, DIRECTOR_STEP_TIMEOUT_MS: String(MAX_TIMER_MS) }), 1_000_000)).toBe(
+      MAX_TIMER_MS,
+    );
+  });
+
+  it('parses the new quota, rate-limit, pool and queue settings', () => {
+    const c = loadConfig({
+      ...BASE,
+      LIMIT_ACTIVE_RUNS_PER_USER: '5',
+      RATE_LIMIT_UNAUTH_PER_MINUTE: '7',
+      DATABASE_POOL_MAX: '25',
+      DATABASE_CONNECTION_TIMEOUT_MS: '1500',
+      QUEUE_ENQUEUE_TIMEOUT_MS: '800',
+      DIRECTOR_JOB_LOCK_MS: '600000',
+      DIRECTOR_HEARTBEAT_STALE_MS: '45000',
+      DIRECTOR_QUEUED_STALE_MS: '120000',
+      VERSION_CACHE_MAX_BYTES: '0',
+    });
+    expect(c.quotas.activeRunsPerUser).toBe(5);
+    expect(c.rateLimitUnauthPerMinute).toBe(7);
+    expect(c.databasePool).toEqual({ max: 25, connectionTimeoutMs: 1500 });
+    expect(c.queue).toEqual({ enqueueTimeoutMs: 800, jobLockMs: 600_000 });
+    expect(c.director.heartbeatStaleMs).toBe(45_000);
+    expect(c.director.queuedStaleMs).toBe(120_000);
+    expect(c.versionCacheMaxBytes).toBe(0);
+    expect(() => loadConfig({ ...BASE, LIMIT_ACTIVE_RUNS_PER_USER: '0' })).toThrow(/LIMIT_ACTIVE_RUNS_PER_USER/);
+    expect(() => loadConfig({ ...BASE, DATABASE_POOL_MAX: '0' })).toThrow(/DATABASE_POOL_MAX/);
   });
 });

@@ -18,13 +18,28 @@ export interface AnthropicConfig {
   structuredOutput: 'json_schema' | 'prompt';
 }
 
+/** Largest delay `setTimeout` honours (2^31 − 1 ms ≈ 24.8 days); longer delays fire immediately. */
+export const MAX_TIMER_MS = 2_147_483_647;
+
 export interface AppConfig {
   nodeEnv: 'development' | 'test' | 'production';
   host: string;
   port: number;
   databaseUrl: string;
+  /** pg pool of each Prisma client (API and worker processes have one each). */
+  databasePool: {
+    max: number;
+    /** How long a query waits for a free pool connection before failing (instead of hanging). */
+    connectionTimeoutMs: number;
+  };
   redisUrl: string;
   queueDriver: 'bullmq' | 'inline';
+  queue: {
+    /** Producer: an enqueue that cannot reach Redis within this budget fails (503 QUEUE_UNAVAILABLE). */
+    enqueueTimeoutMs: number;
+    /** BullMQ job lock duration: how long a worker may lose Redis before its job counts as stalled. */
+    jobLockMs: number;
+  };
   corsOrigins: string[];
   logLevel: 'fatal' | 'error' | 'warn' | 'info' | 'debug' | 'trace' | 'silent';
   ai: {
@@ -40,13 +55,26 @@ export interface AppConfig {
     cacheEnabled: boolean;
     pricingOverrides: Record<string, ModelPricingConfig> | null;
     workerConcurrency: number;
+    /** A RUNNING run whose heartbeat is older than this is reaped as WORKER_LOST. */
+    heartbeatStaleMs: number;
+    /** A QUEUED run older than this whose queue job is gone is reaped as QUEUE_LOST. */
+    queuedStaleMs: number;
+    /** How often the stale-run reaper runs (0 disables it). */
+    reaperIntervalMs: number;
   };
   limits: ResourceLimits;
   quotas: {
     directorRunsPerDay: number;
     directorUsdPerDay: number;
+    /** Queued + running director runs per user (across projects). */
+    activeRunsPerUser: number;
   };
+  /** Requests per minute per authenticated user. */
   rateLimitPerMinute: number;
+  /** Failed authentications per minute per client IP before /v1 answers 429 without touching the database. */
+  rateLimitUnauthPerMinute: number;
+  /** Byte budget of the in-process cache of serialized version DTOs (0 disables it). */
+  versionCacheMaxBytes: number;
   dev: {
     userEmail: string;
     apiToken: string | undefined;
@@ -62,6 +90,8 @@ export class ConfigError extends Error {
 
 const posInt = (def: number) => z.coerce.number().int().positive().default(def);
 const nonNegInt = (def: number) => z.coerce.number().int().min(0).default(def);
+/** A millisecond duration that is used as a timer delay (bounded by MAX_TIMER_MS). */
+const timerMs = (def: number, min: number) => z.coerce.number().int().min(min).max(MAX_TIMER_MS).default(def);
 
 const ModelPricingSchema = z
   .object({
@@ -88,7 +118,11 @@ const EnvSchema = z
       .min(1)
       .refine((v) => /^rediss?:\/\//.test(v), 'REDIS_URL must be a redis:// or rediss:// URL')
       .default('redis://localhost:6379'),
+    DATABASE_POOL_MAX: z.coerce.number().int().min(1).max(1000).default(10),
+    DATABASE_CONNECTION_TIMEOUT_MS: timerMs(5_000, 100),
     QUEUE_DRIVER: z.enum(['bullmq', 'inline']).default('bullmq'),
+    QUEUE_ENQUEUE_TIMEOUT_MS: timerMs(3_000, 50),
+    DIRECTOR_JOB_LOCK_MS: timerMs(300_000, 30_000),
     CORS_ORIGINS: z.string().default('http://localhost:3000'),
     LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
 
@@ -101,11 +135,14 @@ const EnvSchema = z
     ANTHROPIC_STRUCTURED_OUTPUT: z.enum(['json_schema', 'prompt']).default('json_schema'),
 
     DIRECTOR_MAX_REPAIR_ATTEMPTS: nonNegInt(2),
-    DIRECTOR_RUN_TIMEOUT_MS: posInt(1_800_000),
-    DIRECTOR_STEP_TIMEOUT_MS: nonNegInt(120_000),
+    DIRECTOR_RUN_TIMEOUT_MS: timerMs(1_800_000, 1),
+    DIRECTOR_STEP_TIMEOUT_MS: timerMs(120_000, 0),
     DIRECTOR_CACHE: z.enum(['on', 'off']).default('on'),
     DIRECTOR_PRICING_JSON: z.string().min(1).optional(),
     DIRECTOR_WORKER_CONCURRENCY: posInt(2),
+    DIRECTOR_HEARTBEAT_STALE_MS: timerMs(60_000, 5_000),
+    DIRECTOR_QUEUED_STALE_MS: timerMs(600_000, 10_000),
+    DIRECTOR_REAPER_INTERVAL_MS: timerMs(30_000, 0),
 
     LIMIT_MAX_DURATION_SECONDS: posInt(DEFAULT_RESOURCE_LIMITS.maxDurationSeconds),
     LIMIT_MAX_WIDTH: posInt(DEFAULT_RESOURCE_LIMITS.maxWidth),
@@ -118,7 +155,10 @@ const EnvSchema = z
     LIMIT_MAX_PROMPT_CHARS: posInt(DEFAULT_RESOURCE_LIMITS.maxPromptChars),
     LIMIT_DIRECTOR_RUNS_PER_DAY: nonNegInt(50),
     LIMIT_DIRECTOR_USD_PER_DAY: z.coerce.number().min(0).default(25),
+    LIMIT_ACTIVE_RUNS_PER_USER: posInt(2),
     RATE_LIMIT_PER_MINUTE: posInt(300),
+    RATE_LIMIT_UNAUTH_PER_MINUTE: posInt(60),
+    VERSION_CACHE_MAX_BYTES: nonNegInt(64 * 1024 * 1024),
 
     // Loose check on purpose: the default `dev@localhost` has no TLD.
     STUDIO_DEV_USER_EMAIL: z
@@ -134,6 +174,13 @@ const EnvSchema = z
         code: 'custom',
         path: ['ANTHROPIC_API_KEY'],
         message: 'ANTHROPIC_API_KEY is required when AI_PROVIDER=anthropic',
+      });
+    }
+    if (env.DIRECTOR_REAPER_INTERVAL_MS !== 0 && env.DIRECTOR_REAPER_INTERVAL_MS < 1_000) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['DIRECTOR_REAPER_INTERVAL_MS'],
+        message: 'DIRECTOR_REAPER_INTERVAL_MS must be 0 (disabled) or at least 1000',
       });
     }
   });
@@ -188,8 +235,10 @@ export function loadConfig(env: EnvInput = process.env): AppConfig {
     host: e.STUDIO_API_HOST,
     port: e.STUDIO_API_PORT,
     databaseUrl: e.DATABASE_URL,
+    databasePool: { max: e.DATABASE_POOL_MAX, connectionTimeoutMs: e.DATABASE_CONNECTION_TIMEOUT_MS },
     redisUrl: e.REDIS_URL,
     queueDriver: e.QUEUE_DRIVER,
+    queue: { enqueueTimeoutMs: e.QUEUE_ENQUEUE_TIMEOUT_MS, jobLockMs: e.DIRECTOR_JOB_LOCK_MS },
     corsOrigins: e.CORS_ORIGINS.split(',')
       .map((o) => o.trim())
       .filter((o) => o.length > 0),
@@ -212,6 +261,9 @@ export function loadConfig(env: EnvInput = process.env): AppConfig {
       cacheEnabled: e.DIRECTOR_CACHE === 'on',
       pricingOverrides,
       workerConcurrency: e.DIRECTOR_WORKER_CONCURRENCY,
+      heartbeatStaleMs: e.DIRECTOR_HEARTBEAT_STALE_MS,
+      queuedStaleMs: e.DIRECTOR_QUEUED_STALE_MS,
+      reaperIntervalMs: e.DIRECTOR_REAPER_INTERVAL_MS,
     },
     limits: {
       maxDurationSeconds: e.LIMIT_MAX_DURATION_SECONDS,
@@ -227,8 +279,11 @@ export function loadConfig(env: EnvInput = process.env): AppConfig {
     quotas: {
       directorRunsPerDay: e.LIMIT_DIRECTOR_RUNS_PER_DAY,
       directorUsdPerDay: e.LIMIT_DIRECTOR_USD_PER_DAY,
+      activeRunsPerUser: e.LIMIT_ACTIVE_RUNS_PER_USER,
     },
     rateLimitPerMinute: e.RATE_LIMIT_PER_MINUTE,
+    rateLimitUnauthPerMinute: e.RATE_LIMIT_UNAUTH_PER_MINUTE,
+    versionCacheMaxBytes: e.VERSION_CACHE_MAX_BYTES,
     dev: {
       userEmail: e.STUDIO_DEV_USER_EMAIL,
       apiToken: e.STUDIO_DEV_API_TOKEN,
@@ -239,8 +294,9 @@ export function loadConfig(env: EnvInput = process.env): AppConfig {
 /**
  * Effective wall-clock budget of one director run: the configured minimum, scaled up for long plans
  * (`2 + 5 × chapters + 1` sequential steps) so multi-hour videos with a live provider are not cut off.
+ * Clamped to MAX_TIMER_MS (a larger `setTimeout` delay would fire immediately).
  */
 export function effectiveRunTimeoutMs(config: Pick<AppConfig, 'director'>, totalSteps: number): number {
   const scaled = Math.max(0, Math.floor(totalSteps)) * config.director.stepTimeoutMs;
-  return Math.max(config.director.runTimeoutMs, scaled);
+  return Math.min(MAX_TIMER_MS, Math.max(config.director.runTimeoutMs, scaled));
 }

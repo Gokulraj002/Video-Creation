@@ -1,15 +1,35 @@
+import { toWellFormedText } from '../common';
 import type { TemplatePropsContext } from './types';
 
 const HEX = /^#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
 
 export const DEFAULT_PALETTE = ['#1E3A8A', '#F59E0B', '#0F172A', '#F8FAFC', '#10B981'] as const;
 
-/** Collapses whitespace and truncates to `max` chars (with an ellipsis when cut). */
+/**
+ * Longest prefix of `value` (assumed well-formed) of at most `maxUnits` UTF-16 code units that never splits a
+ * surrogate pair, i.e. it is cut on a code-point boundary. A trailing zero-width joiner is dropped too.
+ */
+function codePointPrefix(value: string, maxUnits: number): string {
+  let end = 0;
+  while (end < value.length) {
+    const code = value.charCodeAt(end);
+    const width = code >= 0xd800 && code <= 0xdbff && end + 1 < value.length ? 2 : 1;
+    if (end + width > maxUnits) break;
+    end += width;
+  }
+  return value.slice(0, end).replace(/\u200D+$/, '');
+}
+
+/**
+ * Collapses whitespace and truncates to `max` UTF-16 code units (with an ellipsis when cut), so the result always fits
+ * a Zod `.max(max)`. Cuts on code-point boundaries (never half of an emoji) and replaces lone surrogates already present
+ * in the input with U+FFFD: the output is always well-formed (PostgreSQL `jsonb` rejects lone surrogates).
+ */
 export function clip(value: string, max: number): string {
-  const clean = value.replace(/\s+/g, ' ').trim();
+  const clean = toWellFormedText(value).replace(/\s+/g, ' ').trim();
   if (clean.length <= max) return clean;
-  if (max <= 1) return clean.slice(0, max);
-  return `${clean.slice(0, max - 1).trimEnd()}…`;
+  if (max <= 1) return codePointPrefix(clean, Math.max(0, max));
+  return `${codePointPrefix(clean, max - 1).trimEnd()}…`;
 }
 
 /** Last-resort text when every candidate and the fallback are blank. */

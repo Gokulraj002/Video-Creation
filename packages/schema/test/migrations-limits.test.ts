@@ -124,6 +124,9 @@ describe('resource limits', () => {
       maxTracks: 50,
       maxAssets: 500,
       maxPromptChars: 20000,
+      maxTrackItems: 20_000,
+      maxLayers: 5_000,
+      maxTimelineBytes: 20 * 1024 * 1024,
     });
     expect(ResourceLimitsSchema.safeParse(DEFAULT_RESOURCE_LIMITS).success).toBe(true);
   });

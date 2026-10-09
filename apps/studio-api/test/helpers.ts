@@ -1,5 +1,10 @@
-import type { AIProvider } from '@vc/ai-director';
-import type { CreateProjectRequestInput } from '@vc/schema';
+import {
+  HeuristicMockProvider,
+  type AIProvider,
+  type StructuredGenerationRequest,
+  type StructuredGenerationResult,
+} from '@vc/ai-director';
+import type { CreateProjectRequestInput, TokenUsage } from '@vc/schema';
 import type { FastifyInstance, LightMyRequestResponse } from 'fastify';
 import { buildApp } from '../src/app';
 import { loadConfig, type AppConfig } from '../src/config';
@@ -71,6 +76,8 @@ export interface BuildTestAppOptions {
   provider?: AIProvider;
   progressThrottleMs?: number;
   cancelPollMs?: number;
+  shutdownSignal?: AbortSignal;
+  finalWriteRetryDelaysMs?: readonly number[];
 }
 
 /** Fastify app wired exactly like production, but with the inline queue and the given (mock) provider. */
@@ -87,6 +94,8 @@ export async function buildTestApp(options: BuildTestAppOptions = {}): Promise<T
       logger: silentLogger,
       ...(options.progressThrottleMs !== undefined ? { progressThrottleMs: options.progressThrottleMs } : {}),
       ...(options.cancelPollMs !== undefined ? { cancelPollMs: options.cancelPollMs } : {}),
+      ...(options.shutdownSignal !== undefined ? { shutdownSignal: options.shutdownSignal } : {}),
+      ...(options.finalWriteRetryDelaysMs !== undefined ? { finalWriteRetryDelaysMs: options.finalWriteRetryDelaysMs } : {}),
     }),
   );
   const app = await buildApp({ config, prisma, queue, directorFactory: factory, logger: false });
@@ -144,4 +153,45 @@ export function deferred(): { promise: Promise<void>; resolve: () => void } {
     resolve = r;
   });
   return { promise, resolve };
+}
+
+/**
+ * Provider that answers like the heuristic mock (valid outputs) but reports a fixed token usage per call and
+ * a priced model id, so runs have a real (estimated) cost. `before` runs before each call (gates, latency).
+ */
+export class PricedMockProvider implements AIProvider {
+  readonly name = 'priced-mock';
+  readonly mode = 'mock' as const;
+  readonly calls: string[] = [];
+  private readonly inner = new HeuristicMockProvider();
+
+  constructor(
+    readonly model: string,
+    private readonly usagePerCall: TokenUsage,
+    private readonly before?: (callIndex: number) => Promise<void> | void,
+  ) {}
+
+  async generateStructured<T>(req: StructuredGenerationRequest<T>): Promise<StructuredGenerationResult> {
+    const index = this.calls.length;
+    this.calls.push(`${req.stage}${req.chunk === null ? '' : `:${req.chunk}`}`);
+    await this.before?.(index);
+    const result = await this.inner.generateStructured(req);
+    return { ...result, provider: this.name, model: this.model, usage: { ...this.usagePerCall } };
+  }
+}
+
+export const tokens = (inputTokens: number, outputTokens = 0): TokenUsage => ({
+  inputTokens,
+  outputTokens,
+  cacheReadTokens: 0,
+  cacheWriteTokens: 0,
+});
+
+/** Inserts a project row directly (bypasses the API). */
+export async function insertProject(prisma: PrismaClient, ownerId: string, title = 'p'): Promise<string> {
+  const project = await prisma.project.create({
+    data: { ownerId, title, genre: 'promo', durationSeconds: 30, aspectRatio: '16:9', request: {} },
+    select: { id: true },
+  });
+  return project.id;
 }

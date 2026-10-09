@@ -1,4 +1,4 @@
-import type { DirectorJob, DirectorJobProcessor, DirectorQueue } from './types';
+import { QueueUnavailableError, type DirectorJob, type DirectorJobProcessor, type DirectorQueue, type QueueJobState } from './types';
 
 export interface InlineQueueOptions {
   /** Called when the processor rejects (process-run normally records failures itself). */
@@ -14,6 +14,8 @@ export class InlineDirectorQueue implements DirectorQueue {
   readonly driver = 'inline' as const;
   private processor: DirectorJobProcessor | null;
   private readonly pending = new Set<Promise<void>>();
+  /** runId → state of its job while it is pending in this process. */
+  private readonly jobs = new Map<string, 'waiting' | 'active'>();
   private closed = false;
 
   constructor(
@@ -29,18 +31,32 @@ export class InlineDirectorQueue implements DirectorQueue {
   }
 
   async enqueue(job: DirectorJob): Promise<void> {
-    if (this.closed) throw new Error('Inline director queue is closed');
+    if (this.closed) throw new QueueUnavailableError('Inline director queue is closed');
     const processor = this.processor;
-    if (processor === null) throw new Error('Inline director queue has no processor');
+    if (processor === null) throw new QueueUnavailableError('Inline director queue has no processor');
+    this.jobs.set(job.runId, 'waiting');
     const task = new Promise<void>((resolve) => setImmediate(resolve))
-      .then(() => processor(job))
+      .then(() => {
+        this.jobs.set(job.runId, 'active');
+        return processor(job);
+      })
       .catch((error: unknown) => {
         this.options.onError?.(error, job);
       })
       .finally(() => {
         this.pending.delete(task);
+        this.jobs.delete(job.runId);
       });
     this.pending.add(task);
+  }
+
+  /** Only jobs of this process are known; anything else (e.g. lost in a restart) is `missing`. */
+  async jobState(runId: string): Promise<QueueJobState> {
+    return this.jobs.get(runId) ?? 'missing';
+  }
+
+  async ping(): Promise<void> {
+    if (this.closed) throw new QueueUnavailableError('Inline director queue is closed');
   }
 
   /** Resolves once no job is pending. */

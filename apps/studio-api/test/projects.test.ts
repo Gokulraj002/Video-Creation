@@ -18,6 +18,9 @@ import {
   type TestUser,
 } from './helpers';
 
+/** `total` is optional in ProjectSummaryPageSchema; the API always sends it. */
+const TotalSchema = z.object({ total: z.number().int().min(0) });
+
 const prisma = testPrisma();
 let t: TestApp;
 let alice: TestUser;
@@ -84,16 +87,16 @@ describe('projects CRUD', () => {
     expect(ProjectDetailDTOSchema.parse(json(get))).toEqual(dto);
   });
 
-  it('lists owner projects by updatedAt desc with cursor pagination', async () => {
-    const ids: string[] = [];
-    for (let i = 0; i < 5; i++) ids.push((await create(alice, { title: `P${i}` })).id);
+  it('lists owner projects by updatedAt desc with cursor pagination and the total count', async () => {
+    for (let i = 0; i < 5; i++) await create(alice, { title: `P${i}` });
     await create(bob, { title: 'Bob project' });
 
-    const page1 = ProjectSummaryPageSchema.parse(
-      json(await t.app.inject({ method: 'GET', url: '/v1/projects?limit=2', headers: alice.auth })),
-    );
+    const page1Res = await t.app.inject({ method: 'GET', url: '/v1/projects?limit=2', headers: alice.auth });
+    const page1 = ProjectSummaryPageSchema.parse(json(page1Res));
     expect(page1.items.map((p) => p.title)).toEqual(['P4', 'P3']);
-    expect(page1.nextCursor).toBe(ids[3]);
+    expect(page1.nextCursor).not.toBeNull();
+    // `total` = the owner's project count (independent of the page).
+    expect(TotalSchema.parse(json(page1Res)).total).toBe(5);
     const page2 = ProjectSummaryPageSchema.parse(
       json(
         await t.app.inject({
@@ -121,6 +124,44 @@ describe('projects CRUD', () => {
     );
     expect(all.items).toHaveLength(5);
     expect(all.items.every((p) => p.title !== 'Bob project')).toBe(true);
+    const bobPage = json(await t.app.inject({ method: 'GET', url: '/v1/projects', headers: bob.auth }));
+    expect(TotalSchema.parse(bobPage).total).toBe(1);
+  });
+
+  it('cursors are positions: rows touched or deleted between pages cause no duplicates or errors', async () => {
+    for (let i = 0; i < 6; i++) await create(alice, { title: `P${i}` });
+    const page = async (cursor: string | null) =>
+      ProjectSummaryPageSchema.parse(
+        json(
+          await t.app.inject({
+            method: 'GET',
+            url: `/v1/projects?limit=2${cursor !== null ? `&cursor=${cursor}` : ''}`,
+            headers: alice.auth,
+          }),
+        ),
+      );
+    const p1 = await page(null);
+    expect(p1.items.map((p) => p.title)).toEqual(['P5', 'P4']);
+    // The last row of page 1 is updated (e.g. a run starts) and moves to the top before page 2 is fetched.
+    const touched = p1.items[1];
+    if (touched === undefined) throw new Error('expected two items');
+    await prisma.project.update({ where: { id: touched.id }, data: { title: 'P4 (touched)' } });
+    const p2 = await page(p1.nextCursor);
+    expect(p2.items.map((p) => p.title)).toEqual(['P3', 'P2']);
+    // The anchor of the next cursor is deleted: the next page still works.
+    const anchor = p2.items[1];
+    if (anchor === undefined) throw new Error('expected two items');
+    await prisma.project.delete({ where: { id: anchor.id } });
+    const p3 = await page(p2.nextCursor);
+    expect(p3.items.map((p) => p.title)).toEqual(['P1', 'P0']);
+    const seen = [...p1.items, ...p2.items, ...p3.items].map((p) => p.id);
+    expect(new Set(seen).size).toBe(seen.length);
+    // Garbage and raw ids are not cursors.
+    for (const cursor of ['%%%', touched.id, Buffer.from('not-a-date~abc').toString('base64url')]) {
+      const res = await t.app.inject({ method: 'GET', url: `/v1/projects?cursor=${cursor}`, headers: alice.auth });
+      expect(res.statusCode, cursor).toBe(400);
+      expect(ApiErrorSchema.parse(json(res)).error.code).toBe('INVALID_CURSOR');
+    }
   });
 
   it('rejects bad pagination parameters', async () => {

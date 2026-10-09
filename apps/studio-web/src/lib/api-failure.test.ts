@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { describeFailure, failureMessage, type ApiFailure } from './api-failure';
+import {
+  PUBLIC_FAILURE_MESSAGES,
+  describeFailure,
+  failureMessage,
+  proxyStatusFor,
+  publicFailureMessage,
+  type ApiFailure,
+} from './api-failure';
 import { isActiveRunStatus, runProgressPercent } from './run-status';
 import { runErrorNotice } from './run-actions';
 
@@ -8,16 +15,16 @@ const failure = (overrides: Partial<ApiFailure>): ApiFailure => ({
   status: 500,
   code: 'INTERNAL',
   message: 'boom',
-  apiUrl: 'http://localhost:4100',
   ...overrides,
 });
 
 describe('describeFailure', () => {
   it('explains unreachable and unauthorized states with actionable hints', () => {
-    const unreachable = describeFailure(failure({ kind: 'unreachable', status: null, code: 'API_UNREACHABLE', message: 'ECONNREFUSED' }));
+    const unreachable = describeFailure(
+      failure({ kind: 'unreachable', status: null, code: 'API_UNREACHABLE', message: PUBLIC_FAILURE_MESSAGES.unreachable }),
+    );
     expect(unreachable.title).toMatch(/reach/);
-    expect(unreachable.description).toContain('http://localhost:4100');
-    expect(unreachable.hint).toMatch(/studio:dev:api/);
+    expect(unreachable.hint).toMatch(/Settings/);
 
     const unauthorized = describeFailure(failure({ kind: 'unauthorized', status: 401, code: 'UNAUTHORIZED' }));
     expect(unauthorized.hint).toMatch(/STUDIO_API_TOKEN/);
@@ -26,9 +33,34 @@ describe('describeFailure', () => {
     expect(missing.hint).toMatch(/\.env/);
   });
 
-  it('never includes a token', () => {
-    const copy = describeFailure(failure({ kind: 'unauthorized', status: 401 }));
-    expect(JSON.stringify(copy)).not.toMatch(/Bearer/);
+  it('never includes a token or the API base URL', () => {
+    for (const kind of ['unreachable', 'unauthorized', 'not_configured', 'invalid_response'] as const) {
+      const copy = describeFailure(failure({ kind, status: null, message: PUBLIC_FAILURE_MESSAGES[kind] }));
+      expect(JSON.stringify(copy)).not.toMatch(/Bearer|localhost|http:\/\//);
+    }
+  });
+});
+
+describe('route handler mapping', () => {
+  it('maps failures to proxy status codes', () => {
+    expect(proxyStatusFor(failure({ kind: 'not_configured', status: null }))).toBe(503);
+    expect(proxyStatusFor(failure({ kind: 'unauthorized', status: 401 }))).toBe(503);
+    expect(proxyStatusFor(failure({ kind: 'unreachable', status: null }))).toBe(502);
+    expect(proxyStatusFor(failure({ kind: 'not_found', status: 404 }))).toBe(404);
+    expect(proxyStatusFor(failure({ kind: 'http', status: 429 }))).toBe(429);
+    expect(proxyStatusFor(failure({ kind: 'http', status: null }))).toBe(502);
+  });
+
+  it('returns generic messages for infrastructure failures and 5xx', () => {
+    // Even if a raw detail slipped into `message`, the public message is generic.
+    expect(publicFailureMessage(failure({ kind: 'unreachable', status: null, message: 'connect ECONNREFUSED 127.0.0.1:4100' }))).toBe(
+      PUBLIC_FAILURE_MESSAGES.unreachable,
+    );
+    expect(publicFailureMessage(failure({ kind: 'http', status: 500, message: 'Error: stack trace…' }))).not.toMatch(/stack/);
+    expect(publicFailureMessage(failure({ kind: 'http', status: 409, code: 'RUN_ACTIVE', message: 'Run active' }))).toBe('Run active');
+    expect(publicFailureMessage(failure({ kind: 'not_found', status: 404, message: 'Director run not found' }))).toBe(
+      'Director run not found',
+    );
   });
 });
 

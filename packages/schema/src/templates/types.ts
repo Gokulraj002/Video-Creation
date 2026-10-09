@@ -1,4 +1,5 @@
 import type { z } from 'zod';
+import type { AssetKind } from '../assets';
 import type { VideoGenre } from '../director';
 
 /** Context the deterministic `buildProps` uses to produce valid props (heuristic mock + engine-fallback coercion). */
@@ -22,6 +23,11 @@ export interface TemplateDefinition<P extends z.ZodObject = z.ZodObject> {
   genres: readonly VideoGenre[];
   /** LLM-safe: closed object, all properties required, nullable for optional, no records/recursion. */
   propsSchema: P;
+  /**
+   * Props whose (string) value is an asset id, with the asset kind they must reference. `TimelineSchema` checks
+   * these against `timeline.assets` (invariant 4); `null` / absent values are not checked.
+   */
+  assetRefProps?: Readonly<Record<string, AssetKind>>;
   minDurationSeconds: number;
   buildProps(ctx: TemplatePropsContext): z.infer<P>;
 }

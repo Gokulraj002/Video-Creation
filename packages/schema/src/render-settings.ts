@@ -59,23 +59,54 @@ function requireCustom(value: number | null | undefined, name: string): number {
   return value;
 }
 
+function checkRange(dims: Dimensions): Dimensions {
+  for (const [name, value] of [
+    ['width', dims.width],
+    ['height', dims.height],
+  ] as const) {
+    if (value < MIN_DIMENSION || value > MAX_DIMENSION) {
+      throw new RangeError(
+        `Resolved ${name} ${value} px is outside [${MIN_DIMENSION}, ${MAX_DIMENSION}] (after rounding to an even integer)`,
+      );
+    }
+  }
+  return dims;
+}
+
+/**
+ * `true` when `width × height` matches the preset aspect ratio up to rounding: there is an exact-ratio size
+ * (t·w, t·h) with each side within ±1 px of the given one (what rounding each side to an even integer can cause).
+ * Always `true` for `custom`.
+ */
+export function dimensionsMatchAspectRatio(width: number, height: number, aspectRatio: AspectRatio): boolean {
+  if (aspectRatio === 'custom') return true;
+  const { w, h } = ASPECT_RATIO_VALUES[aspectRatio];
+  const low = Math.max((width - 1) / w, (height - 1) / h);
+  const high = Math.min((width + 1) / w, (height + 1) / h);
+  return low <= high;
+}
+
 /**
  * Resolves output pixel dimensions. Preset resolution = SHORT side in px; the long side is
- * round(short × ratio) rounded to even. `custom` aspect ratio or resolution requires both custom dims.
- * Output is always even integers.
+ * round(short × ratio) rounded to even. `custom` aspect ratio or resolution requires both custom dims, which are
+ * used as-is (rounded to even). With aspectRatio `custom` the resolution preset is IGNORED; with resolution `custom`
+ * and a preset aspect ratio, `VideoRequestSchema` requires the custom size to match that ratio
+ * (`dimensionsMatchAspectRatio`). Output is always even integers in [16, 8192].
+ *
+ * @throws RangeError when custom dims are missing / non-positive, or a resolved side falls outside [16, 8192].
  */
 export function resolveDimensions(input: ResolveDimensionsInput): Dimensions {
   const { aspectRatio, resolution } = input;
   if (aspectRatio === 'custom' || resolution === 'custom') {
     const width = requireCustom(input.customWidth, 'customWidth');
     const height = requireCustom(input.customHeight, 'customHeight');
-    return { width: toEven(width), height: toEven(height) };
+    return checkRange({ width: toEven(width), height: toEven(height) });
   }
   const short = RESOLUTION_SHORT_SIDE[resolution];
   const { w, h } = ASPECT_RATIO_VALUES[aspectRatio];
-  if (w === h) return { width: toEven(short), height: toEven(short) };
-  if (w < h) return { width: toEven(short), height: toEven((short * h) / w) };
-  return { width: toEven((short * w) / h), height: toEven(short) };
+  if (w === h) return checkRange({ width: toEven(short), height: toEven(short) });
+  if (w < h) return checkRange({ width: toEven(short), height: toEven((short * h) / w) });
+  return checkRange({ width: toEven((short * w) / h), height: toEven(short) });
 }
 
 export const SampleRateSchema = z.union([z.literal(44100), z.literal(48000)]);

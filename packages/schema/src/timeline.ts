@@ -2,11 +2,20 @@ import { z } from 'zod';
 import { AssetRefSchema, type AssetKind, type AssetRef } from './assets';
 import { BrandKitSchema } from './brand';
 import { ChapterSchema } from './chapter';
-import { DurationFramesSchema, IdSchema, IsoDateTimeSchema, LanguageTagSchema } from './common';
+import {
+  DurationFramesSchema,
+  findIllFormedStrings,
+  IdSchema,
+  ILL_FORMED_TEXT_MESSAGE,
+  IsoDateTimeSchema,
+  LanguageTagSchema,
+  type JsonObject,
+} from './common';
 import type { Layer2D } from './layers';
 import { CURRENT_TIMELINE_VERSION, TimelineMigrationError, migrateTimeline } from './migrations';
 import { RenderSettingsSchema } from './render-settings';
 import { SceneSchema } from './scene';
+import { getTemplateAssetRefProps } from './templates/catalog';
 import { TrackSchema } from './tracks';
 
 export const TimelineGeneratorSchema = z.object({
@@ -41,6 +50,9 @@ export type TimelineBase = z.infer<typeof TimelineBaseSchema>;
 
 type Path = (string | number)[];
 type IssueSink = (path: Path, message: string) => void;
+
+/** Template props are validated by `JsonObjectSchema` (incl. well-formed text); skip them in the timeline-wide walk. */
+const SKIP_PROPS: ReadonlySet<string> = new Set(['props']);
 
 /** Invariant 1 / 2 helper: contiguous spans covering [0, total]. */
 function checkContiguous(
@@ -82,6 +94,38 @@ function checkAssetRef(
     report(path, `Unknown asset "${assetId}" (not listed in timeline.assets)`);
   } else if (asset.kind !== expected) {
     report(path, `Asset "${assetId}" must be of kind "${expected}" (got "${asset.kind}")`);
+  }
+}
+
+/** Invariant 4 for template props: known asset-reference props of catalog templates must name a compatible asset. */
+function checkTemplateAssetProps(
+  content: { template: string; props: JsonObject },
+  contentPath: Path,
+  assets: ReadonlyMap<string, AssetRef>,
+  report: IssueSink,
+): void {
+  for (const { prop, kind } of getTemplateAssetRefProps(content.template)) {
+    const value = content.props[prop];
+    if (typeof value === 'string') checkAssetRef(assets, value, kind, [...contentPath, 'props', prop], report);
+  }
+}
+
+/** Invariant 5b: a source offset must fall inside the source media when its length is known. */
+function checkTrimStart(
+  assets: ReadonlyMap<string, AssetRef>,
+  assetId: string,
+  expected: AssetKind,
+  trimStartFrame: number,
+  path: Path,
+  report: IssueSink,
+): void {
+  const asset = assets.get(assetId);
+  if (!asset || asset.kind !== expected || asset.durationInFrames === undefined) return;
+  if (trimStartFrame >= asset.durationInFrames) {
+    report(
+      path,
+      `trimStartFrame ${trimStartFrame} must be < the duration of asset "${assetId}" (${asset.durationInFrames} frames)`,
+    );
   }
 }
 
@@ -165,16 +209,37 @@ function checkTimelineInvariants(t: TimelineBase, report: IssueSink): void {
     const cp: Path = [...base, 'content'];
     switch (content.engine) {
       case 'motion2d':
+        checkTemplateAssetProps(content, cp, assets, report);
         checkLayers(content.layers, scene.durationInFrames, [...cp, 'layers'], assets, claimId, report);
         break;
       case 'three':
+        checkTemplateAssetProps(content, cp, assets, report);
         if (content.modelAssetId !== undefined) {
           checkAssetRef(assets, content.modelAssetId, 'model3d', [...cp, 'modelAssetId'], report);
         }
         break;
       case 'footage':
+        checkAssetRef(assets, content.assetId, 'video', [...cp, 'assetId'], report);
+        checkTrimStart(assets, content.assetId, 'video', content.trimStartFrame, [...cp, 'trimStartFrame'], report);
+        break;
       case 'screen':
         checkAssetRef(assets, content.assetId, 'video', [...cp, 'assetId'], report);
+        checkTrimStart(assets, content.assetId, 'video', content.trimStartFrame, [...cp, 'trimStartFrame'], report);
+        content.zoomRegions.forEach((region, k) => {
+          const rp: Path = [...cp, 'zoomRegions', k];
+          const end = region.startFrame + region.durationInFrames;
+          if (region.startFrame >= scene.durationInFrames) {
+            report(
+              [...rp, 'startFrame'],
+              `Zoom region starts at ${region.startFrame}, outside the scene [0, ${scene.durationInFrames})`,
+            );
+          } else if (end > scene.durationInFrames) {
+            report(
+              [...rp, 'durationInFrames'],
+              `Zoom region ends at ${end}, beyond the scene duration ${scene.durationInFrames}`,
+            );
+          }
+        });
         break;
       case 'image':
         checkAssetRef(assets, content.assetId, 'image', [...cp, 'assetId'], report);
@@ -258,6 +323,7 @@ function checkTimelineInvariants(t: TimelineBase, report: IssueSink): void {
         track.items.forEach((item, j) => {
           const path: Path = ['tracks', ti, 'items', j];
           checkAssetRef(assets, item.assetId, 'audio', [...path, 'assetId'], report);
+          checkTrimStart(assets, item.assetId, 'audio', item.trimStartFrame, [...path, 'trimStartFrame'], report);
           if (item.fadeInFrames + item.fadeOutFrames > item.durationInFrames) {
             report(
               [...path, 'fadeOutFrames'],
@@ -268,7 +334,9 @@ function checkTimelineInvariants(t: TimelineBase, report: IssueSink): void {
         break;
       case 'video':
         track.items.forEach((item, j) => {
-          checkAssetRef(assets, item.assetId, 'video', ['tracks', ti, 'items', j, 'assetId'], report);
+          const path: Path = ['tracks', ti, 'items', j];
+          checkAssetRef(assets, item.assetId, 'video', [...path, 'assetId'], report);
+          checkTrimStart(assets, item.assetId, 'video', item.trimStartFrame, [...path, 'trimStartFrame'], report);
         });
         break;
       case 'overlay':
@@ -277,6 +345,7 @@ function checkTimelineInvariants(t: TimelineBase, report: IssueSink): void {
           if (item.content.engine === 'image') {
             checkAssetRef(assets, item.content.assetId, 'image', [...cp, 'assetId'], report);
           } else {
+            checkTemplateAssetProps(item.content, cp, assets, report);
             checkLayers(item.content.layers, item.durationInFrames, [...cp, 'layers'], assets, claimId, report);
           }
         });
@@ -285,6 +354,9 @@ function checkTimelineInvariants(t: TimelineBase, report: IssueSink): void {
         break;
     }
   });
+
+  // 10. Well-formed text everywhere (template props are already checked by JsonObjectSchema).
+  findIllFormedStrings(t, (path) => report(path, ILL_FORMED_TEXT_MESSAGE), SKIP_PROPS);
 }
 
 /**
@@ -292,12 +364,15 @@ function checkTimelineInvariants(t: TimelineBase, report: IssueSink): void {
  * 1. scenes sorted, contiguous, from 0 to `durationInFrames`;
  * 2. chapters contiguous over [0, durationInFrames], scenes reference existing chapters, lie inside them and never go back;
  * 3. globally unique ids (chapters, scenes, assets, tracks, track items, layers);
- * 4. asset references exist with a compatible kind;
- * 5. track items within [0, durationInFrames], sorted and non-overlapping per track;
+ * 4. asset references exist with a compatible kind — including the asset-reference props of catalog templates
+ *    (`assetRefProps`, e.g. split-feature `imageAssetId` → image); unknown templates' props are not inspected;
+ * 5. track items within [0, durationInFrames], sorted and non-overlapping per track; `trimStartFrame` (footage, screen,
+ *    audio and video items) `<` the asset's `durationInFrames` when the asset declares it;
  * 6. no transitionIn (other than `cut`) on the first scene; duration ≤ min(scene, previous scene);
  * 7. camera keyframes `< scene.durationInFrames`, strictly increasing; `3d` only on `three` scenes;
- * 8. audio fades fit the item; layers fit the scene;
- * 9. generated `ready` ⇒ `assetId`.
+ * 8. audio fades fit the item; layers fit the scene; screen `zoomRegions` lie within the scene;
+ * 9. generated `ready` ⇒ `assetId`;
+ * 10. every string is well-formed UTF-16 (no lone surrogates; PostgreSQL `jsonb` rejects them).
  */
 export const TimelineSchema = TimelineBaseSchema.superRefine((timeline, ctx) => {
   checkTimelineInvariants(timeline, (path, message) => {

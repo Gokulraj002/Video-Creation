@@ -30,26 +30,64 @@ export function toSeconds(value: number, unit: DurationUnit): number {
 export type ParseDurationResult = { ok: true; seconds: number } | { ok: false; error: string };
 
 /**
- * Parses the raw duration form inputs (value + unit). Accepts `1.5`, `1,5` (decimal comma) and surrounding
- * whitespace; rejects empty, non-numeric, non-finite and non-positive values.
+ * Input hint shown next to the duration field. It documents the separator rule implemented by
+ * `parseDurationInput`: one decimal separator (`.` or `,`), never thousands separators.
+ */
+export const DURATION_INPUT_HINT = 'Decimals with . or , (1.5 or 1,5) — no thousands separators';
+
+/**
+ * Upper bound for a *numerically meaningful* duration (not a product limit — the configured maximum comes from
+ * `GET /v1/system/config`). Above this, seconds can no longer be represented exactly as a JS number.
+ */
+const MAX_REPRESENTABLE_SECONDS = Number.MAX_SAFE_INTEGER;
+
+/** `1,000` / `12,500` / `1,000,000`: a comma followed by groups of exactly three digits (leading group 1–3 digits, no leading zero). */
+const THOUSANDS_GROUPING_RE = /^[1-9]\d{0,2}(?:,\d{3})+$/;
+
+/**
+ * Parses the raw duration form inputs (value + unit).
+ *
+ * Separator rule (also shown as `DURATION_INPUT_HINT`): a single decimal separator, either `.` or `,`
+ * (`1.5`, `1,5`, `.5`). Thousands separators are NOT supported: a comma followed by exactly three digits
+ * (`1,000`) is ambiguous — one thousand, or 1.000? — so it is rejected with a hint instead of being silently
+ * read as a decimal. Inputs with several separators (`1,000,000`, `1.000,5`) are rejected too.
+ *
+ * Also rejects empty, non-numeric, non-positive, too-short (< 1 ms) and non-finite / unrepresentably large values
+ * (e.g. a 400-digit string) with a friendly message.
  */
 export function parseDurationInput(rawValue: string | null | undefined, rawUnit: string | null | undefined): ParseDurationResult {
   const unit = (rawUnit ?? 's').trim();
   if (!isDurationUnit(unit)) {
     return { ok: false, error: `Unknown duration unit "${unit}"` };
   }
-  const text = (rawValue ?? '').trim().replace(',', '.');
-  if (text === '') {
+  const raw = (rawValue ?? '').trim();
+  if (raw === '') {
     return { ok: false, error: 'Enter a duration' };
   }
+  if (THOUSANDS_GROUPING_RE.test(raw)) {
+    return {
+      ok: false,
+      error: `"${raw}" is ambiguous — type ${raw.replace(/,/g, '')} without separators, or use a single decimal separator such as 1.5`,
+    };
+  }
+  if (raw.includes(',') && raw.includes('.')) {
+    return { ok: false, error: 'Use a single decimal separator (. or ,) and no thousands separators' };
+  }
+  const text = raw.replace(',', '.');
   if (!/^\d*\.?\d+$/.test(text)) {
     return { ok: false, error: 'Duration must be a positive number' };
   }
   const value = Number(text);
-  if (!Number.isFinite(value) || value <= 0) {
+  if (!Number.isFinite(value)) {
+    return { ok: false, error: 'That number is too large' };
+  }
+  if (value <= 0) {
     return { ok: false, error: 'Duration must be greater than zero' };
   }
   const seconds = toSeconds(value, unit);
+  if (!Number.isFinite(seconds) || seconds > MAX_REPRESENTABLE_SECONDS) {
+    return { ok: false, error: 'That duration is too large' };
+  }
   if (seconds <= 0) {
     return { ok: false, error: 'Duration is too short' };
   }

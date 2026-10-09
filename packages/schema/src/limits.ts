@@ -5,8 +5,7 @@ import type { Timeline } from './timeline';
 
 const PositiveIntSchema = z.number().int().positive();
 
-/** Configurable resource limits. These are NOT hardcoded maxima: apps override them from env. */
-export const ResourceLimitsSchema = z.object({
+const CORE_RESOURCE_LIMITS_SHAPE = {
   maxDurationSeconds: PositiveIntSchema,
   maxWidth: PositiveIntSchema,
   maxHeight: PositiveIntSchema,
@@ -16,11 +15,44 @@ export const ResourceLimitsSchema = z.object({
   maxTracks: PositiveIntSchema,
   maxAssets: PositiveIntSchema,
   maxPromptChars: PositiveIntSchema,
+};
+
+/** The nine core limits (all required). */
+export const CoreResourceLimitsSchema = z.object(CORE_RESOURCE_LIMITS_SHAPE);
+
+/**
+ * Optional timeline-size limits. When a field is absent, `checkTimelineLimits` uses `DEFAULT_RESOURCE_LIMITS`.
+ * - `maxTrackItems`: total number of items over ALL tracks;
+ * - `maxLayers`: total number of 2D layers over all scenes and overlay items;
+ * - `maxTimelineBytes`: UTF-8 size of `JSON.stringify(timeline)`.
+ */
+export const TimelineSizeLimitsSchema = z.object({
+  maxTrackItems: PositiveIntSchema.optional(),
+  maxLayers: PositiveIntSchema.optional(),
+  maxTimelineBytes: PositiveIntSchema.optional(),
 });
-export type ResourceLimits = z.infer<typeof ResourceLimitsSchema>;
+export type TimelineSizeLimits = z.infer<typeof TimelineSizeLimitsSchema>;
+
+/**
+ * Configurable resource limits. These are NOT hardcoded maxima: apps override them from env.
+ * The nine core limits are required; the timeline-size limits (`maxTrackItems`, `maxLayers`, `maxTimelineBytes`) are
+ * optional and default to `DEFAULT_RESOURCE_LIMITS`.
+ */
+export const ResourceLimitsSchema = z.object({
+  ...CORE_RESOURCE_LIMITS_SHAPE,
+  ...TimelineSizeLimitsSchema.shape,
+});
+
+/**
+ * The core limits. Deliberately WITHOUT the optional size limits so `limits[key]` for `key: keyof ResourceLimits`
+ * stays `number`; use `FullResourceLimits` (= `z.infer<typeof ResourceLimitsSchema>`) to also carry size limits.
+ * Every function taking limits accepts `FullResourceLimits`, and a plain `ResourceLimits` value works too.
+ */
+export type ResourceLimits = z.infer<typeof CoreResourceLimitsSchema>;
+export type FullResourceLimits = ResourceLimits & TimelineSizeLimits;
 
 /** Defaults only — apps override these from env. */
-export const DEFAULT_RESOURCE_LIMITS: Readonly<ResourceLimits> = Object.freeze({
+export const DEFAULT_RESOURCE_LIMITS: Readonly<ResourceLimits & Required<TimelineSizeLimits>> = Object.freeze({
   maxDurationSeconds: 7200,
   maxWidth: 3840,
   maxHeight: 3840,
@@ -30,6 +62,9 @@ export const DEFAULT_RESOURCE_LIMITS: Readonly<ResourceLimits> = Object.freeze({
   maxTracks: 50,
   maxAssets: 500,
   maxPromptChars: 20000,
+  maxTrackItems: 20_000,
+  maxLayers: 5_000,
+  maxTimelineBytes: 20 * 1024 * 1024,
 });
 
 export const LimitViolationCodeSchema = z.enum([
@@ -42,6 +77,9 @@ export const LimitViolationCodeSchema = z.enum([
   'MAX_TRACKS',
   'MAX_ASSETS',
   'MAX_PROMPT_CHARS',
+  'MAX_TRACK_ITEMS',
+  'MAX_LAYERS',
+  'MAX_TIMELINE_BYTES',
   'INVALID_DIMENSIONS',
 ]);
 export type LimitViolationCode = z.infer<typeof LimitViolationCodeSchema>;
@@ -66,8 +104,53 @@ function check(
   }
 }
 
-/** Checks a (valid) timeline against resource limits. Empty array = within limits. */
-export function checkTimelineLimits(timeline: Timeline, limits: ResourceLimits): LimitViolation[] {
+/** UTF-8 byte length of a string (lone surrogates count as 3 bytes, like U+FFFD). No `TextEncoder` needed. */
+export function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < value.length) {
+      const next = value.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        i++;
+      } else {
+        bytes += 3;
+      }
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+/** Total number of 2D layers in a timeline (scene layers + overlay item layers). */
+export function countTimelineLayers(timeline: Timeline): number {
+  let layers = 0;
+  for (const scene of timeline.scenes) {
+    if (scene.content.engine === 'motion2d') layers += scene.content.layers.length;
+  }
+  for (const track of timeline.tracks) {
+    if (track.kind !== 'overlay') continue;
+    for (const item of track.items) {
+      if (item.content.engine === 'motion2d') layers += item.content.layers.length;
+    }
+  }
+  return layers;
+}
+
+/** Total number of items over all tracks. */
+export function countTimelineTrackItems(timeline: Timeline): number {
+  let items = 0;
+  for (const track of timeline.tracks) items += track.items.length;
+  return items;
+}
+
+/**
+ * Checks a (valid) timeline against resource limits. Empty array = within limits.
+ * Optional size limits missing from `limits` fall back to `DEFAULT_RESOURCE_LIMITS`.
+ */
+export function checkTimelineLimits(timeline: Timeline, limits: FullResourceLimits): LimitViolation[] {
   const out: LimitViolation[] = [];
   const durationSeconds = timeline.durationInFrames / timeline.settings.fps;
   check(out, 'MAX_DURATION_SECONDS', 'Duration (seconds)', durationSeconds, limits.maxDurationSeconds);
@@ -83,11 +166,32 @@ export function checkTimelineLimits(timeline: Timeline, limits: ResourceLimits):
       check(out, 'MAX_PROMPT_CHARS', `Scene "${scene.id}" prompt length`, scene.content.prompt.length, limits.maxPromptChars);
     }
   }
+  check(
+    out,
+    'MAX_TRACK_ITEMS',
+    'Track item count (all tracks)',
+    countTimelineTrackItems(timeline),
+    limits.maxTrackItems ?? DEFAULT_RESOURCE_LIMITS.maxTrackItems,
+  );
+  check(
+    out,
+    'MAX_LAYERS',
+    'Layer count (scenes and overlays)',
+    countTimelineLayers(timeline),
+    limits.maxLayers ?? DEFAULT_RESOURCE_LIMITS.maxLayers,
+  );
+  check(
+    out,
+    'MAX_TIMELINE_BYTES',
+    'Timeline JSON size (bytes)',
+    utf8ByteLength(JSON.stringify(timeline)),
+    limits.maxTimelineBytes ?? DEFAULT_RESOURCE_LIMITS.maxTimelineBytes,
+  );
   return out;
 }
 
 /** Checks a (valid) video request against resource limits. Empty array = within limits. */
-export function checkVideoRequestLimits(request: VideoRequest, limits: ResourceLimits): LimitViolation[] {
+export function checkVideoRequestLimits(request: VideoRequest, limits: FullResourceLimits): LimitViolation[] {
   const out: LimitViolation[] = [];
   check(out, 'MAX_DURATION_SECONDS', 'Duration (seconds)', request.durationSeconds, limits.maxDurationSeconds);
   try {
