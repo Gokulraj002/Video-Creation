@@ -112,6 +112,8 @@ describe('director runs end-to-end (inline queue + heuristic mock)', () => {
       startedAt: null,
       finishedAt: null,
     });
+    // 30 s → 1 chapter → brief + outline + 5 chapter stages + compile.
+    expect(queued.progress).toEqual({ completedSteps: 0, totalSteps: 8, currentStage: null, message: 'Queued' });
 
     const directing = ProjectDetailDTOSchema.parse(
       json(await app.app.inject({ method: 'GET', url: `/v1/projects/${project.id}`, headers: alice.auth })),
@@ -127,7 +129,7 @@ describe('director runs end-to-end (inline queue + heuristic mock)', () => {
     expect(run.error).toBeNull();
     expect(run.startedAt).not.toBeNull();
     expect(run.finishedAt).not.toBeNull();
-    expect(run.progress.totalSteps).toBeGreaterThan(0);
+    expect(run.progress.totalSteps).toBe(8);
     expect(run.progress.completedSteps).toBe(run.progress.totalSteps);
     expect(run.usage).not.toBeNull();
     expect(run.usage?.totals.calls).toBeGreaterThan(0);
@@ -216,6 +218,12 @@ describe('director runs end-to-end (inline queue + heuristic mock)', () => {
       .array(DirectorRunDTOSchema)
       .parse(json(await app.app.inject({ method: 'GET', url: `/v1/projects/${project.id}/director-runs`, headers: alice.auth })));
     expect(list.map((r) => r.id)).toEqual([second.id, first.id]);
+
+    // Deleting a directed project cascades to its versions and runs.
+    const del = await app.app.inject({ method: 'DELETE', url: `/v1/projects/${project.id}`, headers: alice.auth });
+    expect(del.statusCode).toBe(204);
+    expect(await prisma.projectVersion.count()).toBe(0);
+    expect(await prisma.directorRun.count()).toBe(0);
   });
 
   it('DIRECTOR_CACHE=off makes the provider do the work again', async () => {

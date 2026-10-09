@@ -2,6 +2,7 @@ import type { DirectorRunDTO } from '@vc/schema';
 import type { AppConfig } from '../config';
 import { ProjectStatus, RunStatus, type PrismaClient } from '../db';
 import type { DirectorFactory } from '../director/factory';
+import { plannedTotalSteps } from '../director/plan';
 import { markRunFailed } from '../director/process-run';
 import { EMPTY_PROGRESS, runInclude, toDirectorRunDto } from '../lib/dto';
 import { AppError, conflict, notFound } from '../lib/errors';
@@ -51,8 +52,12 @@ export async function startDirectorRun(
   projectId: string,
 ): Promise<DirectorRunDTO> {
   const { prisma, directorFactory } = deps;
-  const owned = await prisma.project.findFirst({ where: { id: projectId, ownerId: userId }, select: { id: true } });
+  const owned = await prisma.project.findFirst({
+    where: { id: projectId, ownerId: userId },
+    select: { id: true, request: true },
+  });
   if (owned === null) throw notFound('Project');
+  const totalSteps = plannedTotalSteps(owned.request, deps.config.limits);
 
   const run = await prisma.$transaction(async (tx) => {
     await tx.$queryRaw<{ id: string }[]>`SELECT id FROM projects WHERE id = ${projectId} FOR UPDATE`;
@@ -74,7 +79,7 @@ export async function startDirectorRun(
         provider: directorFactory.providerInfo.name,
         model: directorFactory.providerInfo.model,
         promptVersion: directorFactory.promptVersion,
-        progress: { ...EMPTY_PROGRESS, message: 'Queued' },
+        progress: { ...EMPTY_PROGRESS, totalSteps, message: 'Queued' },
       },
       include: runInclude,
     });
