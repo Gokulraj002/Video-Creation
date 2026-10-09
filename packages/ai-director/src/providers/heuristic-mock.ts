@@ -15,7 +15,7 @@ import { mockChapterEngineSelection, mockChapterSceneSpecs } from './heuristic/v
 
 export const HEURISTIC_MOCK_MODEL = 'mock-director-v1';
 /** Bump when the heuristic output logic changes (part of the provider's cache fingerprint). */
-export const HEURISTIC_MOCK_VERSION = 2;
+export const HEURISTIC_MOCK_VERSION = 3;
 
 /**
  * Deterministic, genre-aware provider that builds schema-valid AND semantically valid output for every stage
