@@ -56,8 +56,13 @@ const DEFAULT_COLORS = { primary: '#1E3A8A', secondary: '#F59E0B', accent: '#10B
 
 /** Brand kit from the request brand colors + brief palette, with sensible defaults. */
 export function buildBrandKit(request: VideoRequest, palette: readonly string[], assets: readonly AssetRef[], warnings: string[]): BrandKit {
-  const colors = uniqueHexColors([...(request.brand?.colors ?? []), ...palette]);
-  const darkest = colors.reduce<string | null>((best, c) => (best === null || luminance(c) < luminance(best) ? c : best), null);
+  const brandColors = uniqueHexColors(request.brand?.colors ?? []);
+  const colors = uniqueHexColors([...brandColors, ...palette]);
+  const darkestOf = (list: readonly string[]) =>
+    list.reduce<string | null>((best, c) => (best === null || luminance(c) < luminance(best) ? c : best), null);
+  // Background: the darkest brand color when the brand has a dark one, else the darkest palette color.
+  const darkBrand = darkestOf(brandColors);
+  const darkest = darkBrand !== null && luminance(darkBrand) < 0.2 ? darkBrand : darkestOf(colors);
   const background = darkest !== null && luminance(darkest) < 0.2 ? darkest : DEFAULT_COLORS.background;
   const rest = colors.filter((c) => c !== background);
   const primary = rest[0] ?? DEFAULT_COLORS.primary;
