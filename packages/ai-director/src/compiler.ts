@@ -246,7 +246,9 @@ export function compileTimeline(input: CompileInput): CompileResult {
       language: request.language,
       style: {
         preset: profile.captionPreset,
-        position: profile.captionPreset === 'bold-center' ? 'center' : 'bottom',
+        // 'bold-center' means bold, horizontally centred text. Template scenes put their headline
+        // in the middle of the frame, so captions stay at the bottom for every genre.
+        position: 'bottom',
         fontFamily: brand.fonts.body,
         color: '#FFFFFF',
         backgroundColor: '#000000B3',

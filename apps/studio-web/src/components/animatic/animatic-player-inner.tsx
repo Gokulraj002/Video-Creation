@@ -39,6 +39,15 @@ export default function AnimaticPlayerInner({ timeline }: { timeline: Timeline }
     setFrame(target);
   };
 
+  // A scene's first frames belong to its incoming transition, where the previous scene is still
+  // showing; jump to the first fully visible frame instead. Chapter starts are scene starts too.
+  const settledFrame = (startFrame: number) => {
+    const scene = timeline.scenes.find((s) => s.startFrame === startFrame);
+    if (!scene) return startFrame;
+    const settle = scene.transitionIn?.durationInFrames ?? 0;
+    return Math.min(startFrame + settle, startFrame + scene.durationInFrames - 1);
+  };
+
   return (
     <div className="flex flex-col gap-4">
       <div
@@ -82,7 +91,7 @@ export default function AnimaticPlayerInner({ timeline }: { timeline: Timeline }
             <button
               key={mark.id}
               type="button"
-              onClick={() => seek(mark.startFrame)}
+              onClick={() => seek(settledFrame(mark.startFrame))}
               title={`${mark.title} · ${formatTimecode(mark.startFrame, fps)}`}
               className={cn(
                 'max-w-56 truncate rounded-md border px-2 py-1 text-left text-xs transition-colors hover:bg-accent hover:text-accent-foreground',
